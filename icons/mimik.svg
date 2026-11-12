@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256">
+  <!-- MIMIK icon: a plug whose cable zigzags into an M. Original artwork. -->
+  <rect x="6" y="6" width="244" height="244" rx="52" fill="#1a1a22" stroke="#b48fdd" stroke-width="6"/>
+  <!-- plug prongs -->
+  <rect x="48" y="26" width="15" height="40" rx="7" fill="#b48fdd"/>
+  <rect x="82" y="26" width="15" height="40" rx="7" fill="#b48fdd"/>
+  <!-- plug body -->
+  <rect x="40" y="62" width="66" height="56" rx="18" fill="#b48fdd"/>
+  <!-- cable forming an M -->
+  <path d="M 73 118 L 73 150 L 112 106 L 140 140 L 168 106 L 205 150 L 205 196"
+        fill="none" stroke="#b48fdd" stroke-width="19"
+        stroke-linecap="round" stroke-linejoin="round"/>
+  <!-- cable end dot -->
+  <circle cx="205" cy="196" r="10" fill="#b48fdd"/>
+</svg>
