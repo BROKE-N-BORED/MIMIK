@@ -1,5 +1,12 @@
 # MIMIK Changelog
 
+## v0.1.1 — 2026-11-12
+
+- Fixed the Hosts tab label: Qt renders a bare `&` in tab text as a
+  mnemonic marker, so "Hosts & Learn" showed as "Hosts_Learn" in the
+  window (the stored string was right, the pixels were wrong). The tab
+  is now "Hosts and Learn", and the GUI test forbids `&` in tab titles.
+
 ## v0.1 — 2026-11-12
 
 First release. Linux port of littledivy/mimic (MIT, see LICENSE-NOTICE).

@@ -190,7 +190,7 @@ class MainWindow(QMainWindow):
         tabs = QTabWidget()
         self.setCentralWidget(tabs)
         tabs.addTab(self._record_tab(), "Record")
-        tabs.addTab(self._hosts_tab(), "Hosts & Learn")
+        tabs.addTab(self._hosts_tab(), "Hosts and Learn")
         tabs.addTab(self._generate_tab(), "Generate")
         tabs.addTab(self._clients_tab(), "Clients")
         tabs.addTab(self._doctor_tab(), "Doctor")

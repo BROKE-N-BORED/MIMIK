@@ -43,8 +43,13 @@ class GuiTests(unittest.TestCase):
         tabs = win.tabs
         self.assertEqual(tabs.count(), 5)
         titles = [tabs.tabText(i) for i in range(tabs.count())]
-        self.assertEqual(titles, ["Record", "Hosts & Learn", "Generate",
+        self.assertEqual(titles, ["Record", "Hosts and Learn", "Generate",
                                   "Clients", "Doctor"])
+        # Qt eats a bare & in visible widget text (mnemonic marker — it
+        # rendered as "_" in the tab bar while tabText() still returned the
+        # raw string, so the old assertion stayed green on a wrong label).
+        for t in titles:
+            self.assertNotIn("&", t)
         win.close()
 
     def test_record_tab_targets(self):

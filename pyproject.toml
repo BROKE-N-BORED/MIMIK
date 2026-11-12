@@ -1,6 +1,6 @@
 [project]
 name = "mimik"
-version = "0.1.0"
+version = "0.1.1"
 description = "Intercept any app, then call it from Python like a library — Linux port of littledivy/mimic."
 requires-python = ">=3.10"
 license = "MIT"
