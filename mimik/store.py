@@ -143,6 +143,34 @@ def load_all(base=None):
     return out
 
 
+def capture_meta(host, base=None):
+    """The meta dict of the newest saved capture for a host, or {}.
+
+    Meta is what the recorder stored with the capture (e.g.
+    {"launched_file": ...} for a program run from a file) — it links
+    a host's traffic back to the program it came from.
+    """
+    base = base or data_dir()
+    cdir = captures_dir(base)
+    if not os.path.isdir(cdir):
+        return {}
+    safe = _safe_host(host)
+    newest = None
+    for name in sorted(os.listdir(cdir)):
+        if not name.startswith(safe + "_") or not name.endswith(".json"):
+            continue
+        try:
+            with open(os.path.join(cdir, name)) as fh:
+                data = json.load(fh)
+        except (OSError, ValueError):
+            continue
+        if data.get("host") != host:
+            continue
+        newest = data  # filenames sort chronologically
+    meta = (newest or {}).get("meta")
+    return meta if isinstance(meta, dict) else {}
+
+
 def list_captures(base=None):
     """[(host, flow_count, latest_saved_at)] for every captured host."""
     base = base or data_dir()

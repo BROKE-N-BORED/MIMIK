@@ -9,19 +9,26 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 
-from . import store
+from . import assets, store
 from .sources.mitm import Mitm, MitmError
 
 TOKEN_RE = re.compile(r"token=([A-Za-z0-9_\-]+)")
 
 
 def mitmweb_cmd():
-    """Prefer mitmweb on PATH; otherwise run it ephemerally through uv."""
+    """Prefer mitmweb on PATH; otherwise the copy in MIMIK's own venv
+    (next to this Python — the installer puts mitmproxy there, and the
+    venv's bin is not on PATH); otherwise run it ephemerally through uv.
+    """
     if shutil.which("mitmweb"):
         return ["mitmweb"]
+    venv_mitmweb = os.path.join(os.path.dirname(sys.executable), "mitmweb")
+    if os.path.isfile(venv_mitmweb) and os.access(venv_mitmweb, os.X_OK):
+        return [venv_mitmweb]
     if shutil.which("uvx"):
         return ["uvx", "--from", "mitmproxy", "mitmweb"]
     return None
@@ -56,16 +63,23 @@ class ProxySession:
                 "so MIMIK can run mitmweb for you"
             )
         self._log_fh = open(self.log_path, "w")
+        # Unbuffered: mitmweb's startup lines (including the web-UI token)
+        # sit in a block buffer forever when stdout is a file, so the
+        # token was never discovered and /flows answered 403.
+        env = dict(os.environ)
+        env["PYTHONUNBUFFERED"] = "1"
         self.proc = subprocess.Popen(
             cmd, stdout=self._log_fh, stderr=subprocess.STDOUT,
-            start_new_session=True,
+            start_new_session=True, env=env,
         )
         deadline = time.time() + timeout
         last_err = None
         while time.time() < deadline:
             if self.proc.poll() is not None:
+                code = self.proc.returncode
+                self._cleanup_failed_start()
                 raise MitmError(
-                    f"mitmweb exited right away (code {self.proc.returncode}) "
+                    f"mitmweb exited right away (code {code}) "
                     f"— see {self.log_path}"
                 )
             self._discover_token()
@@ -76,9 +90,25 @@ class ProxySession:
             except MitmError as e:
                 last_err = e
                 time.sleep(1)
+        self._cleanup_failed_start()
         raise MitmError(
             f"mitmweb did not answer within {timeout}s (last error: {last_err})"
         )
+
+    def _cleanup_failed_start(self):
+        """Stop a mitmweb that started but never answered, so a failed
+        record does not leave an orphan proxy behind."""
+        if self.proc is not None and self.proc.poll() is None:
+            self.proc.terminate()
+            try:
+                self.proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self.proc.kill()
+                self.proc.wait()
+        self.proc = None
+        if self._log_fh is not None:
+            self._log_fh.close()
+            self._log_fh = None
 
     def _discover_token(self):
         """mitmweb prints its web-UI token at startup; pick it up if present."""
@@ -109,11 +139,43 @@ class ProxySession:
             self.on_update(rows)
         return rows
 
+    def extract_assets(self):
+        """Save asset responses (images, models, audio, fonts) from the
+        live capture, per host. Raw bytes come from mitmweb while it
+        is still running. Returns [(host, group_dir, count)]. Never
+        raises — a failed extraction is a lost bonus, not a lost
+        capture."""
+        if self.mitm is None:
+            return []
+        try:
+            flows = self.mitm.flows()
+        except Exception:
+            return []
+        by_host = {}
+        for f in flows:
+            req = f.get("request") or {}
+            if req.get("host"):
+                by_host.setdefault(req["host"], []).append(f)
+        out = []
+        for host, host_flows in sorted(by_host.items()):
+            try:
+                gdir, manifest = assets.extract_from_flows(
+                    host_flows, host, mitm=self.mitm, host=host)
+            except Exception:
+                continue
+            if gdir:
+                out.append((host, gdir, len(manifest["assets"])))
+        return out
+
     def stop(self):
-        """Final pull, then stop mitmweb."""
+        """Final pull, asset extraction, then stop mitmweb."""
         if self.mitm is not None:
             try:
                 self.poll()
+            except Exception:
+                pass
+            try:
+                self.extract_assets()
             except Exception:
                 pass
         if self.proc is not None and self.proc.poll() is None:

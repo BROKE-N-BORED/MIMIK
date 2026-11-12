@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build the MIMIK v0.1 release zip.
+"""Build the MIMIK v0.2 release zip.
 
 Zip modes matter: GUI extractors (Thunar's) drop the execute bit unless
 external_attr carries the full regular-file type bits — 0o100755 for
@@ -11,13 +11,14 @@ import sys
 import zipfile
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-VERSION = "0.1"
+VERSION = "0.2"
 PREFIX = f"mimik-v{VERSION}/"
 
 EXECUTABLES = {"install.sh", "uninstall.sh", "Install MIMIK.desktop"}
 
 INCLUDE_DIRS = ["mimik", "tests", "icons"]
-INCLUDE_FILES = ["pyproject.toml", "README.md", "LICENSE-NOTICE",
+INCLUDE_FILES = ["pyproject.toml", "README.md", "CHANGELOG.md",
+                 "LICENSE-NOTICE",
                  "install.sh", "uninstall.sh", "Install MIMIK.desktop"]
 
 

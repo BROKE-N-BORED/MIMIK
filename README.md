@@ -47,8 +47,8 @@ mimik learn <host>      # see the endpoints MIMIK caught
 mimik gen <host>        # generate <host>_client.py, free, no LLM needed
 ```
 
-Or open the **MIMIK** GUI from the menu: Record → Hosts & Learn → Generate →
-Clients → Doctor. Same flow, no terminal.
+Or open the **MIMIK** GUI from the menu: Record → Hosts and Learn → Generate
+→ Assets → Clients → Doctor → Presets. Same flow, no terminal.
 
 Captures are saved under `~/.local/share/mimik/captures/` as they're pulled,
 so `hosts`, `learn`, `gen`, and generated clients keep working after the
@@ -173,6 +173,175 @@ and compiles cleanly.
 Generated clients are also copied to `~/.local/share/mimik/clients/`; the
 GUI Clients tab lists them with a smoke-test button.
 
+If a **preset** was learned for the host (see below), the generated client
+uses it: the learned auth section (header/cookie names, sign-in endpoint)
+appears in the class, and repeat endpoints collapse by their generalized
+shape (`/api/users/123` and `/api/users/456` become one `/api/users/{id}`
+method). With no preset, generation is exactly as before.
+
+## Assets and Reblend packs (v0.2)
+
+A clone gets its look, not just its code. When MIMIK captures an app or a
+game, it also saves the assets the thing is made of — images, 3D models,
+audio, fonts — and can build them into a **Reblend asset pack**: the
+models converted to Reblend meshes, a scene file that opens in Reblend,
+and the originals kept alongside.
+
+Where assets come from:
+
+- **Traffic**: image, model, audio, and font responses in a capture are
+  saved as raw bytes when the proxy stops (live mitmweb preferred), and
+  from saved captures or HAR imports on demand. Nothing is re-encoded.
+- **Program files**: when MIMIK launches a program from a file, it scans
+  the extracted archive, mounted disk image, or extracted `.deb` for the
+  same asset types and copies them out (never moves, never runs
+  anything). For ISOs the copy happens before the unmount.
+
+```bash
+mimik assets <host>              # list captured assets for a host
+mimik assets --har session.har   # extract assets from a HAR file
+mimik assets --scan ~/game-dir   # scan a program folder for assets
+mimik build-pack <host>          # build a Reblend asset pack
+```
+
+Or use the GUI **Assets** tab: pick a capture, see its assets and their
+conversion status, point MIMIK at your Reblend folder, and hit **Build
+asset pack**. **Open in Reblend** opens the pack scene straight in
+Reblend (`main.py --scene <pack scene>`).
+
+A pack lives at `~/.local/share/mimik/packs/<app>_<timestamp>/`:
+
+```
+<app>.json     Reblend scene (v2) — one mesh object per converted model
+assets/        converted .mesh.json files (via Reblend's own importer)
+textures/      image originals
+originals/     model / audio / font originals
+pack.json      manifest: sources, conversions, warnings, materials
+```
+
+Pointing MIMIK at Reblend: the Assets tab has a folder picker, or
+`mimik build-pack --reblend <path>`. MIMIK also auto-detects Reblend in
+`~/.local/share/reblend*`, `~/Desktop/reblend*`, and `~/reblend*`. MIMIK
+loads Reblend's own `light_engine` package by path and calls its own
+importer — no Reblend code is copied into MIMIK, and Reblend's tree is
+never touched. Without a Reblend install, capture and listing still work
+and the pack still assembles with originals; conversion just waits until
+Reblend is found.
+
+Honest asset limits (these are Reblend's limits, not MIMIK hiding things):
+
+- **Images are color-only materials.** Reblend materials use procedural
+  textures only — there is no image-file texture support in scene v2.
+  Each image becomes a material entry with its average color, and the
+  original file is kept in the pack's `textures/` folder.
+- **Audio and fonts are kept, not wired in.** Reblend has no audio or
+  font support, so those originals travel in the pack for the clone but
+  don't appear in the scene. The pack manifest says so plainly.
+- **`.gltf` needs `.glb`.** Reblend's importer reads `.glb` and `.obj`
+  only. A `.gltf` file is kept as an original with a note to convert it
+  in Blender (File → Export → glTF 2.0). MIMIK writes no glTF parser.
+- **Size guards**: 50 MB per file, 500 MB per capture group. Over-cap
+  files are skipped with a note in the manifest, never a crash.
+- **Heavy meshes warn, never refuse**: over 1M triangles gets a warning
+  in the pack, and the import still goes through.
+
+## Learned presets (v0.2)
+
+MIMIK teaches itself rules from your captures, so its behavior gets
+slowly programmed instead of needing AI for everything. A **preset** is
+a small JSON file, learned by pure rule extraction — no LLM, no
+network, no new dependency. There are two layers:
+
+- **App presets** — rules for one app, host, or program, learned from
+  its own captures and applied to that app. One JSON file per host or
+  program under `~/.local/share/mimik/presets/`.
+- **Pattern presets** — rules for a *shape* MIMIK has seen before,
+  across apps. MIMIK fingerprints each app's captures — the sign-in
+  flow, the API style, the asset shapes — and when a *different* app
+  shows the same shape, the pattern preset applies there too. One
+  JSON file per fingerprint under
+  `~/.local/share/mimik/presets/patterns/`.
+
+What a preset holds:
+
+- **Auth**: the header and cookie NAMES that carry tokens (e.g.
+  `Authorization` with scheme `Bearer`, cookie `session_id`), and the
+  sign-in endpoint shape when one is visible. **Never the values** —
+  token and cookie values are dropped at extraction time and can never
+  appear in a preset file.
+- **Endpoints**: generalized shapes with a seen count (`/api/users/123`
+  and `/api/users/456` become `/api/users/{id}`; numeric, UUID, and
+  long-hex segments generalize, short literal segments stay).
+- **Asset patterns**: which URL/path patterns carry which asset kinds
+  (e.g. `/m/*.glb` → 3D model).
+- **Pack settings**: the model scale from that app's last built pack.
+- **Pattern presets also hold**: which apps the pattern was learned
+  from (`learned_from`, names only) and the fingerprint that defines
+  it (id, plain name, signals observed).
+
+### How fingerprint matching works
+
+A fingerprint is a small set of traffic-derived signals with a stable
+id and a plain name. The set MIMIK recognizes (`mimik/fingerprints.py`
+documents each one with exactly what triggers it):
+
+- **Auth algorithms**: `oauth2-code` (authorization-code flow),
+  `oauth2-client-credentials`, `jwt-bearer` (Bearer tokens with the
+  3-part JWT *shape* — shape only, the token itself is never stored),
+  `basic-auth`, `api-key-header`, `session-cookie`.
+- **Request shapes**: `json-rpc`, `graphql`, `cursor-pagination`,
+  `offset-pagination`.
+- **Framework/SDK signatures**, from unambiguous response headers
+  only: `express`, `aspnet`, `php`, `stripe-api`.
+- **Asset patterns**: `cdn-assets` (models/images served from
+  CDN-shaped paths).
+
+Scanned program files add a weak corroborating signal only — the
+presence of a well-known engine/library file *by name* (e.g. a Unity
+or Godot runtime) — and a code signal never creates a fingerprint on
+its own.
+
+**Matching is conservative.** A fingerprint needs at least two
+independent signals, or one unambiguous one (`grant_type=`
+`authorization_code` in a token request is one; a `jsonrpc` + `method`
+body is another). One stray header never claims a pattern: a Bearer
+token that is not JWT-shaped does not fingerprint `jwt-bearer`, a lone
+API key header claims nothing alone, a single cursor value is not
+pagination.
+
+**Which preset wins.** App presets win, per section. A pattern preset
+fills a section the app preset lacks — e.g. the app preset has
+endpoints but no auth, so the pattern's auth applies. The generated
+client carries a comment naming which presets were applied (app vs
+pattern), and `pack.json` records `pattern_presets_applied`.
+
+```bash
+mimik presets                    # list app + pattern presets
+mimik presets learn <host>       # learn (or refresh) app + pattern presets
+mimik presets show <name>        # show a preset in plain language
+mimik presets match <host>       # which patterns would apply (dry run)
+mimik presets delete <name>      # delete a preset (asks first; --yes skips)
+mimik presets --auto-learn on    # refresh presets when a capture stops
+```
+
+Learning is explicit by default — you run `learn` (or press **Learn
+preset** on the GUI **Presets** tab) when you want it. Re-learning
+merges: new endpoints are added, old ones are kept with updated counts,
+and a pattern preset's `learned_from` list grows as more apps show
+the same shape. The **Learn presets from captures** setting (default
+OFF, in the GUI Presets tab or `mimik presets --auto-learn on`) also
+refreshes app and pattern presets when a record run stops.
+
+What a preset changes (nothing changes where no preset exists):
+
+- `mimik gen` adds the learned auth section to the generated client
+  and collapses repeat endpoints by their generalized shape.
+- `mimik build-pack` reuses the learned scale unless `--scale` is
+  given, and records the scale used plus "preset applied" in `pack.json`.
+- The record summary says when a preset was used for a captured host
+  ("Used the saved preset for \<host\>"), and names the patterns the
+  traffic matched ("Matched patterns: jwt-bearer, cursor-pagination.").
+
 ## CLI reference
 
 | Command | What it does |
@@ -185,6 +354,13 @@ GUI Clients tab lists them with a smoke-test button.
 | `mimik learn <host> [--har FILE] [--curl FILE]` | Show endpoints for a host |
 | `mimik gen <host> [...]` | Generate a Python client |
 | `mimik clients` | List generated clients + saved captures |
+| `mimik assets [host] [--har FILE] [--scan DIR] [--refresh]` | List captured assets (images, models, audio, fonts) |
+| `mimik build-pack <host> [--reblend PATH] [--out DIR] [--scale N]` | Build a Reblend asset pack |
+| `mimik presets [--auto-learn on\|off]` | List app + pattern presets + the auto-learn setting |
+| `mimik presets learn <host\|group>` | Learn (or refresh) app + pattern presets from saved captures |
+| `mimik presets show <name>` | Show a preset in plain language |
+| `mimik presets match <host\|group>` | Show which pattern presets would apply (dry run) |
+| `mimik presets delete <name> [--yes]` | Delete a preset |
 
 ## Honest limits
 
@@ -198,11 +374,19 @@ GUI Clients tab lists them with a smoke-test button.
   real PC run — it needs your real-PC verdict.
 - **Cloning in other languages**: v0.1 generates Python only. Other
   languages are the next step after v0.1, not part of this release.
+- **Asset packs**: images become color-only materials (Reblend has no
+  image textures), audio/fonts are kept but not wired into scenes,
+  `.gltf` needs a `.glb` conversion in Blender. See the Assets section.
 
 ## Files
 
 - `~/.local/share/mimik/captures/` — saved captures (per host + timestamp)
 - `~/.local/share/mimik/clients/` — copies of generated clients
+- `~/.local/share/mimik/assets/` — captured assets (per host/program + timestamp)
+- `~/.local/share/mimik/packs/` — built Reblend asset packs
+- `~/.local/share/mimik/presets/` — learned presets (one JSON file per host/program; pattern presets under `patterns/`)
+- `~/.local/share/mimik/settings.json` — settings (auto-learn presets: off by default)
+- `~/.local/share/mimik/reblend.json` — remembered Reblend folder
 - `~/.cache/mimik/runs/` — temp extractions from archives / .debs
 - `~/.mitmproxy/mitmproxy-ca-cert.pem` — the mitmproxy CA cert
 

@@ -1,7 +1,8 @@
 """MIMIK desktop GUI — a native Qt window, never a web page.
 
-One window, five tabs: Record | Hosts & Learn | Generate | Clients | Doctor.
-Dark, plain, big readable text. Accent violet #b48fdd only where needed.
+One window, seven tabs: Record | Hosts and Learn | Generate | Assets |
+Clients | Doctor | Presets. Dark, plain, big readable text. Accent
+violet #b48fdd only where needed.
 """
 import os
 import subprocess
@@ -10,13 +11,13 @@ import sys
 from PySide6.QtCore import Qt, QThread, QUrl, Signal
 from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
-    QApplication, QComboBox, QFileDialog, QGroupBox, QHBoxLayout, QLabel,
-    QListWidget, QListWidgetItem, QMainWindow, QMessageBox, QPushButton,
-    QTabWidget, QTableWidget, QTableWidgetItem, QTextEdit, QVBoxLayout,
-    QWidget,
+    QApplication, QCheckBox, QComboBox, QFileDialog, QGroupBox, QHBoxLayout,
+    QLabel, QListWidget, QListWidgetItem, QMainWindow, QMessageBox,
+    QPushButton, QSpinBox, QTabWidget, QTableWidget, QTableWidgetItem,
+    QTextEdit, QVBoxLayout, QWidget,
 )
 
-from . import codegen, launch, store, wine
+from . import assets, codegen, launch, presets, reblend_bridge, store, wine
 from .cli import _lan_ip
 from .recorder import ProxySession, mitmweb_cmd
 from .sources import har
@@ -65,9 +66,14 @@ class RecordWorker(QThread):
         self.launch_cmd = launch_cmd
         self.deb_install = deb_install
         self._stop = False
+        self._last_rows = []
 
     def request_stop(self):
         self._stop = True
+
+    def _hosts_updated(self, rows):
+        self._last_rows = rows
+        self.hosts_updated.emit(rows)
 
     def _wait(self, seconds):
         waited = 0.0
@@ -103,10 +109,25 @@ class RecordWorker(QThread):
                 meta.update({"launched_file": self.file_path,
                              "kind": plan.kind})
                 self.status.emit(f"will run: {plan.command_display}")
+                # Assets inside the program's own files: copy them out
+                # now, while the extraction / mount is live.
+                if plan.work_dir:
+                    try:
+                        program = os.path.basename(
+                            launch.run_dir_for(self.file_path))
+                        gdir, manifest = assets.scan_program_tree(
+                            plan.work_dir, program)
+                        if gdir:
+                            self.status.emit(
+                                f"found {len(manifest['assets'])} asset "
+                                "file(s) in the program — saved for the "
+                                "asset pack")
+                    except Exception as e:
+                        self.status.emit(f"asset scan skipped: {e}")
 
             session = ProxySession(
                 meta=meta,
-                on_update=lambda rows: self.hosts_updated.emit(rows),
+                on_update=self._hosts_updated,
             )
             try:
                 session.start()
@@ -170,6 +191,22 @@ class RecordWorker(QThread):
                         f"could not restore the prefix proxy: {e}")
             if session is not None:
                 session.stop()
+            # Presets: refresh when auto-learn is on, and say which
+            # saved presets apply to the hosts just captured — app
+            # presets, and pattern presets the traffic matched.
+            try:
+                for host, refreshed, has in presets.after_record(
+                        [h for h, _n in self._last_rows]):
+                    if refreshed:
+                        self.status.emit(f"Preset refreshed for {host}")
+                    if has:
+                        self.status.emit(f"Used the saved preset for {host}")
+                    matched = presets.matched_pattern_ids(host)
+                    if matched:
+                        self.status.emit(
+                            f"Matched patterns: {', '.join(matched)}")
+            except Exception:
+                pass
             self.status.emit("capture saved")
             self.finished.emit()
 
@@ -186,14 +223,19 @@ class MainWindow(QMainWindow):
         self.har_path = None
         self.curl_path = None
         self.gen_out = None
+        self.pack_dir = None
+        self.pack_scene = None
+        self.pack_reblend = None
 
         tabs = QTabWidget()
         self.setCentralWidget(tabs)
         tabs.addTab(self._record_tab(), "Record")
         tabs.addTab(self._hosts_tab(), "Hosts and Learn")
         tabs.addTab(self._generate_tab(), "Generate")
+        tabs.addTab(self._assets_tab(), "Assets")
         tabs.addTab(self._clients_tab(), "Clients")
         tabs.addTab(self._doctor_tab(), "Doctor")
+        tabs.addTab(self._presets_tab(), "Presets")
         self.tabs = tabs
 
     # ---- Record tab ----------------------------------------------------------
@@ -596,7 +638,9 @@ class MainWindow(QMainWindow):
                                 f"no requests to {host} found")
             return
         polish = self.polish_combo.currentData()
-        src = codegen.generate(host, eps, polish=polish)
+        preset, applied, _pids, auth_label = presets.resolve_for_gen(host)
+        src = codegen.generate(host, eps, polish=polish, preset=preset,
+                               preset_label=auth_label, applied=applied)
         from .cli import _default_out
 
         out = os.path.join(os.getcwd(), _default_out(host))
@@ -605,7 +649,8 @@ class MainWindow(QMainWindow):
         store.save_client_copy(os.path.basename(out), src)
         self.gen_out = out
         self.gen_log.setText(
-            f"wrote {out}\n\n{src[:3000]}"
+            (f"presets applied: {'; '.join(applied)}\n\n" if applied else "")
+            + f"wrote {out}\n\n{src[:3000]}"
             + ("\n…(truncated in this preview)" if len(src) > 3000 else ""))
         self.open_btn.setEnabled(True)
         self.copy_btn.setEnabled(True)
@@ -626,6 +671,498 @@ class MainWindow(QMainWindow):
         QApplication.clipboard().setText(
             f"from {mod} import {cls}\nacc = {cls}()\n")
         self.gen_log.append("\n(import snippet copied to clipboard)")
+
+    # ---- Assets tab -----------------------------------------------------------
+
+    def _assets_tab(self):
+        w = QWidget()
+        lay = QVBoxLayout(w)
+        lay.addWidget(QLabel(
+            "Assets captured from your apps and games — images, 3D models, "
+            "audio, fonts. Build them into a Reblend pack to see the clone "
+            "look like the real thing."))
+
+        row = QHBoxLayout()
+        row.addWidget(QLabel("Capture:"))
+        self.asset_group = QComboBox()
+        self.asset_group.currentIndexChanged.connect(
+            self._asset_group_selected)
+        row.addWidget(self.asset_group, 1)
+        refresh = QPushButton("Refresh")
+        refresh.clicked.connect(self._refresh_asset_groups)
+        row.addWidget(refresh)
+        lay.addLayout(row)
+
+        self.asset_table = QTableWidget(0, 5)
+        self.asset_table.setHorizontalHeaderLabels(
+            ["Name", "Kind", "Size", "Source", "Status"])
+        self.asset_table.horizontalHeader().setStretchLastSection(True)
+        lay.addWidget(self.asset_table, 2)
+
+        row = QHBoxLayout()
+        har_btn = QPushButton("Import HAR…")
+        har_btn.clicked.connect(self._import_assets_har)
+        scan_btn = QPushButton("Scan a program folder…")
+        scan_btn.clicked.connect(self._scan_assets_folder)
+        row.addWidget(har_btn)
+        row.addWidget(scan_btn)
+        row.addStretch(1)
+        lay.addLayout(row)
+
+        # Reblend location
+        rbox = QGroupBox("Reblend (for converting models into a scene)")
+        rlay = QVBoxLayout(rbox)
+        rrow = QHBoxLayout()
+        self.reblend_label = QLabel("")
+        pick_btn = QPushButton("Choose Reblend folder…")
+        pick_btn.clicked.connect(self._choose_reblend)
+        rrow.addWidget(self.reblend_label, 1)
+        rrow.addWidget(pick_btn)
+        rlay.addLayout(rrow)
+        srow = QHBoxLayout()
+        srow.addWidget(QLabel("Model scale (cm per unit):"))
+        self.scale_spin = QSpinBox()
+        self.scale_spin.setRange(1, 10000)
+        self.scale_spin.setValue(100)
+        srow.addWidget(self.scale_spin)
+        srow.addStretch(1)
+        rlay.addLayout(srow)
+        lay.addWidget(rbox)
+
+        build_btn = QPushButton("Build asset pack")
+        build_btn.setObjectName("big")
+        build_btn.clicked.connect(self._build_pack)
+        lay.addWidget(build_btn)
+
+        row = QHBoxLayout()
+        self.open_pack_btn = QPushButton("Open pack folder")
+        self.open_pack_btn.setEnabled(False)
+        self.open_pack_btn.clicked.connect(self._open_pack_folder)
+        self.open_reblend_btn = QPushButton("Open in Reblend")
+        self.open_reblend_btn.setEnabled(False)
+        self.open_reblend_btn.clicked.connect(self._open_in_reblend)
+        row.addWidget(self.open_pack_btn)
+        row.addWidget(self.open_reblend_btn)
+        row.addStretch(1)
+        lay.addLayout(row)
+
+        self.assets_log = QTextEdit()
+        self.assets_log.setReadOnly(True)
+        self.assets_log.setMaximumHeight(110)
+        lay.addWidget(self.assets_log, 1)
+
+        self._refresh_reblend_status()
+        self._refresh_asset_groups()
+        return w
+
+    def _pack_status_map(self):
+        """sha256 -> short conversion status from built packs (newest first)."""
+        status = {}
+        for _pdir, pack in reblend_bridge.list_packs():
+            for rec in pack.get("assets", []):
+                digest = rec.get("sha256")
+                if not digest or digest in status:
+                    continue
+                if rec.get("ok"):
+                    status[digest] = "converted to mesh"
+                elif rec.get("note"):
+                    status[digest] = rec["note"][:60]
+                else:
+                    status[digest] = "kept as original"
+            for mat in pack.get("materials", []):
+                digest = mat.get("sha256")
+                if digest and digest not in status:
+                    status[digest] = "color material in pack"
+        return status
+
+    def _refresh_asset_groups(self):
+        groups = assets.list_asset_groups()
+        current = self.asset_group.currentData()
+        self.asset_group.blockSignals(True)
+        self.asset_group.clear()
+        for gdir, manifest in groups:
+            n = len(manifest.get("assets", []))
+            label = (f"{manifest.get('group')} — "
+                     f"{manifest.get('captured_at', '')} ({n} assets)")
+            self.asset_group.addItem(label, gdir)
+        self.asset_group.blockSignals(False)
+        if current:
+            idx = self.asset_group.findData(current)
+            if idx >= 0:
+                self.asset_group.setCurrentIndex(idx)
+        self._asset_group_selected()
+
+    def _asset_group_selected(self, _idx=None):
+        self.asset_table.setRowCount(0)
+        gdir = self.asset_group.currentData()
+        if not gdir:
+            return
+        status_map = self._pack_status_map()
+        entries = []
+        host = None
+        for gd, manifest in assets.list_asset_groups():
+            if gd == gdir:
+                entries = manifest.get("assets", [])
+                host = manifest.get("host")
+                break
+        self._wire_pack_buttons(host)
+        self._apply_preset_scale(host, gdir)
+        self.asset_table.setRowCount(len(entries))
+        for i, e in enumerate(entries):
+            size = e.get("size", 0)
+            if size >= 1024 * 1024:
+                size_text = f"{size / (1024 * 1024):.1f} MB"
+            elif size >= 1024:
+                size_text = f"{size / 1024:.1f} KB"
+            else:
+                size_text = f"{size} B"
+            source = e.get("source") or ""
+            if e.get("url"):
+                source = f"traffic: {e['url'][:60]}"
+            elif e.get("source_path"):
+                source = f"program file: {e['source_path'][:60]}"
+            self.asset_table.setItem(i, 0, QTableWidgetItem(e.get("name", "")))
+            self.asset_table.setItem(
+                i, 1, QTableWidgetItem(
+                    assets.KIND_LABELS.get(e.get("kind"), e.get("kind", ""))))
+            self.asset_table.setItem(i, 2, QTableWidgetItem(size_text))
+            self.asset_table.setItem(i, 3, QTableWidgetItem(source))
+            self.asset_table.setItem(
+                i, 4, QTableWidgetItem(
+                    status_map.get(e.get("sha256"), "saved")))
+
+    def _wire_pack_buttons(self, host):
+        """Point Open pack folder / Open in Reblend at the newest pack
+        for this host, so a pack built in an earlier session is still
+        openable without rebuilding."""
+        self.pack_dir = None
+        self.pack_scene = None
+        self.pack_reblend = None
+        if host:
+            for pdir, manifest in reblend_bridge.list_packs():
+                if manifest.get("host") != host:
+                    continue
+                self.pack_dir = pdir
+                scene = manifest.get("scene")
+                if scene:
+                    self.pack_scene = os.path.join(pdir, scene)
+                self.pack_reblend = (manifest.get("reblend_path")
+                                     or reblend_bridge.find_reblend())
+                break
+        self.open_pack_btn.setEnabled(self.pack_dir is not None)
+        self.open_reblend_btn.setEnabled(
+            self.pack_scene is not None and self.pack_reblend is not None)
+
+    def _apply_preset_scale(self, host, gdir):
+        """Point the scale spinbox at the saved preset's scale, if the
+        selected capture has one — app preset first, then a matching
+        pattern preset. The user can still change it."""
+        scale, _app, _patterns = presets.resolve_pack_scale(
+            host=host,
+            group=None if host else os.path.basename(gdir or ""))
+        if scale is None:
+            return
+        self.scale_spin.blockSignals(True)
+        self.scale_spin.setValue(int(scale))
+        self.scale_spin.blockSignals(False)
+
+    def _refresh_reblend_status(self):
+        path = reblend_bridge.find_reblend()
+        if path:
+            self.reblend_label.setText(f"Reblend found at {path}")
+        else:
+            self.reblend_label.setText(
+                "Reblend not found — pick your Reblend folder to convert "
+                "models (capture and listing still work without it)")
+
+    def _choose_reblend(self):
+        path = QFileDialog.getExistingDirectory(
+            self, "Choose your Reblend folder", os.path.expanduser("~"))
+        if not path:
+            return
+        ok, msg = reblend_bridge.set_reblend_path(path)
+        if not ok:
+            QMessageBox.warning(self, "MIMIK", msg)
+            return
+        self._refresh_reblend_status()
+        self.assets_log.setText(msg)
+
+    def _import_assets_har(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Choose a HAR file", os.path.expanduser("~"),
+            "HAR files (*.har);;All files (*)")
+        if not path:
+            return
+        try:
+            groups = assets.extract_from_har(path)
+        except (OSError, ValueError) as e:
+            QMessageBox.warning(self, "MIMIK",
+                                f"could not read that HAR file: {e}")
+            return
+        total = sum(len(m["assets"]) for _d, m in groups)
+        self.assets_log.setText(
+            f"imported {total} asset(s) from {path}" if total
+            else "no assets in that HAR file")
+        self._refresh_asset_groups()
+
+    def _scan_assets_folder(self):
+        path = QFileDialog.getExistingDirectory(
+            self, "Choose a program folder to scan",
+            os.path.expanduser("~"))
+        if not path:
+            return
+        program = os.path.basename(os.path.abspath(path)) or "folder"
+        gdir, manifest = assets.scan_program_tree(path, program)
+        if not gdir:
+            self.assets_log.setText(f"no asset files in {path}")
+        else:
+            self.assets_log.setText(
+                f"saved {len(manifest['assets'])} asset(s) from {path}")
+        self._refresh_asset_groups()
+
+    def _build_pack(self):
+        gdir = self.asset_group.currentData()
+        if not gdir:
+            QMessageBox.warning(self, "MIMIK", "no captured assets yet — "
+                                "record an app or import a HAR first")
+            return
+        host = None
+        group = os.path.basename(gdir)
+        for gd, manifest in assets.list_asset_groups():
+            if gd == gdir:
+                host = manifest.get("host")
+                break
+        scale = float(self.scale_spin.value())
+        resolved, _app, _patterns = presets.resolve_pack_scale(
+            host=host, group=None if host else group)
+        if resolved is not None and scale == float(resolved):
+            # The spinbox still holds the preset's value — let the
+            # pack use the preset itself (and say so in the log).
+            scale = None
+        try:
+            result = reblend_bridge.build_pack(
+                host=host, group=None if host else group,
+                scale=scale)
+        except Exception as e:
+            QMessageBox.warning(self, "MIMIK", f"pack build failed: {e}")
+            return
+        self.pack_dir = result["pack_dir"]
+        self.pack_scene = result["scene_path"]
+        self.pack_reblend = result["reblend_path"]
+        lines = [f"pack: {result['pack_dir']}"]
+        if result.get("preset_applied"):
+            lines.append(f"preset: used the saved scale {result['scale']}")
+        if result.get("pattern_presets_applied"):
+            lines.append(
+                f"patterns: used the saved scale {result['scale']} from "
+                f"{', '.join(result['pattern_presets_applied'])}")
+        if result["scene_path"]:
+            lines.append(f"scene: {result['scene_path']}")
+            lines.append(f"models converted: {result['models_converted']}")
+        for note in result["notes"]:
+            lines.append(f"note: {note}")
+        for w in result["warnings"]:
+            lines.append(f"warning: {w}")
+        self.assets_log.setText("\n".join(lines))
+        self.open_pack_btn.setEnabled(True)
+        self.open_reblend_btn.setEnabled(result["scene_path"] is not None
+                                         and result["reblend_path"] is not None)
+        self._asset_group_selected()
+
+    def _open_pack_folder(self):
+        if self.pack_dir:
+            QDesktopServices.openUrl(QUrl.fromLocalFile(self.pack_dir))
+
+    def _open_in_reblend(self):
+        if not self.pack_scene or not self.pack_reblend:
+            return
+        ok, msg = reblend_bridge.open_in_reblend(self.pack_reblend,
+                                                 self.pack_scene)
+        if not ok:
+            QMessageBox.warning(self, "MIMIK", msg)
+            if self.pack_dir:
+                QDesktopServices.openUrl(QUrl.fromLocalFile(self.pack_dir))
+        else:
+            self.assets_log.append(msg)
+
+    # ---- Presets tab --------------------------------------------------------
+
+    def _presets_tab(self):
+        w = QWidget()
+        lay = QVBoxLayout(w)
+        lay.addWidget(QLabel(
+            "Presets are rules MIMIK learns from your captures — how an "
+            "app signs in, what its endpoints look like, where its assets "
+            "live. A saved preset makes the next client and the next pack "
+            "smarter, with no AI involved. Presets never hold passwords "
+            "or tokens — names and shapes only. Pattern presets learn "
+            "the shape itself — the same sign-in flow or API style — "
+            "and apply to any app that shows it."))
+
+        row = QHBoxLayout()
+        row.addWidget(QLabel("Learn from:"))
+        self.preset_source = QComboBox()
+        row.addWidget(self.preset_source, 1)
+        learn_btn = QPushButton("Learn preset")
+        learn_btn.clicked.connect(self._learn_preset)
+        row.addWidget(learn_btn)
+        refresh = QPushButton("Refresh")
+        refresh.clicked.connect(self._refresh_presets)
+        row.addWidget(refresh)
+        lay.addLayout(row)
+
+        self.auto_learn_check = QCheckBox(
+            "Learn presets from captures (refresh when a capture stops)")
+        self.auto_learn_check.setChecked(presets.auto_learn_enabled())
+        self.auto_learn_check.toggled.connect(self._toggle_auto_learn)
+        lay.addWidget(self.auto_learn_check)
+
+        lay.addWidget(QLabel("Saved presets:"))
+        self.presets_list = QListWidget()
+        self.presets_list.currentItemChanged.connect(self._preset_selected)
+        lay.addWidget(self.presets_list, 1)
+
+        lay.addWidget(QLabel("Pattern presets:"))
+        self.pattern_presets_list = QListWidget()
+        self.pattern_presets_list.currentItemChanged.connect(
+            self._pattern_preset_selected)
+        lay.addWidget(self.pattern_presets_list, 1)
+
+        self.preset_detail = QTextEdit()
+        self.preset_detail.setReadOnly(True)
+        lay.addWidget(self.preset_detail, 2)
+
+        row = QHBoxLayout()
+        delete_btn = QPushButton("Delete preset")
+        delete_btn.clicked.connect(self._delete_preset)
+        row.addWidget(delete_btn)
+        row.addStretch(1)
+        lay.addLayout(row)
+
+        self.presets_log = QLabel("")
+        self.presets_log.setWordWrap(True)
+        lay.addWidget(self.presets_log)
+
+        self._refresh_presets()
+        return w
+
+    def _refresh_presets(self):
+        sources = set()
+        for host, _n, _t in store.list_captures():
+            sources.add(host)
+        for _gdir, manifest in assets.list_asset_groups():
+            group = manifest.get("group")
+            if group:
+                sources.add(group)
+        current = self.preset_source.currentText()
+        self.preset_source.blockSignals(True)
+        self.preset_source.clear()
+        self.preset_source.addItems(sorted(sources))
+        self.preset_source.blockSignals(False)
+        if current:
+            self.preset_source.setCurrentText(current)
+        self.presets_list.clear()
+        for p in presets.list_presets():
+            item = QListWidgetItem(
+                f"{p['name']} ({p['scope']}) — {presets.summary(p)}")
+            item.setData(Qt.UserRole, p["name"])
+            self.presets_list.addItem(item)
+        self.pattern_presets_list.clear()
+        for p in presets.list_pattern_presets():
+            learned_from = p.get("learned_from") or []
+            item = QListWidgetItem(
+                f"{p.get('display_name') or p['name']} — learned from "
+                f"{len(learned_from)} "
+                f"app{'s' if len(learned_from) != 1 else ''}")
+            item.setData(Qt.UserRole, p["name"])
+            self.pattern_presets_list.addItem(item)
+        self._preset_selected()
+
+    def _preset_selected(self, _current=None, _prev=None):
+        item = self.presets_list.currentItem()
+        if item is None:
+            if self.pattern_presets_list.currentItem() is None:
+                self.preset_detail.setText("")
+            return
+        self.pattern_presets_list.blockSignals(True)
+        self.pattern_presets_list.setCurrentRow(-1)
+        self.pattern_presets_list.blockSignals(False)
+        preset = presets.load_preset(item.data(Qt.UserRole))
+        if preset is None:
+            self.preset_detail.setText("")
+            return
+        self.preset_detail.setText("\n".join(presets.describe(preset)))
+
+    def _pattern_preset_selected(self, _current=None, _prev=None):
+        item = self.pattern_presets_list.currentItem()
+        if item is None:
+            if self.presets_list.currentItem() is None:
+                self.preset_detail.setText("")
+            return
+        self.presets_list.blockSignals(True)
+        self.presets_list.setCurrentRow(-1)
+        self.presets_list.blockSignals(False)
+        preset = presets.load_pattern_preset(item.data(Qt.UserRole))
+        if preset is None:
+            self.preset_detail.setText("")
+            return
+        self.preset_detail.setText("\n".join(presets.describe(preset)))
+
+    def _learn_preset(self):
+        name = self.preset_source.currentText().strip()
+        if not name:
+            QMessageBox.warning(self, "MIMIK",
+                                "pick a capture to learn from first")
+            return
+        result = presets.learn(name)
+        patterns = presets.learn_patterns(name)
+        if result is None:
+            self.presets_log.setText(
+                f"nothing to learn from for {name} yet — capture it first")
+            return
+        preset, _path, created = result
+        verb = "Learned" if created else "Refreshed"
+        log = f"{verb} a preset for {name}: {presets.summary(preset)}"
+        if patterns:
+            names = ", ".join(p["name"] for p, _c in patterns)
+            log += (f" Patterns learned/updated: {names}")
+        self.presets_log.setText(log)
+        self._refresh_presets()
+
+    def _delete_preset(self):
+        item = self.presets_list.currentItem()
+        pattern_item = self.pattern_presets_list.currentItem()
+        if item is None and pattern_item is None:
+            QMessageBox.warning(self, "MIMIK", "select a preset first")
+            return
+        if pattern_item is not None:
+            fid = pattern_item.data(Qt.UserRole)
+            answer = QMessageBox.question(
+                self, "MIMIK", f"Delete the pattern preset {fid}?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+            if answer != QMessageBox.Yes:
+                return
+            presets.delete_pattern_preset(fid)
+            self.presets_log.setText(
+                f"Deleted the pattern preset {fid}.")
+            self._refresh_presets()
+            return
+        name = item.data(Qt.UserRole)
+        answer = QMessageBox.question(
+            self, "MIMIK", f"Delete the preset for {name}?",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if answer != QMessageBox.Yes:
+            return
+        presets.delete_preset(name)
+        self.presets_log.setText(f"Deleted the preset for {name}.")
+        self._refresh_presets()
+
+    def _toggle_auto_learn(self, checked):
+        presets.set_auto_learn(checked)
+        self.presets_log.setText(
+            "Presets will refresh when a capture stops."
+            if checked else
+            "Presets only learn when you press Learn preset.")
 
     # ---- Clients tab ----------------------------------------------------------
 
@@ -752,6 +1289,11 @@ class MainWindow(QMainWindow):
                      "wine (Windows capture target)")
         lines.append(f"{'✓' if wine.winlinx_available() else '–'}  "
                      "WinLinx (Windows capture target)")
+        rb = reblend_bridge.find_reblend()
+        lines.append(f"{'✓' if rb else '–'}  "
+                     "Reblend (asset packs)"
+                     + (f"  ({rb})" if rb else
+                        "  (pick the folder on the Assets tab)"))
         caps = store.list_captures()
         lines.append("")
         lines.append(f"saved captures: {len(caps)} host(s)")

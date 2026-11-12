@@ -38,6 +38,35 @@ echo "Installing packages (requests, PySide6, mitmproxy)…"
 ln -sf "$VENV/bin/mimik" "$BIN/mimik"
 ln -sf "$VENV/bin/mimik-gui" "$BIN/mimik-gui"
 
+# Verify the install actually worked before claiming success — v0.1.x
+# installed without PySide6, so the menu icon silently did nothing
+# (mimik-gui crashed on import, with no terminal to show the error).
+# Two checks: the packages must be present (fatal if not — that is the
+# installer's job), and the GUI must import (warning if not — that
+# depends on the machine's system Qt libraries, which the installer
+# cannot fix, so the user gets the reason instead of silence).
+echo "Verifying the install…"
+if ! "$VENV/bin/python" -c "import importlib.metadata as m; [m.version(p) for p in ('mimik', 'PySide6', 'mitmproxy')]; import mitmproxy" 2>/dev/null; then
+  echo
+  echo "Install FAILED: MIMIK, PySide6 or mitmproxy did not install."
+  echo "Check your network connection and re-run this installer."
+  exit 1
+fi
+if [ ! -x "$BIN/mimik-gui" ]; then
+  echo
+  echo "Install FAILED: mimik-gui is missing from $BIN."
+  exit 1
+fi
+if ! GUI_ERR="$("$VENV/bin/python" -c "import PySide6.QtWidgets, mimik.gui" 2>&1)"; then
+  echo
+  echo "WARNING: the GUI could not start on this machine, so the menu"
+  echo "icon may not open yet. This usually means system Qt libraries"
+  echo "are missing on this machine. The error was:"
+  echo "  $(echo "$GUI_ERR" | tail -1)"
+  echo "Install the missing system library, then re-run this installer."
+  echo
+fi
+
 # Icons
 for spec in "48 mimik-48.png" "128 mimik-128.png" "256 mimik-256.png"; do
   set -- $spec
