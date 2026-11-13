@@ -20,8 +20,6 @@ REBLEND_T9 = os.environ.get(
     os.path.join(os.path.expanduser("~"), "workspace",
                  "reblend-v02-t9-build", "reblend"))
 HAS_REBLEND = reblend_bridge._is_reblend_dir(REBLEND_T9)
-ICON_PNG = os.path.join(os.path.dirname(__file__), "..", "icons",
-                        "mimik-48.png")
 
 
 def run_cmd(func, args):

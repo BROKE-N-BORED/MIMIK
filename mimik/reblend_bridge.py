@@ -52,23 +52,23 @@ DEFAULT_SCALE = 100.0
 NEUTRAL_GRAY = "#808080"
 
 REBLEND_NOT_FOUND = (
-    "Reblend not found — point MIMIK at your Reblend folder "
+    "Reblend not found, point MIMIK at your Reblend folder "
     "(the folder with light_engine/ in it)"
 )
 
-AUDIO_NOTE = ("kept for the clone, not wired into a Reblend scene yet "
-              "— Reblend has no audio support")
-FONT_NOTE = ("kept for the clone, not wired into a Reblend scene yet "
-             "— Reblend has no font support")
-VIDEO_NOTE = ("kept for the clone, not wired into a Reblend scene yet "
-              "— Reblend has no video support")
-TEXTURE_NOTE = ("kept for the clone — convert to PNG to use it as a "
+AUDIO_NOTE = ("kept for the clone, not wired into a Reblend scene yet, "
+              "Reblend has no audio support")
+FONT_NOTE = ("kept for the clone, not wired into a Reblend scene yet, "
+             "Reblend has no font support")
+VIDEO_NOTE = ("kept for the clone, not wired into a Reblend scene yet, "
+              "Reblend has no video support")
+TEXTURE_NOTE = ("kept for the clone, convert to PNG to use it as a "
                 "Reblend texture (Reblend materials use procedural "
                 "textures, not DDS/KTX2 files)")
-GLTF_NOTE = "needs .glb — convert in Blender (File, Export, glTF 2.0)"
-FBX_DAE_NOTE = ("needs .glb — import in Blender (File, Import), then "
+GLTF_NOTE = "needs .glb, convert in Blender (File, Export, glTF 2.0)"
+FBX_DAE_NOTE = ("needs .glb, import in Blender (File, Import), then "
                 "Export glTF 2.0")
-IMAGE_MATERIAL_NOTE = ("color only — Reblend materials use procedural "
+IMAGE_MATERIAL_NOTE = ("color only, Reblend materials use procedural "
                        "textures, not image files")
 
 # Where a Reblend install might live on Joshua's Mint PC. The GUI
@@ -115,12 +115,13 @@ def set_reblend_path(path, base=None):
     """Remember a Reblend folder. Returns (ok, message)."""
     if not _is_reblend_dir(path):
         return False, (
-            f"{path} does not look like a Reblend folder — it needs "
+            f"{path} does not look like a Reblend folder, it needs "
             "light_engine/ with meshio.py, meshfile.py and scene.py in it")
     base = base or store.data_dir()
-    os.makedirs(base, exist_ok=True)
-    with open(_settings_path(base), "w") as fh:
-        json.dump({"path": os.path.abspath(path)}, fh)
+    store.ensure_private_dir(base)
+    store.atomic_write(_settings_path(base),
+                       json.dumps({"path": os.path.abspath(path)}),
+                       private=False)
     return True, f"Reblend folder set to {os.path.abspath(path)}"
 
 
@@ -162,7 +163,7 @@ def load_light_engine(reblend_path):
         if not existing_file.startswith(le_dir):
             raise RuntimeError(
                 "a different light_engine package is already loaded "
-                f"({existing_file}) — restart MIMIK to switch Reblend "
+                f"({existing_file}), restart MIMIK to switch Reblend "
                 "folders")
         le_pkg = existing
     else:
@@ -197,14 +198,14 @@ def average_color(image_path):
     """
     ext = os.path.splitext(image_path)[1].lower()
     if ext == ".svg":
-        return NEUTRAL_GRAY, "SVG — average color not computed"
+        return NEUTRAL_GRAY, "SVG, average color not computed"
     try:
         from PySide6.QtGui import QImage
     except ImportError:
-        return NEUTRAL_GRAY, "PySide6 not available — color not computed"
+        return NEUTRAL_GRAY, "PySide6 not available, color not computed"
     img = QImage(image_path)
     if img.isNull():
-        return NEUTRAL_GRAY, "image could not be read — color not computed"
+        return NEUTRAL_GRAY, "image could not be read, color not computed"
     if max(img.width(), img.height()) > 32:
         img = img.scaled(32, 32)
     r = g = b = n = 0
@@ -216,7 +217,7 @@ def average_color(image_path):
             b += px & 0xFF
             n += 1
     if not n:
-        return NEUTRAL_GRAY, "empty image — color not computed"
+        return NEUTRAL_GRAY, "empty image, color not computed"
     return "#%02x%02x%02x" % (r // n, g // n, b // n), None
 
 
@@ -246,7 +247,7 @@ def convert_model(asset_path, assets_dir, scale, le, used):
     result["warnings"].extend(report.get("warnings", []))
     if le.meshio.is_heavy(result["triangles"]):
         result["warnings"].append(
-            f"{result['triangles']:,} triangles — heavy on this machine, "
+            f"{result['triangles']:,} triangles, heavy on this machine, "
             "imported anyway")
     for item in objects:
         filename = le.meshio.unique_asset_name(
@@ -338,22 +339,23 @@ def build_pack(host=None, group=None, group_name=None, reblend=None,
     assets_out = os.path.join(pack_dir, "assets")
     textures_out = os.path.join(pack_dir, "textures")
     originals_out = os.path.join(pack_dir, "originals")
+    store.ensure_private_dir(packs_dir(base))
     for d in (assets_out, textures_out, originals_out):
-        os.makedirs(d, exist_ok=True)
+        store.ensure_private_dir(d)
 
     reblend_path = find_reblend(reblend, base=base)
     le = None
     notes = []
     warnings = []
     if reblend_path is None:
-        notes.append(REBLEND_NOT_FOUND + " — the pack still holds the "
+        notes.append(REBLEND_NOT_FOUND + ", the pack still holds the "
                      "captured originals; conversions are pending")
     else:
         try:
             le = load_light_engine(reblend_path)
         except (RuntimeError, ImportError, OSError) as exc:
             notes.append(f"Reblend found at {reblend_path} but its "
-                         f"light_engine could not be loaded ({exc}) — "
+                         f"light_engine could not be loaded ({exc}), "
                          "the pack still holds the captured originals; "
                          "conversions are pending")
             reblend_path = None
@@ -375,7 +377,7 @@ def build_pack(host=None, group=None, group_name=None, reblend=None,
         counts[kind] = counts.get(kind, 0) + 1
         src = assets_mod.asset_file_path(entry, base)
         if not src or not os.path.isfile(src):
-            warnings.append(f"{entry.get('name')}: saved bytes are gone — "
+            warnings.append(f"{entry.get('name')}: saved bytes are gone, "
                             "skipped")
             continue
         name = entry.get("name") or os.path.basename(src)
@@ -409,7 +411,7 @@ def build_pack(host=None, group=None, group_name=None, reblend=None,
                       "original": f"originals/{os.path.basename(dest)}"}
             if le is None:
                 record["ok"] = False
-                record["note"] = "Reblend not found — conversion pending"
+                record["note"] = "Reblend not found, conversion pending"
             else:
                 conv = convert_model(src, assets_out, scale, le, used_names)
                 record.update({"ok": conv["ok"],
@@ -460,7 +462,7 @@ def build_pack(host=None, group=None, group_name=None, reblend=None,
     scene_path = None
     scene_name = f"{_safe_app(app)}.json"
     if le is not None and scene_objects:
-        scene = le.scene.new_scene(f"{app} — MIMIK asset pack")
+        scene = le.scene.new_scene(f"{app}, MIMIK asset pack")
         for obj in scene_objects:
             sobj = le.scene.new_object("mesh", name=obj["name"],
                                        material=obj.get("material"))
@@ -472,7 +474,7 @@ def build_pack(host=None, group=None, group_name=None, reblend=None,
         scene_path = os.path.join(pack_dir, scene_name)
         le.scene.save_scene(scene, scene_path)
     elif le is not None:
-        notes.append("no 3D models converted — no scene file was written "
+        notes.append("no 3D models converted, no scene file was written "
                      "(images, audio and fonts travel as originals)")
 
     pack = {
@@ -494,8 +496,8 @@ def build_pack(host=None, group=None, group_name=None, reblend=None,
         "warnings": warnings,
         "notes": notes,
     }
-    with open(os.path.join(pack_dir, "pack.json"), "w") as fh:
-        json.dump(pack, fh, indent=2)
+    store.atomic_write(os.path.join(pack_dir, "pack.json"),
+                       json.dumps(pack, indent=2), private=False)
 
     # Remember the scale used, on the preset (when one exists) and on
     # the pattern presets that applied — the next build reuses it.
@@ -635,7 +637,7 @@ def open_in_reblend(reblend_path, scene_path,
     args = reblend_launch_args(reblend_path, scene_path)
     if args is None:
         return False, (
-            "Reblend cannot be launched from here — open the pack folder "
+            "Reblend cannot be launched from here, open the pack folder "
             "and open the scene from Reblend's File menu instead")
     try:
         launch.launch_checked(args, settle=settle, label="Reblend")

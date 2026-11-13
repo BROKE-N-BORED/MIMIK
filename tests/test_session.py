@@ -6,6 +6,7 @@ import unittest
 from unittest import mock
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+sys.path.insert(0, os.path.dirname(__file__))  # for test_websocket
 
 from mimik import App, Session, store
 
@@ -301,6 +302,24 @@ class TimeoutTests(unittest.TestCase):
         client._http.request.return_value = FakeResponse(200, {"users": []})
         client.get_users()
         self.assertEqual(client._http.request.call_args[1]["timeout"], 30)
+
+
+class WsReplayTests(unittest.TestCase):
+    """v0.4 item 13: Session.ws_replay against the echo server."""
+
+    def test_ws_replay_echo(self):
+        from test_websocket import EchoServer
+
+        with EchoServer() as server:
+            session = Session(f"http://127.0.0.1:{server.port}",
+                              headers={})
+            replies = session.ws_replay("/chat", ["hi", b"\x00\x01"])
+            self.assertEqual(replies, ["hi", b"\x00\x01"])
+
+    def test_ws_replay_dead_server_raises(self):
+        session = Session("http://127.0.0.1:9", headers={})
+        with self.assertRaises(ConnectionError):
+            session.ws_replay("/chat", ["hi"], timeout=2)
 
 
 if __name__ == "__main__":

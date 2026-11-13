@@ -41,7 +41,7 @@ MAX_EXTRACT_BYTES = 2 * 1024 * 1024 * 1024   # 2 GiB total, all members
 MAX_EXTRACT_FILES = 50000                    # file members, dirs excluded
 
 WINLINX_MESSAGE = (
-    "Windows programs are WinLinx's job — run it there.\n"
+    "Windows programs are WinLinx's job, run it there.\n"
     "MIMIK never runs Windows programs. To capture a Windows program's\n"
     "traffic for cloning, launch it in WinLinx, then use:\n"
     "    mimik record --target windows"
@@ -145,11 +145,11 @@ def _check_extract_caps(n_files, total_bytes, max_bytes, max_files):
     """Refuse an archive over the extraction caps (review #19)."""
     if n_files > max_files:
         raise LaunchError(
-            f"archive holds {n_files} files — over the "
+            f"archive holds {n_files} files, over the "
             f"{max_files}-file extraction cap, refused")
     if total_bytes > max_bytes:
         raise LaunchError(
-            f"archive expands to {total_bytes // (1024 * 1024)} MB — "
+            f"archive expands to {total_bytes // (1024 * 1024)} MB, "
             f"over the {max_bytes // (1024 * 1024)} MB extraction cap, "
             "refused")
 
@@ -174,7 +174,7 @@ def _extract_zip(path, dest, max_bytes, max_files):
             if written > max_bytes:
                 raise LaunchError(
                     f"archive expands past the "
-                    f"{max_bytes // (1024 * 1024)} MB extraction cap — "
+                    f"{max_bytes // (1024 * 1024)} MB extraction cap, "
                     "refused, nothing extracted")
 
 
@@ -198,8 +198,8 @@ def _extract_tar(path, dest, max_bytes, max_files):
                 if written > max_bytes:
                     raise LaunchError(
                         f"archive expands past the "
-                        f"{max_bytes // (1024 * 1024)} MB extraction cap "
-                        "— refused, nothing extracted")
+                        f"{max_bytes // (1024 * 1024)} MB extraction cap, "
+                        "refused, nothing extracted")
 
 
 def extract_archive(path, dest, max_bytes=MAX_EXTRACT_BYTES,
@@ -232,7 +232,7 @@ def extract_deb(path, dest):
     """Extract a .deb with dpkg-deb -x (no sudo). Returns dest."""
     if shutil.which("dpkg-deb") is None:
         raise LaunchError(
-            "dpkg-deb not found — install it with: sudo apt install dpkg-dev"
+            "dpkg-deb not found, install it with: sudo apt install dpkg-dev"
         )
     os.makedirs(dest, exist_ok=True)
     subprocess.run(["dpkg-deb", "-x", path, dest], check=True)
@@ -491,7 +491,7 @@ def prepare_file(path, pick=None, deb_install=False):
         cands = find_executables(dest)
         return _plan_from_candidates(kind, path, dest, cands, pick)
     raise LaunchError(
-        f"don't know how to launch {os.path.basename(path)} — MIMIK handles "
+        f"don't know how to launch {os.path.basename(path)}, MIMIK handles "
         "Linux programs, AppImages, executables, scripts, archives (.zip, "
         ".tar.gz), disk images (.iso, .img), and .deb packages."
     )
@@ -500,7 +500,7 @@ def prepare_file(path, pick=None, deb_install=False):
 def _plan_from_candidates(kind, source, work_dir, cands, pick, mount=None):
     if not cands:
         raise LaunchError(
-            f"no program found inside {os.path.basename(source)} — nothing "
+            f"no program found inside {os.path.basename(source)}, nothing "
             "executable in there to launch"
         )
     if pick is not None:
@@ -521,7 +521,7 @@ def _plan_from_candidates(kind, source, work_dir, cands, pick, mount=None):
     return LaunchPlan(kind, source, command=build_launch_command(cands[0]),
                       work_dir=work_dir, mount=mount, candidates=cands,
                       message=f"auto-picked {cands[0]} "
-                              f"({len(cands)} programs found — pick another "
+                              f"({len(cands)} programs found, pick another "
                               "with --pick N)")
 
 
@@ -629,7 +629,7 @@ def launch_process(plan, proxy=PROXY_URL, settle=LAUNCH_SETTLE_SECONDS):
     if plan.install_command:
         subprocess.run(plan.install_command, check=True)
     if not plan.command:
-        raise LaunchError("no program chosen yet — pick one first")
+        raise LaunchError("no program chosen yet, pick one first")
     env = dict(os.environ)
     env.update(proxy_env(proxy))
     return launch_checked(plan.command, env=env, cwd=plan.work_dir or None,

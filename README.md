@@ -37,6 +37,12 @@ PySide6 + mitmproxy, and puts `mimik` and `mimik-gui` on your PATH
 Terminal way: `bash install.sh` (bash, not sh). Uninstall: `bash uninstall.sh`
 — captures and generated clients are kept unless you pass `--purge`.
 
+From a git clone: every file arrives without exec bits (the GitHub push
+path can't set file modes), so run `bash install.sh` — the installer
+fixes the scripts' bits itself. The Release zip is the install path:
+its scripts arrive executable, so double-clicking Install MIMIK works
+straight from the unzip.
+
 ## Quick start
 
 ```bash
@@ -55,6 +61,15 @@ so `hosts`, `learn`, `gen`, and generated clients keep working after the
 proxy stops — and after a reboot. Captures contain live session tokens:
 capture files, preset files, and the mitmweb log are all written with
 0600 permissions (owner only), so don't share them or loosen them.
+
+Stop-time screenshot (v0.4): `mimik record --screenshot`, or the
+"Screenshot the desktop when recording stops" checkbox on the Record
+tab, takes one desktop screenshot when recording stops (while the
+target app is still up) and saves it with the capture at
+`~/.local/share/mimik/captures/screenshots/screenshot-<timestamp>.png`,
+for reference. Off by default. The GUI uses Qt; the CLI uses
+gnome-screenshot, scrot, or ImageMagick's import, whichever is
+installed. A failed screenshot never loses the capture.
 
 ## Capture targets
 
@@ -353,6 +368,7 @@ What a preset changes (nothing changes where no preset exists):
 | `mimik record [--target android\|linux-app\|file\|web\|windows]` | Start the proxy and capture a target |
 | `mimik record --target file --file <path> [--pick N] [--deb-install]` | Capture a program from a file |
 | `mimik record --target linux-app --launch "<cmd>"` | Launch an app through the proxy |
+| `mimik record --screenshot` | Screenshot the desktop when recording stops (saved with the capture) |
 | `mimik doctor` | Check python, requests, mitmproxy, Qt, Ollama, CA cert, wine/WinLinx |
 | `mimik hosts [--har FILE] [--curl FILE]` | List captured hosts |
 | `mimik learn <host> [--har FILE] [--curl FILE]` | Show endpoints for a host |
@@ -365,19 +381,48 @@ What a preset changes (nothing changes where no preset exists):
 | `mimik presets show <name>` | Show a preset in plain language |
 | `mimik presets match <host\|group>` | Show which pattern presets would apply (dry run) |
 | `mimik presets delete <name> [--yes]` | Delete a preset |
+| `mimik unpin <target> [--android\|--linux] [--ca PATH] [--proxy-host HOST] [--workdir DIR]` | Defeat cert pinning via Frida so a pinned app can be captured |
+
+## Pinned apps — `mimik unpin` (v0.4)
+
+A pinned app rejects the proxy's certificate, so it shows no traffic.
+`mimik unpin` fixes that app-side: it fetches the maintained Frida
+unpinning scripts (httptoolkit/frida-interception-and-unpinning),
+bakes your mitmproxy CA + proxy address into them, and prints the
+exact `frida` command to run. Three targets:
+
+- **Android, rooted**: `mimik unpin com.example.app` — attaches over
+  USB to frida-server on the phone and spawns the app.
+- **Android, stock**: `mimik unpin app.apk` — injects the Frida gadget
+  into the APK (`objection patchapk`), you install the patched APK,
+  then attach to the gadget. Installing it replaces the original
+  (different signature), so uninstall the original first.
+- **Linux program**: `mimik unpin /usr/bin/app` — attaches Frida to a
+  local program.
+
+Also in the GUI: File → Unpin a pinned app… `mimik doctor` lists the
+tools it needs (git, frida, objection) as optional checks. The hooks
+cover OpenSSL/BoringSSL; Flutter apps and apps on another TLS stack
+still show no traffic (see Honest limits). Your own apps on your own
+devices only.
 
 ## Honest limits
 
-- **Certificate pinning**: pinned apps show no traffic. MIMIK has no
-  unpinning bypass in v0.1 (upstream's Frida `unpin` is not ported).
+- **Certificate pinning**: pinned apps show no traffic unless unpinned
+  first — see `mimik unpin` above. The Frida hooks cover
+  OpenSSL/BoringSSL; Flutter apps (private BoringSSL, proxy ignored)
+  and apps on another TLS stack (NSS, GnuTLS, Rust) still show no
+  traffic. Live Frida execution needs a real device or a real Linux
+  app and hasn't been verified in a headless test.
 - **DPoP / request signing**: APIs that bind requests to a device key or
   sign each request can't be replayed from captured headers alone.
 - **Android 7+ user CAs**: apps that don't opt in won't trust the mitm CA.
 - **Some desktop apps** ignore proxy env vars or use their own cert store.
 - **Windows capture** needs WinLinx + wine and can't be verified without a
   real PC run — it needs your real-PC verdict.
-- **Cloning in other languages**: v0.1 generates Python only. Other
-  languages are the next step after v0.1, not part of this release.
+- **Cloning in other languages**: MIMIK generates Python only. Other
+  languages come later (multi-language codegen is queued, pending a
+  language pick), not part of this release.
 - **Asset packs**: images become color-only materials (Reblend has no
   image textures), audio/fonts are kept but not wired into scenes,
   `.gltf` needs a `.glb` conversion in Blender. See the Assets section.
@@ -396,6 +441,6 @@ What a preset changes (nothing changes where no preset exists):
 
 ## Credits
 
-Linux port of [littledivy/mimic](https://github.com/littledivy/mimic)
-(MIT, Copyright (c) 2026 Divy Srivastava). See LICENSE-NOTICE for the full
-attribution and license text.
+MIMIK is released under the MIT License — see LICENSE. Linux port of
+[littledivy/mimic](https://github.com/littledivy/mimic) (MIT, Copyright
+(c) 2026 Divy Srivastava); see LICENSE-NOTICE for the full attribution.

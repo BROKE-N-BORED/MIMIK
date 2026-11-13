@@ -575,6 +575,16 @@ class SettingsTests(unittest.TestCase):
             fh.write("{not json")
         self.assertFalse(presets.auto_learn_enabled(base=self.tmp))
 
+    def test_screenshot_default_off(self):
+        # v0.4 item 15: a desktop screenshot is opt-in.
+        self.assertFalse(presets.screenshot_enabled(base=self.tmp))
+
+    def test_screenshot_set_on_and_off(self):
+        presets.set_screenshot_enabled(True, base=self.tmp)
+        self.assertTrue(presets.screenshot_enabled(base=self.tmp))
+        presets.set_screenshot_enabled(False, base=self.tmp)
+        self.assertFalse(presets.screenshot_enabled(base=self.tmp))
+
 
 class AfterRecordTests(unittest.TestCase):
     def setUp(self):

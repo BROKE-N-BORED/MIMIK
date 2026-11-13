@@ -32,7 +32,7 @@ class DoctorTests(unittest.TestCase):
                          {"ok", "required", "mitmweb_running",
                           "optional", "info"})
         self.assertEqual(len(result["required"]), 4)
-        self.assertEqual(len(result["optional"]), 5)
+        self.assertEqual(len(result["optional"]), 8)
         self.assertEqual(len(result["info"]), 3)
         for c in result["required"] + result["optional"]:
             self.assertIn("name", c)
@@ -43,6 +43,12 @@ class DoctorTests(unittest.TestCase):
         self.assertIn("requests library", names)
         self.assertIn("proxy (mitmweb or uvx)", names)
         self.assertIn("Qt GUI (PySide6)", names)
+        # v0.4 item 14: the unpin tools are optional checks.
+        opt_names = [c["name"] for c in result["optional"]]
+        self.assertIn("git (fetch unpinning scripts)", opt_names)
+        self.assertIn("frida (defeat pinning in the app)", opt_names)
+        self.assertIn("objection (patch APKs for the Frida gadget)",
+                      opt_names)
         self.assertFalse(result["mitmweb_running"])
         self.assertIn("disk usage:", result["info"][1])
         self.assertIn("LAN IP", result["info"][2])

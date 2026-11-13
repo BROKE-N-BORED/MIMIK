@@ -12,6 +12,8 @@ import os
 
 import requests
 
+from .. import websocket as ws_mod
+
 DEFAULT_URL = os.environ.get("MITM_URL", "http://127.0.0.1:8081")
 DEFAULT_TOKEN = os.environ.get("MITM_TOKEN", "test")
 
@@ -45,7 +47,7 @@ class Mitm:
                            proxies=_NO_PROXY, timeout=5)
         except requests.RequestException as e:
             raise MitmError(
-                f"can't reach mitmweb at {self.url} — is it running? "
+                f"can't reach mitmweb at {self.url}, is it running? "
                 f"start it with `mimik record` (original error: {e})"
             )
 
@@ -66,6 +68,52 @@ class Mitm:
         )
         return r.content
 
+    def ws_messages(self, flow_id):
+        """WebSocket messages for a flow (v0.4 item 13).
+
+        Returns [{"from_client", "timestamp", "text"} |
+        {"from_client", "timestamp", "b64"}] — text for text messages,
+        base64 for binary ones. Fetches the auto + raw content views:
+        text comes from "raw" (exact), binary from "auto"'s hex dump
+        (parsed back to bytes). A hex dump that won't parse is kept as
+        text — visible in the transcript, replayed as text.
+        Raises MitmError when mitmweb doesn't answer.
+        """
+        self._auth()
+        views = {}
+        for view in ("auto", "raw"):
+            try:
+                r = self._http.get(
+                    f"{self.url}/flows/{flow_id}/messages/content/"
+                    f"{view}.json",
+                    proxies=_NO_PROXY, timeout=15)
+            except requests.RequestException as e:
+                raise MitmError(f"can't fetch WS messages: {e}")
+            if r.status_code != 200:
+                raise MitmError(
+                    f"mitmweb WS messages returned {r.status_code}")
+            views[view] = r.json()
+        auto = views["auto"]
+        raw = views["raw"]
+        out = []
+        for i, message in enumerate(auto):
+            entry = {"from_client": message.get("from_client", True),
+                     "timestamp": message.get("timestamp", 0)}
+            if message.get("view_name") == "Hex Dump":
+                parsed = ws_mod.parse_hex_dump(message.get("text", ""))
+                if parsed is not None:
+                    import base64
+
+                    entry["b64"] = base64.b64encode(parsed).decode("ascii")
+                else:
+                    entry["text"] = message.get("text", "")
+            elif i < len(raw):
+                entry["text"] = raw[i].get("text", "")
+            else:
+                entry["text"] = message.get("text", "")
+            out.append(entry)
+        return out
+
 
 def hosts(flows):
     """Count requests per host, most frequent first."""
@@ -84,11 +132,14 @@ def endpoints(mitm, flows, host):
     endpoint wins, so bodies reflect the most recent real call.
     """
     by_key = {}
+    counts = {}
     for f in flows:
         req = f.get("request")
         if not req or req["host"] != host:
             continue
-        by_key[(req["method"], req["path"].split("?")[0])] = f
+        key = (req["method"], req["path"].split("?")[0])
+        by_key[key] = f
+        counts[key] = counts.get(key, 0) + 1
 
     out = []
     for (method, path), f in by_key.items():
@@ -102,9 +153,32 @@ def endpoints(mitm, flows, host):
                 "query": req["path"].split("?", 1)[1] if "?" in req["path"] else "",
                 "request_body": _decode(mitm.body(f["id"], "request")),
                 "response_body": _decode(mitm.body(f["id"], "response")),
+                # The sample flow itself (v0.4 item 10) — the GUI's
+                # Replay button re-sends it.
+                "flow": f,
+                # How many captured calls fed this endpoint (v0.4
+                # item 11) — codegen flags single-sample methods.
+                "samples": counts[(method, path)],
+                # WebSocket (v0.4 item 13): the sample flow's messages,
+                # fetched live — codegen turns them into a ws_replay
+                # method. A failed fetch means an empty session, never
+                # a failed endpoint list.
+                "websocket": ws_mod.is_websocket_flow(f),
+                "ws_messages": _live_ws_messages(mitm, f),
             }
         )
     return out
+
+
+def _live_ws_messages(mitm, flow):
+    """A live flow's WS messages, or [] (not a WS flow, or the fetch
+    failed — the endpoint list must never break on a WS fetch)."""
+    if not ws_mod.is_websocket_flow(flow):
+        return []
+    try:
+        return mitm.ws_messages(flow["id"])
+    except Exception:
+        return []
 
 
 def endpoints_from_saved(flows, host):
@@ -117,11 +191,14 @@ def endpoints_from_saved(flows, host):
     import base64
 
     by_key = {}
+    counts = {}
     for f in flows:
         req = f.get("request")
         if not req or req["host"] != host:
             continue
-        by_key[(req["method"], req["path"].split("?")[0])] = f
+        key = (req["method"], req["path"].split("?")[0])
+        by_key[key] = f
+        counts[key] = counts.get(key, 0) + 1
 
     out = []
     for (method, path), f in by_key.items():
@@ -135,6 +212,16 @@ def endpoints_from_saved(flows, host):
                 "query": req["path"].split("?", 1)[1] if "?" in req["path"] else "",
                 "request_body": _saved_body(f, "request", base64),
                 "response_body": _saved_body(f, "response", base64),
+                # The sample flow itself (v0.4 item 10) — the GUI's
+                # Replay button re-sends it.
+                "flow": f,
+                # How many captured calls fed this endpoint (v0.4
+                # item 11) — codegen flags single-sample methods.
+                "samples": counts[(method, path)],
+                # WebSocket (v0.4 item 13): the saved messages ride
+                # with the flow (see store._embed_bodies).
+                "websocket": ws_mod.is_websocket_flow(f),
+                "ws_messages": ws_mod.ws_messages(f),
             }
         )
     return out

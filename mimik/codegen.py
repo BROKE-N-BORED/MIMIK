@@ -10,6 +10,7 @@ small local model if one is already there — never downloads anything);
 (b) the `claude` or `opencode` CLI if installed; (c) --prompt-only prints the
 prompt. Any polish failure silently falls back to the deterministic output.
 """
+import base64
 import json
 import re
 import subprocess
@@ -102,7 +103,12 @@ def class_name_for_host(host):
         words = [w for w in re.split(r"[^a-zA-Z0-9]+", label.lower()) if w]
         kept = [w for w in words if w not in _GENERIC_LABEL_WORDS]
         if kept:
-            return _camel("_".join(kept)) + "Client"
+            name = _camel("_".join(kept)) + "Client"
+            # A class name can't start with a digit — an IP host like
+            # 127.0.0.1 would give 127Client, a SyntaxError.
+            if name[0].isdigit():
+                name = "Host" + name
+            return name
     return "ApiClient"
 
 
@@ -227,12 +233,16 @@ def _render_method(ep, used_names):
     """Render one endpoint as a method source block. Returns (name, source)."""
     method, path = ep["method"].upper(), ep["path"]
     base = method_name_for(method, path)
+    if ep.get("websocket") and not base.endswith("_ws"):
+        base += "_ws"
     name = base
     n = 2
     while name in used_names:
         name = f"{base}_{n}"
         n += 1
     used_names.add(name)
+    if ep.get("websocket"):
+        return name, _render_ws_method(ep, name)
 
     _parts, path_params = _path_parts(path)
     params, literals, query_params = _params_for_endpoint(ep)
@@ -253,6 +263,10 @@ def _render_method(ep, used_names):
     # Path with {param} placeholders for f-string substitution.
     url = _url_with_params(path)
     lines.append(f'        """{method} {url} -> {ep.get("status")}."""')
+    if ep.get("samples") == 1:
+        # v0.4 item 11: one captured call built this method — say so.
+        lines.append("        # Single sample: one captured call built "
+                     "this method.")
 
     use_json = method in ("POST", "PUT", "PATCH")
     body_lines = []
@@ -294,6 +308,45 @@ def _render_method(ep, used_names):
     return name, "\n".join(lines)
 
 
+def _render_ws_method(ep, name):
+    """A WebSocket endpoint as a ws_replay method (v0.4 item 13).
+
+    The captured client->server messages are embedded as the default
+    session; pass messages=[...] to send something else. Text embeds
+    as a string, binary as bytes.fromhex(...).
+    """
+    method, path = ep["method"].upper(), ep["path"]
+    _parts, path_params = _path_parts(path)
+    url = _url_with_params(path)
+    sig = ", ".join(["self"] + path_params + ["messages=None"])
+    url_expr = f'f"{url}"' if path_params else f'"{url}"'
+    lines = [f"    def {name}({sig}):",
+             f'        """{method} {url} -> {ep.get("status")} (WebSocket)."""']
+    if ep.get("samples") == 1:
+        lines.append("        # Single sample: one captured call built "
+                     "this method.")
+    literals = []
+    for message in ep.get("ws_messages") or []:
+        if not message.get("from_client"):
+            continue
+        if message.get("b64") is not None:
+            try:
+                raw = base64.b64decode(message["b64"])
+            except (ValueError, TypeError):
+                continue
+            literals.append(f"bytes.fromhex({raw.hex()!r})")
+        else:
+            literals.append(repr(message.get("text", "")))
+    lines.append("        if messages is None:")
+    if literals:
+        lines.append(f"            messages = [{', '.join(literals)}]")
+    else:
+        lines.append("            messages = []  # no client messages "
+                     "captured")
+    lines.append(f"        return self.ws_replay({url_expr}, messages)")
+    return "\n".join(lines)
+
+
 def _url_with_params(path):
     """Rewrite a captured path so ids become {param} slots.
 
@@ -323,17 +376,22 @@ def _generalize_endpoints(endpoints):
     /users/123 and /users/456 become one /users/{id} endpoint — the
     first sample's bodies win. Returns new dicts; the input is
     untouched. Without this, a first run (no preset learned yet)
-    generates one method per concrete id.
+    generates one method per concrete id. Sample counts (v0.4 item
+    11) SUM across the merged endpoints — a generalized method built
+    from two concrete endpoints is multi-sample by construction.
     """
-    seen = set()
+    seen = {}
     out = []
     for ep in endpoints:
         key = (ep["method"].upper(), generalize_path(ep["path"]))
         if key in seen:
+            merged = seen[key]
+            merged["samples"] = (merged.get("samples", 1)
+                                 + ep.get("samples", 1))
             continue
-        seen.add(key)
         merged = dict(ep)
         merged["path"] = key[1]
+        seen[key] = merged
         out.append(merged)
     return out
 
@@ -396,14 +454,23 @@ def generate_deterministic(host, endpoints, preset=None, preset_label=None,
     applied_note = ""
     if applied:
         applied_note = "\n# Presets applied: " + "; ".join(applied)
-    return f'''"""{cls} — {GENERATED_MARKER} from your own captured traffic.
+    # v0.4 item 11: the docstring counts the single-sample methods.
+    single = sum(1 for ep in eps if ep.get("samples") == 1)
+    sample_note = ""
+    if single:
+        sample_note = (
+            f"\n{single} of {len(eps)} "
+            f"endpoint{'s' if len(eps) != 1 else ''} "
+            f"come{'s' if single == 1 else ''} from a single captured "
+            "sample, those methods are marked below. Re-record with "
+            "more traffic to firm them up.\n")
+    return f'''"""{cls}, {GENERATED_MARKER} from your own captured traffic.
 
 Own accounts only: this client replays YOUR session for YOUR apps.
-Auth is pulled from your live mitmweb or your saved capture — no tokens
-are stored in this file. Requests time out after 30 s by default —
-pass timeout=... to the constructor or any call to change it.
+Auth is pulled from your live mitmweb or your saved capture, no tokens
+are stored in this file. Requests time out after 30 s by default, pass timeout=... to the constructor or any call to change it.
 Personal values from your captures (names, cities, and the like) are
-method parameters, never baked-in literals.
+method parameters, never baked-in literals.{sample_note}
 Edit freely.
 """{applied_note}
 
@@ -434,7 +501,7 @@ their own account. Your job: turn it into a clean, ergonomic client library.
 Rules:
 - Output ONE Python file, nothing else. No prose, no markdown fences.
 - Subclass `mimik.App`. Set `HOST = "{host}"`. Auth/device headers are pulled \
-automatically by the base class — do NOT hardcode tokens or headers.
+automatically by the base class, do NOT hardcode tokens or headers.
 - Give methods human names for what they DO (get_posts, like, send_message), \
 not the raw path. Infer intent from the path, bodies, and status codes.
 - Use self.get(path)/self.post(path, json=body). Both return parsed JSON.
@@ -473,6 +540,13 @@ def build_digest(endpoints):
     parts = []
     for e in endpoints:
         block = [f"### {e['method']} {e['path']}  -> {e['status']}"]
+        if e.get("websocket"):
+            block[0] += " (WebSocket)"
+            messages = e.get("ws_messages") or []
+            n_client = sum(1 for m in messages if m.get("from_client"))
+            n_server = len(messages) - n_client
+            block.append(f"ws session: {n_client} client -> server, "
+                         f"{n_server} server -> client")
         if e["query"]:
             block.append(f"query: {e['query']}")
         if e["request_body"]:
@@ -593,11 +667,11 @@ def generate(host, endpoints, polish="none", model=None, preset=None,
     if polish == "ollama":
         source, ok = polish_ollama(source, host, model=model)
         if not ok:
-            print("ollama polish unavailable — keeping deterministic output",
+            print("ollama polish unavailable, keeping deterministic output",
                   file=sys.stderr)
     elif polish in ("claude", "opencode"):
         source, ok = polish_cli(source, host, polish)
         if not ok:
-            print(f"{polish} polish unavailable — keeping deterministic output",
+            print(f"{polish} polish unavailable, keeping deterministic output",
                   file=sys.stderr)
     return source

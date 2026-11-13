@@ -37,6 +37,13 @@ class HarTests(unittest.TestCase):
         # latest (page=2) wins over the earlier 500
         self.assertEqual(users[0]["status"], 200)
 
+    def test_endpoints_carry_sample_counts(self):
+        # /v1/users was captured twice (page=1, page=2); /v1/messages once.
+        eps = har.endpoints(FIXTURE, "api.example.com")
+        by_path = {e["path"]: e for e in eps}
+        self.assertEqual(by_path["/v1/users"]["samples"], 2)
+        self.assertEqual(by_path["/v1/messages"]["samples"], 1)
+
     def test_session_from_har(self):
         s = Session.from_har(FIXTURE, "api.example.com")
         self.assertEqual(s.base_url, "https://api.example.com")

@@ -20,22 +20,20 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, os.path.dirname(__file__))  # for test_assets helpers
 
 from mimik import assets, reblend_bridge
-from test_assets import make_wav, read_t9, saved_flow
+from test_assets import (icon_png_bytes, icon_png_path, make_wav, read_t9,
+                         saved_flow)
 
 REBLEND_T9 = os.environ.get(
     "REBLEND_FIXTURE",
     os.path.join(os.path.expanduser("~"), "workspace",
                  "reblend-v02-t9-build", "reblend"))
 HAS_REBLEND = reblend_bridge._is_reblend_dir(REBLEND_T9)
-ICON_PNG = os.path.join(os.path.dirname(__file__), "..", "icons",
-                        "mimik-48.png")
 
 
 def seed_game_assets(base):
     """A capture group for game.example.com: real .glb + .obj + PNG +
     WAV + a .gltf stub + a font stub. Returns the group dir."""
-    with open(ICON_PNG, "rb") as fh:
-        png = fh.read()
+    png = icon_png_bytes()
     wav_path = os.path.join(base, "sfx.wav")
     make_wav(wav_path)
     with open(wav_path, "rb") as fh:
@@ -239,7 +237,7 @@ class ColorTests(unittest.TestCase):
         os.environ.get("MIMIK_TEST_QIMAGE") == "1",
         "QImage path tested under the Qt env only")
     def test_qimage_average_color(self):
-        color, note = reblend_bridge.average_color(ICON_PNG)
+        color, note = reblend_bridge.average_color(icon_png_path())
         self.assertIsNone(note)
         self.assertRegex(color, r"^#[0-9a-f]{6}$")
         self.assertNotEqual(color, reblend_bridge.NEUTRAL_GRAY)

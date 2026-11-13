@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""Build the MIMIK v0.3 release zip.
+"""Build the MIMIK release zip.
+
+The version comes from pyproject.toml at build time (the one version
+source) — "1.2.3" becomes zip version "1.2".
 
 Zip modes matter: GUI extractors (Thunar's) drop the execute bit unless
 external_attr carries the full regular-file type bits — 0o100755 for
@@ -7,18 +10,44 @@ scripts/launchers, 0o100644 for plain files. Bare 0o755 is NOT enough.
 This script sets them explicitly and verifies the result.
 """
 import os
+import re
 import sys
 import zipfile
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-VERSION = "0.3"
+
+
+def _version_from_pyproject():
+    """(full, short) — pyproject.toml [project] version, e.g.
+    ("1.2.3", "1.2"). Regex parse, not tomllib, so this runs on 3.10."""
+    with open(os.path.join(ROOT, "pyproject.toml")) as fh:
+        text = fh.read()
+    in_project = False
+    for line in text.splitlines():
+        if line.startswith("["):
+            in_project = line.strip() == "[project]"
+            continue
+        if in_project:
+            match = re.match(r'\s*version\s*=\s*"([^"]+)"', line)
+            if match:
+                full = match.group(1)
+                return full, ".".join(full.split(".")[:2])
+    raise RuntimeError("no version in pyproject.toml [project]")
+
+
+FULL_VERSION, VERSION = _version_from_pyproject()
 PREFIX = f"mimik-v{VERSION}/"
+
+
+def default_out_path():
+    """The default zip path when no output is given: ./dist/."""
+    return os.path.join(os.getcwd(), "dist", f"mimik-v{VERSION}.zip")
 
 EXECUTABLES = {"install.sh", "uninstall.sh", "Install MIMIK.desktop"}
 
-INCLUDE_DIRS = ["mimik", "tests", "icons"]
+INCLUDE_DIRS = ["mimik", "tests", "icons", "tools", ".github"]
 INCLUDE_FILES = ["pyproject.toml", "README.md", "CHANGELOG.md",
-                 "LICENSE-NOTICE",
+                 "LICENSE", "LICENSE-NOTICE",
                  "install.sh", "uninstall.sh", "Install MIMIK.desktop"]
 
 
@@ -72,9 +101,7 @@ def verify(out_path):
 
 
 if __name__ == "__main__":
-    out = sys.argv[1] if len(sys.argv) > 1 else os.path.join(
-        os.path.expanduser("~"), "workspace", "your_files",
-        f"mimik-v{VERSION}.zip")
+    out = sys.argv[1] if len(sys.argv) > 1 else default_out_path()
     os.makedirs(os.path.dirname(out), exist_ok=True)
     paths = build(out)
     tmp = verify(out)

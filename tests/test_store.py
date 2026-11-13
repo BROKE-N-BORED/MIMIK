@@ -25,8 +25,14 @@ def flow(fid, host, headers=None):
 
 
 class FakeMitm:
+    def __init__(self, ws=None):
+        self.ws = ws or {}
+
     def body(self, flow_id, side):
         return b'{"ok": true}' if side == "response" else b""
+
+    def ws_messages(self, flow_id):
+        return self.ws.get(flow_id, [])
 
 
 class StoreTests(unittest.TestCase):
@@ -53,6 +59,30 @@ class StoreTests(unittest.TestCase):
                          mitm=FakeMitm(), base=self.tmp)
         loaded = store.load_host("api.example.com", base=self.tmp)
         self.assertIn("ok", loaded[0].get("_saved_response_body", ""))
+
+    def test_save_embeds_ws_messages(self):
+        messages = [{"from_client": True, "timestamp": 1.0,
+                     "text": "hello"}]
+        f = flow("w1", "api.example.com")
+        f["request"]["path"] = "/chat"
+        f["response"]["status_code"] = 101
+        f["websocket"] = {"messages_meta": {"count": 1}}
+        store.save_flows([f], mitm=FakeMitm(ws={"w1": messages}),
+                         base=self.tmp)
+        loaded = store.load_host("api.example.com", base=self.tmp)
+        self.assertEqual(loaded[0].get("_saved_ws_messages"), messages)
+
+    def test_save_ws_fetch_failure_keeps_the_flow(self):
+        class FailingMitm(FakeMitm):
+            def ws_messages(self, flow_id):
+                raise RuntimeError("boom")
+
+        f = flow("w1", "api.example.com")
+        f["websocket"] = {"messages_meta": {"count": 1}}
+        store.save_flows([f], mitm=FailingMitm(), base=self.tmp)
+        loaded = store.load_host("api.example.com", base=self.tmp)
+        self.assertEqual(len(loaded), 1)
+        self.assertNotIn("_saved_ws_messages", loaded[0])
 
     def test_save_records_meta(self):
         store.save_flows([flow("1", "api.example.com")], base=self.tmp,

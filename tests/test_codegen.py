@@ -1,4 +1,5 @@
 """Tests for mimik.codegen — the deterministic $0 generator."""
+import base64
 import importlib.util
 import json
 import os
@@ -337,6 +338,132 @@ class PolishTests(unittest.TestCase):
             out, ok = codegen.polish_cli(src, "api.example.com", "claude")
         self.assertFalse(ok)
         self.assertEqual(out, src)
+
+
+class SingleSampleTests(unittest.TestCase):
+    """v0.4 item 11: single-sample methods are flagged."""
+
+    def _ep(self, method, path, samples):
+        ep = {"method": method, "path": path, "status": 200,
+              "query": "", "request_body": "", "response_body": "{}"}
+        if samples is not None:
+            ep["samples"] = samples
+        return ep
+
+    def test_single_sample_method_gets_a_comment(self):
+        src = codegen.generate_deterministic(
+            "api.example.com",
+            [self._ep("GET", "/rec/v2", 1),
+             self._ep("POST", "/like", 3)])
+        self.assertEqual(
+            src.count("# Single sample: one captured call built this "
+                      "method."),
+            1)
+        # The comment sits in the single-sample method, not the other.
+        get_block = src.split("def get_recs(")[1].split("def like(")[0]
+        self.assertIn("# Single sample", get_block)
+        like_block = src.split("def like(")[1]
+        self.assertNotIn("# Single sample", like_block)
+
+    def test_docstring_carries_the_count(self):
+        src = codegen.generate_deterministic(
+            "api.example.com",
+            [self._ep("GET", "/rec/v2", 1),
+             self._ep("POST", "/like", 1),
+             self._ep("GET", "/v1/users/123", 4)])
+        self.assertIn("2 of 3 endpoints come from a single captured "
+                      "sample", src)
+
+    def test_no_singles_means_no_flag_and_no_count(self):
+        src = codegen.generate_deterministic(
+            "api.example.com",
+            [self._ep("GET", "/rec/v2", 2),
+             self._ep("POST", "/like", 5)])
+        self.assertNotIn("Single sample", src)
+        self.assertNotIn("from a single captured sample", src)
+
+    def test_missing_samples_means_no_flag(self):
+        # Fixtures from before the count existed carry no "samples" —
+        # don't claim single-sample when we can't know.
+        src = codegen.generate_deterministic("api.example.com", EPS)
+        self.assertNotIn("Single sample", src)
+        self.assertNotIn("from a single captured sample", src)
+
+    def test_generalize_sums_samples_across_merged_endpoints(self):
+        eps = codegen._generalize_endpoints(
+            [self._ep("GET", "/users/123", 1),
+             self._ep("GET", "/users/456", 1)])
+        self.assertEqual(len(eps), 1)
+        self.assertEqual(eps[0]["samples"], 2)
+        # So the merged method is never flagged single-sample.
+        src = codegen.generate_deterministic(
+            "api.example.com",
+            [self._ep("GET", "/users/123", 1),
+             self._ep("GET", "/users/456", 1)])
+        self.assertNotIn("Single sample", src)
+
+
+class WebSocketCodegenTests(unittest.TestCase):
+    """v0.4 item 13: WS endpoints become ws_replay methods."""
+
+    def _ws_ep(self, path="/chat", samples=1, messages=None):
+        if messages is None:
+            messages = [
+                {"from_client": True, "timestamp": 1.0, "text": "hello"},
+                {"from_client": False, "timestamp": 1.1, "text": "hello"},
+                {"from_client": True, "timestamp": 1.2,
+                 "b64": base64.b64encode(b"\x00\x01").decode()},
+            ]
+        return {"method": "GET", "path": path, "status": 101, "query": "",
+                "request_body": "", "response_body": "",
+                "samples": samples, "websocket": True,
+                "ws_messages": messages}
+
+    def test_ws_method_generated(self):
+        src = codegen.generate_deterministic(
+            "api.example.com",
+            [self._ws_ep(), EPS[0]])
+        self.assertIn("def get_chats_ws(self, messages=None):", src)
+        self.assertIn('"""GET /chat -> 101 (WebSocket)."""', src)
+        # Only the client messages embed (text as a string, binary as
+        # bytes.fromhex) — the server reply is not replayed.
+        self.assertIn("messages = ['hello', bytes.fromhex('0001')]", src)
+        self.assertIn('return self.ws_replay("/chat", messages)', src)
+        self.assertIn("# Single sample", src)
+        # The plain endpoint next to it is untouched.
+        self.assertIn("def get_recs(self):", src)
+
+    def test_ws_method_with_path_params(self):
+        # Generalization runs first (/rooms/123 -> /rooms/{id}), so the
+        # param is `id` — the same as an HTTP method would get.
+        src = codegen.generate_deterministic(
+            "api.example.com", [self._ws_ep("/rooms/123/ws")])
+        self.assertIn("def get_rooms_by_id_ws(self, id, "
+                      "messages=None):", src)
+        self.assertIn('return self.ws_replay(f"/rooms/{id}/ws", '
+                      "messages)", src)
+
+    def test_ws_method_no_client_messages(self):
+        src = codegen.generate_deterministic(
+            "api.example.com", [self._ws_ep(messages=[])])
+        self.assertIn("messages = []  # no client messages captured",
+                      src)
+
+    def test_ip_host_gives_a_valid_class_name(self):
+        # v0.4 item 13 e2e found this: 127.0.0.1 gave 127Client, which
+        # is a SyntaxError. The generated source must compile.
+        self.assertEqual(codegen.class_name_for_host("127.0.0.1"),
+                         "Host127Client")
+        src = codegen.generate_deterministic(
+            "127.0.0.1", [self._ws_ep()])
+        compile(src, "<generated>", "exec")
+        self.assertIn("class Host127Client(App):", src)
+
+    def test_digest_marks_websocket(self):
+        digest = codegen.build_digest([self._ws_ep()])
+        self.assertIn("### GET /chat  -> 101 (WebSocket)", digest)
+        self.assertIn("ws session: 2 client -> server, "
+                      "1 server -> client", digest)
 
 
 if __name__ == "__main__":

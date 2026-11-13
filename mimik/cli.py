@@ -29,7 +29,7 @@ import shutil
 import subprocess
 import sys
 
-from . import assets, codegen, doctor, export, filters, launch, presets, reblend_bridge, sample, store, update, wine
+from . import assets, codegen, diff, doctor, export, filters, launch, presets, reblend_bridge, sample, screenshot, store, unpin, update, wine
 from . import __version__
 from .flows import fetch_flows
 from .recorder import ProxySession
@@ -60,7 +60,7 @@ def _flows_from_args(args):
     m, flows, source = fetch_flows(where="cli")
     if source == "saved" and not flows:
         raise SystemExit(
-            "no proxy running and no saved captures — run `mimik record` "
+            "no proxy running and no saved captures, run `mimik record` "
             "first, or pass --har FILE / --curl FILE"
         )
     return m, flows, source
@@ -78,7 +78,7 @@ def _endpoints_from_args(args, m, flows, source):
 # ---- record ------------------------------------------------------------------
 
 ANDROID_STEPS = """
-Android phone capture — do this once, then just reopen the app to add traffic:
+Android phone capture, do this once, then just reopen the app to add traffic:
 
   1. Phone → Settings → Wi-Fi → your network → Proxy → Manual
         Hostname: {ip}      Port: 8080
@@ -91,13 +91,13 @@ Android phone capture — do this once, then just reopen the app to add traffic:
 
   mitmweb dashboard: http://127.0.0.1:8081   (MIMIK reads flows from here)
 
-  Android 7+ apps only trust user-installed CAs if the app opts in — some
+  Android 7+ apps only trust user-installed CAs if the app opts in, some
   apps show no traffic because of that, and pinned apps (banks, Instagram)
   show none at all. If `mimik hosts` shows the app's API host, you're good.
 """
 
 LINUX_APP_STEPS = """
-Linux app capture — run the app through the proxy:
+Linux app capture, run the app through the proxy:
 
   Launch it with the proxy env vars, for example:
 
@@ -111,7 +111,7 @@ Linux app capture — run the app through the proxy:
 """
 
 WEB_STEPS = """
-Web app capture — no proxy needed:
+Web app capture, no proxy needed:
 
   1. Browser → DevTools (F12) → Network → use the web app normally
   2. Right-click the network log → Save all as HAR → save session.har
@@ -122,25 +122,35 @@ Web app capture — no proxy needed:
 """
 
 WINDOWS_STEPS = """
-Windows program capture (via WinLinx) — MIMIK captures, WinLinx runs:
+Windows program capture (via WinLinx), MIMIK captures, WinLinx runs:
 
   1. Launch the Windows program in WinLinx (it owns running Windows programs)
   2. MIMIK points its Wine prefix at this proxy and installs the mitmproxy
      CA into the prefix, so the program's HTTPS traffic can be captured
-  3. Use the program normally — its API traffic lands in MIMIK
+  3. Use the program normally, its API traffic lands in MIMIK
   4. Stop here restores the prefix's original proxy settings
 
-  Some Windows programs ignore the system proxy or pin their certificates —
-  those show no traffic, same as pinned phone apps.
+  Some Windows programs ignore the system proxy or pin their certificates, those show no traffic, same as pinned phone apps.
 """
 
 
 def _print_hosts(rows):
     if not rows:
-        print("  (no traffic yet — use the app, then check again)")
+        print("  (no traffic yet, use the app, then check again)")
         return
     for host, n in rows:
         print(f"  {n:>6}  {host}")
+
+
+def _stop_screenshot(args):
+    """The stop-time screenshot for a record run (v0.4 item 15)."""
+    if not getattr(args, "screenshot", False):
+        return
+    path = screenshot.capture_for_session()
+    if path:
+        print(f"screenshot saved: {path}")
+    else:
+        print("screenshot failed (no screenshot tool found)")
 
 
 def cmd_record(args):
@@ -170,7 +180,7 @@ def cmd_record(args):
             try:
                 choice = input("pick a number: ").strip()
             except (EOFError, KeyboardInterrupt):
-                sys.exit("\nno program picked — nothing launched")
+                sys.exit("\nno program picked, nothing launched")
             try:
                 plan = launch.pick_candidate(plan, choice)
             except launch.LaunchError as e:
@@ -194,7 +204,7 @@ def cmd_record(args):
                         f"{n} {assets.KIND_LABELS.get(k, k).lower()}"
                         for k, n in sorted(kinds.items()))
                     print(f"  found {len(manifest['assets'])} asset file(s) "
-                          f"in the program ({found}) — saved for the "
+                          f"in the program ({found}), saved for the "
                           "asset pack")
             except Exception as e:
                 print(f"  (asset scan skipped: {e})")
@@ -211,7 +221,7 @@ def cmd_record(args):
         session.start()
     except mitm_mod.MitmError as e:
         sys.exit(str(e))
-    print("\nproxy up — capturing. Ctrl-C to stop.\n")
+    print("\nproxy up, capturing. Ctrl-C to stop.\n")
     rows = []
     try:
         if plan is not None:
@@ -233,12 +243,14 @@ def cmd_record(args):
                 print(f"could not launch {args.launch!r}: {e}")
         rows = session.run_forever()
     finally:
+        # Screenshot first: the program is still up. Then stop it.
+        _stop_screenshot(args)
         launch.stop_process(app_proc)
         if plan is not None and plan.mount is not None:
             plan.mount.unmount()
             print("unmounted the disk image")
     _record_stop_summary(rows)
-    print("\ncapture saved — run `mimik hosts` to see what was caught.")
+    print("\ncapture saved, run `mimik hosts` to see what was caught.")
 
 
 def _record_windows(args):
@@ -259,7 +271,7 @@ def _record_windows(args):
         session.start()
     except mitm_mod.MitmError as e:
         sys.exit(str(e))
-    print("\nproxy up — configuring the Wine prefix…")
+    print("\nproxy up, configuring the Wine prefix…")
     try:
         wine.apply_proxy(prefix)
         print("  prefix now points at the proxy")
@@ -276,13 +288,14 @@ def _record_windows(args):
     try:
         rows = session.run_forever()
     finally:
+        _stop_screenshot(args)
         try:
             wine.revert_proxy(prefix)
             print("prefix proxy settings restored")
         except Exception as e:
             print(f"could not restore the prefix proxy: {e}")
     _record_stop_summary(rows)
-    print("\ncapture saved — run `mimik hosts` to see what was caught.")
+    print("\ncapture saved, run `mimik hosts` to see what was caught.")
 
 
 def _record_stop_summary(rows):
@@ -336,9 +349,9 @@ def cmd_hosts(args):
     if not rows:
         if source in ("har", "curl"):
             sys.exit("no entries in that file")
-        sys.exit("no traffic captured yet — run `mimik record` and use the app")
+        sys.exit("no traffic captured yet, run `mimik record` and use the app")
     if source == "saved":
-        print("(proxy is off — showing saved captures)\n")
+        print("(proxy is off, showing saved captures)\n")
     print(f"{'requests':>9}  host")
     for host, n in rows:
         print(f"{n:>9}  {host}")
@@ -351,11 +364,35 @@ def cmd_hosts(args):
     print("\nPick your API host (usually the one with JSON, not media/cdn).")
 
 
+def cmd_diff(args):
+    """`mimik diff A B` — compare two captures (v0.4 item 12)."""
+    try:
+        flows_a, label_a = diff.load_source(args.a)
+        flows_b, label_b = diff.load_source(args.b)
+    except diff.DiffError as e:
+        sys.exit(str(e))
+    print(diff.format_diff(diff.diff_captures(flows_a, flows_b),
+                           label_a, label_b), end="")
+
+
+def cmd_unpin(args):
+    """`mimik unpin <target>` — defeat cert pinning via Frida (v0.4
+    item 14)."""
+    try:
+        plan = unpin.prepare(args.target, ca_path=args.ca,
+                             proxy_host=args.proxy_host,
+                             workdir=args.workdir,
+                             platform=args.platform)
+    except unpin.UnpinError as e:
+        sys.exit(str(e))
+    print(unpin.format_plan(plan, args.target))
+
+
 def cmd_prune(args):
     keep = max(0, args.keep)
     preview = store.prune(keep=keep, dry_run=True)
     if not preview["deleted"]:
-        print(f"nothing to prune — every host has {keep} or fewer saves.")
+        print(f"nothing to prune, every host has {keep} or fewer saves.")
         return
     print(f"This deletes {len(preview['deleted'])} old capture save(s) "
           f"holding {preview['flows_lost']} flow(s), keeping the {keep} "
@@ -390,7 +427,7 @@ def cmd_delete(args):
     if args.host:
         stats = store.capture_stats(args.host)
         if not stats["files"]:
-            sys.exit(f"no saved captures for {args.host} — run "
+            sys.exit(f"no saved captures for {args.host}, run "
                      "`mimik hosts` to see them")
         what = (f"all {stats['flows']} saved flow(s) for {args.host} "
                 f"({stats['files']} save file(s), "
@@ -408,7 +445,7 @@ def cmd_delete(args):
             name += "_client.py"
         found = [n for n, _p, _s in store.list_clients() if n == name]
         if not found:
-            sys.exit(f"no generated client named {name} — run "
+            sys.exit(f"no generated client named {name}, run "
                      "`mimik clients` to see them")
         if not _confirm_delete(f"the generated client {name}", args):
             return
@@ -419,7 +456,7 @@ def cmd_delete(args):
     if args.group:
         groups = assets.find_groups(args.group)
         if not groups:
-            sys.exit(f"no asset group named {args.group} — run "
+            sys.exit(f"no asset group named {args.group}, run "
                      "`mimik assets` to see them")
         names = ", ".join(os.path.basename(g) for g, _m in groups)
         if not _confirm_delete(
@@ -434,7 +471,7 @@ def cmd_delete(args):
     if args.pack:
         packs = reblend_bridge.find_packs(args.pack)
         if not packs:
-            sys.exit(f"no pack named {args.pack} — run `mimik assets` "
+            sys.exit(f"no pack named {args.pack}, run `mimik assets` "
                      "to see them")
         names = ", ".join(os.path.basename(p) for p, _d in packs)
         if not _confirm_delete(f"{len(packs)} pack(s): {names}", args):
@@ -473,7 +510,7 @@ def cmd_import(args):
         except ValueError as e:
             raise SystemExit(f"couldn't read that cURL paste: {e}")
     if not flows:
-        raise SystemExit(f"no flows in {label} — nothing imported")
+        raise SystemExit(f"no flows in {label}, nothing imported")
     paths = store.save_flows(
         flows, meta={"source": "import", "from": label})
     # The files written hold exactly the new flows — count those, so
@@ -485,7 +522,7 @@ def cmd_import(args):
     hosts = sorted({f["request"]["host"] for f in flows
                     if f.get("request", {}).get("host")})
     if new == 0:
-        print(f"nothing new — all {len(flows)} flow(s) from {label} "
+        print(f"nothing new, all {len(flows)} flow(s) from {label} "
               f"are already saved.")
         return
     print(f"imported {new} flow(s) for {len(hosts)} host(s) from "
@@ -570,12 +607,12 @@ def cmd_clients(args):
     caps = store.list_captures()
     print("generated clients:")
     if not clients:
-        print("  (none yet — run `mimik gen <host>`)")
+        print("  (none yet, run `mimik gen <host>`)")
     for name, path, size in clients:
         print(f"  {name}  ({size} bytes)  {path}")
     print("\nsaved captures:")
     if not caps:
-        print("  (none yet — run `mimik record`)")
+        print("  (none yet, run `mimik record`)")
     for host, n, stamp in caps:
         print(f"  {host}: {n} requests, last saved {stamp}")
 
@@ -622,12 +659,12 @@ def cmd_assets(args):
     found = assets.list_assets(**assets.resolve_scope(args.host))
     if not found:
         if args.host:
-            print(f"\nno captured assets for {args.host} yet — run "
+            print(f"\nno captured assets for {args.host} yet, run "
                   "`mimik record` and use the app, import a HAR with "
                   "`mimik assets --har FILE`, or scan a program folder "
                   "with `mimik assets --scan DIR`")
         else:
-            print("no captured assets yet — run `mimik record` and use "
+            print("no captured assets yet, run `mimik record` and use "
                   "the app, import a HAR with `mimik assets --har FILE`, "
                   "or scan a program folder with `mimik assets --scan DIR`")
         return
@@ -650,7 +687,7 @@ def cmd_build_pack(args):
             assets.extract_from_flows(flows, args.host, host=args.host)
             scope = assets.resolve_scope(args.host)
     if not assets.list_assets(**scope):
-        sys.exit(f"no captured assets for {args.host} — run `mimik record` "
+        sys.exit(f"no captured assets for {args.host}, run `mimik record` "
                  "and use the app, import a HAR with "
                  "`mimik assets --har FILE`, or scan a program folder "
                  "with `mimik assets --scan DIR`")
@@ -727,12 +764,12 @@ def cmd_exclude_reset(args):
 
 def cmd_exclude_on(args):
     presets.set_filtering_enabled(True)
-    print("Capture filtering on — excluded hosts are dropped.")
+    print("Capture filtering on, excluded hosts are dropped.")
 
 
 def cmd_exclude_off(args):
     presets.set_filtering_enabled(False)
-    print("Capture filtering off — all hosts are captured.")
+    print("Capture filtering off, all hosts are captured.")
 
 
 def cmd_update_check(args):
@@ -782,18 +819,18 @@ def _import_export_cli(path, force):
     except export.ExportError as e:
         sys.exit(str(e))
     except FileExistsError as e:
-        sys.exit(f"{e} already exists — use --force to replace it")
+        sys.exit(f"{e} already exists, use --force to replace it")
     print(f"Imported the {result['kind']} {result['name']}.")
 
 
 def cmd_pack_list(args):
     packs = reblend_bridge.list_packs()
     if not packs:
-        print("no packs yet — build one on the Assets tab")
+        print("no packs yet, build one on the Assets tab")
         return
     print("Built packs (newest first):")
     for pdir, pack in packs:
-        print(f"  {os.path.basename(pdir)} — "
+        print(f"  {os.path.basename(pdir)}, "
               f"{pack.get('app') or pack.get('host') or '?'} "
               f"({pack.get('built_at', '')})")
 
@@ -821,13 +858,13 @@ def cmd_presets(args):
         on = args.auto_learn == "on"
         presets.set_auto_learn(on)
         print("Learn presets from captures: "
-              + ("on — presets refresh when a capture stops"
-                 if on else "off — learn with "
+              + ("on, presets refresh when a capture stops"
+                 if on else "off, learn with "
                  "`mimik presets learn <name>`"))
     found = presets.list_presets()
     patterns = presets.list_pattern_presets()
     if not found and not patterns:
-        print("no presets yet — record an app, then run "
+        print("no presets yet, record an app, then run "
               "`mimik presets learn <host>`")
     else:
         if found:
@@ -842,7 +879,7 @@ def cmd_presets(args):
             print("Pattern presets:")
             for p in patterns:
                 learned_from = p.get("learned_from") or []
-                print(f"  {p['name']} (pattern) — "
+                print(f"  {p['name']} (pattern), "
                       f"{p.get('display_name') or p['name']}")
                 print(f"    learned from {len(learned_from)} "
                       f"app{'s' if len(learned_from) != 1 else ''}")
@@ -858,10 +895,10 @@ def cmd_presets_learn(args):
     result, patterns, _matched = presets.learn_all(args.name)
     if result is None:
         if presets.load_preset(args.name) is not None:
-            print(f"no new captures for {args.name} — the saved preset "
+            print(f"no new captures for {args.name}, the saved preset "
                   "is unchanged")
         else:
-            sys.exit(f"no captures for {args.name} yet — record the app, "
+            sys.exit(f"no captures for {args.name} yet, record the app, "
                      "import a HAR, or scan a program folder first, "
                      "then learn")
         return
@@ -879,7 +916,7 @@ def cmd_presets_show(args):
     if preset is None:
         preset = presets.load_pattern_preset(args.name)
     if preset is None:
-        sys.exit(f"no preset named {args.name} — run `mimik presets` "
+        sys.exit(f"no preset named {args.name}, run `mimik presets` "
                  "to see them")
     print("\n".join(presets.describe(preset)))
 
@@ -889,7 +926,7 @@ def cmd_presets_match(args):
     presets would apply to this app, and why. Changes nothing."""
     matches, code_signals = presets.match(args.name)
     if not matches and not code_signals:
-        print(f"no patterns matched for {args.name} — nothing to apply "
+        print(f"no patterns matched for {args.name}, nothing to apply "
               "yet")
         return
     if matches:
@@ -897,11 +934,11 @@ def cmd_presets_match(args):
         for m, preset, corroborated in matches:
             if preset is not None:
                 learned_from = preset.get("learned_from") or []
-                line = (f"  {m['id']} ({m['name']}) — saved preset, "
+                line = (f"  {m['id']} ({m['name']}), saved preset, "
                         f"learned from {len(learned_from)} "
                         f"app{'s' if len(learned_from) != 1 else ''}")
             else:
-                line = (f"  {m['id']} ({m['name']}) — no saved preset "
+                line = (f"  {m['id']} ({m['name']}), no saved preset "
                         "yet (learn one to apply it)")
             print(line)
             for signal in m["signals"]:
@@ -926,7 +963,7 @@ def cmd_presets_delete(args):
         preset = presets.load_pattern_preset(args.name)
         is_pattern = preset is not None
     if preset is None:
-        sys.exit(f"no preset named {args.name} — run `mimik presets` "
+        sys.exit(f"no preset named {args.name}, run `mimik presets` "
                  "to see them")
     what = f"the pattern preset {args.name}" if is_pattern \
         else f"the preset for {args.name}"
@@ -966,6 +1003,9 @@ def main(argv=None):
                     help="install a .deb with apt instead of extracting it")
     rp.add_argument("--launch", metavar="CMD",
                     help="command to launch with proxy env (--target linux-app)")
+    rp.add_argument("--screenshot", action="store_true",
+                    help="screenshot the desktop when recording stops "
+                    "(saved with the capture)")
     rp.set_defaults(func=cmd_record)
 
     sub.add_parser("doctor", help="check your setup").set_defaults(func=cmd_doctor)
@@ -982,6 +1022,33 @@ def main(argv=None):
     lp.add_argument("--curl", metavar="FILE",
                     help="read from a cURL paste (file or text)")
     lp.set_defaults(func=cmd_learn)
+
+    dp = sub.add_parser("diff", help="compare two captures")
+    dp.add_argument("a", help="host name, .json capture file, or .har file")
+    dp.add_argument("b", help="host name, .json capture file, or .har file")
+    dp.set_defaults(func=cmd_diff)
+
+    up = sub.add_parser("unpin",
+                        help="defeat cert pinning via Frida so capture works")
+    up.add_argument("target",
+                    help="Android package (com.example.app), APK file, "
+                    "or Linux program (path or command)")
+    up.add_argument("--android", dest="platform", action="store_const",
+                    const="android",
+                    help="treat the target as an Android package")
+    up.add_argument("--linux", dest="platform", action="store_const",
+                    const="linux",
+                    help="treat the target as a Linux program")
+    up.add_argument("--ca", metavar="PATH",
+                    help="mitmproxy CA cert (default: ~/.mitmproxy/"
+                    "mitmproxy-ca-cert.pem)")
+    up.add_argument("--proxy-host", metavar="HOST",
+                    help="this machine's LAN IP as the phone sees it "
+                    "(default: auto-detected)")
+    up.add_argument("--workdir",
+                    help="where to put scripts + patched APK "
+                    "(default: mimik-unpin/)")
+    up.set_defaults(func=cmd_unpin)
 
     gp = sub.add_parser("gen", help="generate a client for a host")
     gp.add_argument("host")

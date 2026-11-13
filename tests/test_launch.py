@@ -1,6 +1,7 @@
 """Tests for mimik.launch — file-type detection, command building,
 archive extraction, ISO mount selection. No real mounts. LaunchCheckedTests
-run real short-lived `sys.executable -c` children."""
+run real short-lived `/bin/sh` children (a Python child can outlast the
+0.3 s settle window under load)."""
 import glob
 import io
 import os
@@ -444,8 +445,12 @@ class DebTests(unittest.TestCase):
 class LaunchCheckedTests(unittest.TestCase):
     """Item 16: a program that dies instantly is a failure with stderr."""
 
-    def _py(self, code):
-        return [sys.executable, "-c", code]
+    def _sh(self, script):
+        # /bin/sh, not Python: a Python child can take longer than the
+        # 0.3 s settle window to start under load, and the test then
+        # sees a still-running child instead of the instant failure it
+        # is testing (flaked 3/3 in the Qt env under load, 2026-11-13).
+        return ["/bin/sh", "-c", script]
 
     def _litter(self):
         return glob.glob(os.path.join(tempfile.gettempdir(),
@@ -455,8 +460,7 @@ class LaunchCheckedTests(unittest.TestCase):
         before = self._litter()
         with self.assertRaises(launch.LaunchError) as ctx:
             launch.launch_checked(
-                self._py("import sys; print('boom line', file=sys.stderr); "
-                         "sys.exit(3)"),
+                self._sh("echo 'boom line' >&2; exit 3"),
                 settle=0.3, label="game.bin")
         msg = str(ctx.exception)
         self.assertIn("game.bin", msg)
@@ -468,9 +472,8 @@ class LaunchCheckedTests(unittest.TestCase):
     def test_stderr_shows_first_lines_only(self):
         with self.assertRaises(launch.LaunchError) as ctx:
             launch.launch_checked(
-                self._py("import sys; "
-                         "[print('line%d' % i, file=sys.stderr) "
-                         "for i in range(8)]; sys.exit(1)"),
+                self._sh("i=0; while [ $i -lt 8 ]; do "
+                         "echo \"line$i\" >&2; i=$((i+1)); done; exit 1"),
                 settle=0.3)
         msg = str(ctx.exception)
         self.assertIn("line0", msg)
@@ -479,15 +482,13 @@ class LaunchCheckedTests(unittest.TestCase):
 
     def test_no_stderr_says_so(self):
         with self.assertRaises(launch.LaunchError) as ctx:
-            launch.launch_checked(self._py("import sys; sys.exit(7)"),
-                                  settle=0.3)
+            launch.launch_checked(self._sh("exit 7"), settle=0.3)
         self.assertIn("exit code 7", str(ctx.exception))
         self.assertIn("no error output", str(ctx.exception))
 
     def test_running_child_returns_proc(self):
         before = self._litter()
-        proc = launch.launch_checked(
-            self._py("import time; time.sleep(30)"), settle=0.2)
+        proc = launch.launch_checked(["/bin/sleep", "30"], settle=0.2)
         try:
             self.assertIsNone(proc.poll())
         finally:
@@ -501,8 +502,7 @@ class LaunchCheckedTests(unittest.TestCase):
     def test_launch_process_reports_instant_failure(self):
         plan = launch.LaunchPlan(
             "elf", "/tmp/x",
-            command=self._py("import sys; print('missing lib', "
-                             "file=sys.stderr); sys.exit(1)"))
+            command=self._sh("echo 'missing lib' >&2; exit 1"))
         with self.assertRaises(launch.LaunchError) as ctx:
             launch.launch_process(plan, settle=0.3)
         self.assertIn("missing lib", str(ctx.exception))

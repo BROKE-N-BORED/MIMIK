@@ -134,12 +134,15 @@ def endpoints(path_or_data, host):
     to avoid re-reading the file.
     """
     by_key = {}
+    counts = {}
     for entry in _entries(path_or_data):
         req = entry.get("request", {})
         parsed = urlparse(req.get("url", ""))
         if parsed.hostname != host:
             continue
-        by_key[(req.get("method"), parsed.path)] = entry
+        key = (req.get("method"), parsed.path)
+        by_key[key] = entry
+        counts[key] = counts.get(key, 0) + 1
 
     out = []
     for (method, path_only), entry in by_key.items():
@@ -153,6 +156,9 @@ def endpoints(path_or_data, host):
                 "query": urlparse(req.get("url", "")).query,
                 "request_body": mitm._decode(_body_bytes(req.get("postData"))),
                 "response_body": mitm._decode(_content_bytes(resp.get("content"))),
+                # How many captured calls fed this endpoint (v0.4
+                # item 11) — codegen flags single-sample methods.
+                "samples": counts[(method, path_only)],
             }
         )
     return out

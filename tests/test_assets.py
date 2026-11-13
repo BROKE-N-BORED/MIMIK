@@ -21,6 +21,51 @@ HAS_REBLEND = os.path.isdir(os.path.join(REBLEND_T9, "light_engine"))
 ICON_PNG = os.path.join(os.path.dirname(__file__), "..", "icons",
                         "mimik-48.png")
 
+_STUB_ICON_PATH = None
+
+
+def _stub_png_bytes(width=48, height=48, rgb=(41, 98, 168)):
+    """A valid PNG of one solid (non-gray) color, stdlib only.
+
+    The repo holds only icons/mimik.svg — the PNGs can't be committed
+    (the GitHub push path can't carry binary) — so a fresh clone has no
+    icon file. Tests that need PNG bytes use this stub instead of
+    hard-failing; the color is deliberately not gray so the
+    average-color test still distinguishes a real read from the
+    neutral-gray fallback.
+    """
+    import struct
+    import zlib
+
+    def chunk(ctype, data):
+        out = struct.pack(">I", len(data)) + ctype + data
+        return out + struct.pack(">I", zlib.crc32(ctype + data) & 0xFFFFFFFF)
+
+    ihdr = struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)
+    raw = b"".join(b"\x00" + bytes(rgb) * width for _ in range(height))
+    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", ihdr)
+            + chunk(b"IDAT", zlib.compress(raw)) + chunk(b"IEND", b""))
+
+
+def icon_png_path():
+    """Path to a 48px PNG for tests: the real icon when present (zip or
+    local tree), else a generated stub in the temp dir (fresh clone)."""
+    global _STUB_ICON_PATH
+    if os.path.exists(ICON_PNG):
+        return ICON_PNG
+    if _STUB_ICON_PATH is None or not os.path.exists(_STUB_ICON_PATH):
+        fd, path = tempfile.mkstemp(prefix="mimik-icon-", suffix=".png")
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(_stub_png_bytes())
+        _STUB_ICON_PATH = path
+    return _STUB_ICON_PATH
+
+
+def icon_png_bytes():
+    """PNG bytes for tests — the real icon, or the stub (see above)."""
+    with open(icon_png_path(), "rb") as fh:
+        return fh.read()
+
 
 def read_t9(rel):
     with open(os.path.join(REBLEND_T9, rel), "rb") as fh:
@@ -133,8 +178,7 @@ class FlowExtractionTests(unittest.TestCase):
         os.environ["MIMIK_DATA_DIR"] = self.tmp
         self.glb = read_t9("examples/sample.glb")
         self.obj = read_t9("examples/house.obj")
-        with open(ICON_PNG, "rb") as fh:
-            self.png = fh.read()
+        self.png = icon_png_bytes()
         wav_path = os.path.join(self.tmp, "sfx.wav")
         make_wav(wav_path)
         with open(wav_path, "rb") as fh:

@@ -149,9 +149,8 @@ def _import_preset(zf, base, overwrite):
         raise ExportError("preset file is malformed")
     if os.path.exists(target) and not overwrite:
         raise FileExistsError(target)
-    os.makedirs(os.path.dirname(target), exist_ok=True)
-    with store.open_private(target, "w") as fh:
-        json.dump(data, fh, indent=2)
+    store.ensure_private_dir(os.path.dirname(target))
+    store.atomic_write(target, json.dumps(data, indent=2))
     return {"kind": "preset", "name": data["name"], "path": target}
 
 
@@ -178,12 +177,13 @@ def _import_pack(zf, marker, base, overwrite):
         # Replace wholesale — stale files from the old pack must not
         # survive a restore.
         shutil.rmtree(target_dir)
+    store.ensure_private_dir(reblend_bridge.packs_dir(base))
+    store.ensure_private_dir(target_dir)
     for n in names:
         rel = n[len("pack/"):]
         target = _safe_join(target_dir, rel)
         if target is None:
             raise ExportError(f"pack entry escapes the pack dir: {rel}")
-        os.makedirs(os.path.dirname(target), exist_ok=True)
-        with open(target, "wb") as fh:
-            fh.write(zf.read(n))
+        store.ensure_private_dir(os.path.dirname(target))
+        store.atomic_write(target, zf.read(n), private=False)
     return {"kind": "pack", "name": pack_dir, "path": target_dir}

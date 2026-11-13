@@ -189,7 +189,8 @@ class AssetGroup:
         while os.path.exists(self.dir):
             self.dir = f"{wanted}-{n}"
             n += 1
-        os.makedirs(self.dir, exist_ok=True)
+        store.ensure_private_dir(assets_dir(self.base))
+        store.ensure_private_dir(self.dir)
         self.manifest = {
             "group": group,
             "host": host,
@@ -222,7 +223,7 @@ class AssetGroup:
             "name": name, "url": url, "source_path": source_path,
             "size": size, "kind": kind,
             "reason": f"group would pass the "
-                      f"{max_group_bytes // (1024 * 1024)} MB cap — "
+                      f"{max_group_bytes // (1024 * 1024)} MB cap, "
                       "skipped, nothing saved",
         })
 
@@ -243,7 +244,7 @@ class AssetGroup:
                 "name": name, "url": url, "source_path": source_path,
                 "size": size, "kind": kind,
                 "reason": f"over the {max_file_bytes // (1024 * 1024)} MB "
-                          "per-file cap — skipped, nothing saved",
+                          "per-file cap, skipped, nothing saved",
             })
             return None
         if self.manifest["total_bytes"] + size > max_group_bytes:
@@ -256,8 +257,8 @@ class AssetGroup:
             filename = self._by_hash[digest]
         else:
             filename = self._unique_filename(name)
-            with open(os.path.join(self.dir, filename), "wb") as fh:
-                fh.write(data)
+            store.atomic_write(os.path.join(self.dir, filename), data,
+                               private=False)
             self._by_hash[digest] = filename
             self.manifest["total_bytes"] += size
         entry = {
@@ -277,8 +278,9 @@ class AssetGroup:
 
     def finish(self):
         """Write the manifest. Returns (group_dir, manifest)."""
-        with open(os.path.join(self.dir, "assets.json"), "w") as fh:
-            json.dump(self.manifest, fh, indent=2)
+        store.atomic_write(os.path.join(self.dir, "assets.json"),
+                           json.dumps(self.manifest, indent=2),
+                           private=False)
         return self.dir, self.manifest
 
 
@@ -422,7 +424,7 @@ def scan_program_tree(root, program, base=None,
         if stopped is not None:
             break
         if cancelled is not None and cancelled():
-            stopped = "scan cancelled — partial results"
+            stopped = "scan cancelled, partial results"
             break
         rel = os.path.relpath(dirpath, root)
         depth = 0 if rel == "." else rel.count(os.sep) + 1
@@ -436,12 +438,12 @@ def scan_program_tree(root, program, base=None,
             if stopped is not None:
                 break
             if cancelled is not None and cancelled():
-                stopped = "scan cancelled — partial results"
+                stopped = "scan cancelled, partial results"
                 break
             visited += 1
             if visited > max_files:
-                stopped = (f"scan stopped at the {max_files}-file cap "
-                           "— some files were not scanned")
+                stopped = (f"scan stopped at the {max_files}-file cap, "
+                           "some files were not scanned")
                 break
             full = os.path.join(dirpath, name)
             if os.path.islink(full):
@@ -467,7 +469,7 @@ def scan_program_tree(root, program, base=None,
                     "size": size, "kind": kind,
                     "reason": f"over the "
                               f"{max_file_bytes // (1024 * 1024)} MB "
-                              "per-file cap — skipped, nothing saved",
+                              "per-file cap, skipped, nothing saved",
                 })
                 continue
             # Group cap BEFORE reading: a file the group has no room
@@ -493,7 +495,7 @@ def scan_program_tree(root, program, base=None,
         agroup.manifest["scan_note"] = stopped
     elif depth_limited:
         agroup.manifest["scan_note"] = (
-            f"scan did not descend past {max_depth} levels — "
+            f"scan did not descend past {max_depth} levels, "
             "deeper files were not scanned")
     if not agroup.manifest["assets"] and not agroup.manifest["skipped"]:
         try:

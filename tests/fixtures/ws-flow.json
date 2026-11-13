@@ -1,0 +1,85 @@
+[
+  {
+    "id": "871f079b-2d96-4c9c-91b4-ad9f6e99f90f",
+    "intercepted": false,
+    "is_replay": null,
+    "type": "http",
+    "modified": false,
+    "marked": "",
+    "comment": "",
+    "timestamp_created": 1794591069.4484587,
+    "request": {
+      "method": "GET",
+      "scheme": "http",
+      "host": "127.0.0.1",
+      "port": 46107,
+      "path": "/chat",
+      "http_version": "HTTP/1.1",
+      "headers": [
+        [
+          "Host",
+          "127.0.0.1:46107"
+        ],
+        [
+          "Upgrade",
+          "websocket"
+        ],
+        [
+          "Connection",
+          "Upgrade"
+        ],
+        [
+          "Sec-WebSocket-Key",
+          "Zk66D3RHbxo0AKlkwtNkZg=="
+        ],
+        [
+          "Sec-WebSocket-Version",
+          "13"
+        ],
+        [
+          "Origin",
+          "http://127.0.0.1"
+        ]
+      ],
+      "contentLength": 0,
+      "contentHash": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "timestamp_start": 1794591069.4482193,
+      "timestamp_end": 1794591069.4491255,
+      "pretty_host": "127.0.0.1"
+    },
+    "response": {
+      "http_version": "HTTP/1.1",
+      "status_code": 101,
+      "reason": "Switching Protocols",
+      "headers": [
+        [
+          "Upgrade",
+          "websocket"
+        ],
+        [
+          "Connection",
+          "Upgrade"
+        ],
+        [
+          "Sec-WebSocket-Accept",
+          "GwUjDCXt9Z/1R74Vsr78yomqsec="
+        ]
+      ],
+      "contentLength": 0,
+      "contentHash": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "timestamp_start": 1794591069.4511812,
+      "timestamp_end": 1794591069.4517548
+    },
+    "websocket": {
+      "messages_meta": {
+        "contentLength": 68,
+        "count": 6,
+        "timestamp_last": 1794591069.4560976
+      },
+      "closed_by_client": true,
+      "close_code": 1005,
+      "close_reason": "",
+      "timestamp_end": 1794591069.4565747
+    }
+  }
+]

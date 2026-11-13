@@ -11,9 +11,11 @@ Ported from littledivy/mimic (MIT) — see LICENSE-NOTICE — with MIMIK's
 persistent-capture additions: Session.from_saved() and App's live-then-saved
 fallback, so clients work after the proxy stops.
 """
+import base64
+
 import requests
 
-from . import extract, store
+from . import extract, store, websocket as ws_mod
 from .sources.mitm import Mitm, MitmError
 
 
@@ -58,7 +60,7 @@ class Session:
         headers = extract.session_headers(flows, host)
         if not headers:
             raise RuntimeError(
-                f"no authenticated request to {host} captured yet — "
+                f"no authenticated request to {host} captured yet, "
                 f"open the app once so mitmweb sees a real call, then retry"
             )
         return cls(extract.base_url(flows, host), headers, host=host, mitm=mitm)
@@ -69,13 +71,13 @@ class Session:
         flows = store.load_host(host)
         if not flows:
             raise RuntimeError(
-                f"no saved capture for {host} — run `mimik record` and use "
+                f"no saved capture for {host}, run `mimik record` and use "
                 f"the app once, or import a HAR with `mimik gen --har`"
             )
         headers = extract.session_headers(flows, host)
         if not headers:
             raise RuntimeError(
-                f"saved capture for {host} has no authenticated request — "
+                f"saved capture for {host} has no authenticated request, "
                 f"open the app once while recording, then retry"
             )
         return cls(extract.base_url(flows, host), headers, host=host)
@@ -159,6 +161,30 @@ class Session:
 
     def options(self, path, **kw):
         return self.request("OPTIONS", path, **kw)
+
+    def ws_replay(self, path, messages, timeout=None):
+        """Open a WebSocket to base_url+path, send messages, return
+        replies (v0.4 item 13 — what generated WS methods call).
+
+        messages: str (text frame) or bytes (binary frame). Returns a
+        list of replies — str for text frames, bytes for binary.
+        Reads until the server goes quiet (2 s of silence) or the
+        timeout (default: this session's timeout). Raises
+        ConnectionError when the handshake fails.
+        """
+        url = ws_mod.http_to_ws_url(f"{self.base_url}{path}")
+        result = ws_mod.replay_messages(
+            url, self.headers, messages,
+            timeout=self.timeout if timeout is None else timeout)
+        if not result["ok"]:
+            raise ConnectionError(result["error"])
+        replies = []
+        for item in result["received"]:
+            if "text" in item:
+                replies.append(item["text"])
+            else:
+                replies.append(base64.b64decode(item["b64"]))
+        return replies
 
 
 class App(Session):

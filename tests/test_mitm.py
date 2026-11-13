@@ -22,11 +22,21 @@ def flow(fid, host, method, path, status=200, headers=None):
 
 
 class FakeMitm:
-    def __init__(self, bodies=None):
+    def __init__(self, bodies=None, ws=None):
         self.bodies = bodies or {}
+        self.ws = ws or {}
 
     def body(self, flow_id, side):
         return self.bodies.get((flow_id, side), b"")
+
+    def ws_messages(self, flow_id):
+        return self.ws.get(flow_id, [])
+
+
+def ws_flow(fid, host):
+    f = flow(fid, host, "GET", "/chat", 101)
+    f["websocket"] = {"messages_meta": {"count": 2}}
+    return f
 
 
 FLOWS = [
@@ -51,6 +61,50 @@ class MitmTests(unittest.TestCase):
         users = [e for e in eps if e["path"] == "/v1/users"][0]
         self.assertEqual(users["status"], 200)
         self.assertEqual(users["query"], "page=2")
+
+    def test_endpoints_carry_sample_counts(self):
+        # /v1/users was captured twice (page=1, page=2); /v1/like once.
+        eps = mitm.endpoints(FakeMitm(), FLOWS, "api.example.com")
+        by_path = {e["path"]: e for e in eps}
+        self.assertEqual(by_path["/v1/users"]["samples"], 2)
+        self.assertEqual(by_path["/v1/like"]["samples"], 1)
+        eps = mitm.endpoints_from_saved(FLOWS, "api.example.com")
+        by_path = {e["path"]: e for e in eps}
+        self.assertEqual(by_path["/v1/users"]["samples"], 2)
+        self.assertEqual(by_path["/v1/like"]["samples"], 1)
+
+    def test_endpoints_live_ws_carries_messages(self):
+        messages = [{"from_client": True, "timestamp": 1.0,
+                     "text": "hello"}]
+        flows = FLOWS + [ws_flow("w1", "api.example.com")]
+        eps = mitm.endpoints(FakeMitm(ws={"w1": messages}), flows,
+                             "api.example.com")
+        by_path = {e["path"]: e for e in eps}
+        self.assertTrue(by_path["/chat"]["websocket"])
+        self.assertEqual(by_path["/chat"]["ws_messages"], messages)
+        self.assertFalse(by_path["/v1/users"]["websocket"])
+        self.assertEqual(by_path["/v1/users"]["ws_messages"], [])
+
+    def test_endpoints_live_ws_fetch_failure_means_empty(self):
+        class FailingMitm(FakeMitm):
+            def ws_messages(self, flow_id):
+                raise mitm.MitmError("boom")
+
+        flows = FLOWS + [ws_flow("w1", "api.example.com")]
+        eps = mitm.endpoints(FailingMitm(), flows, "api.example.com")
+        by_path = {e["path"]: e for e in eps}
+        self.assertTrue(by_path["/chat"]["websocket"])
+        self.assertEqual(by_path["/chat"]["ws_messages"], [])
+
+    def test_endpoints_from_saved_ws_uses_embedded(self):
+        messages = [{"from_client": True, "timestamp": 1.0,
+                     "text": "hello"}]
+        f = ws_flow("w1", "api.example.com")
+        f["_saved_ws_messages"] = messages
+        eps = mitm.endpoints_from_saved(FLOWS + [f], "api.example.com")
+        by_path = {e["path"]: e for e in eps}
+        self.assertTrue(by_path["/chat"]["websocket"])
+        self.assertEqual(by_path["/chat"]["ws_messages"], messages)
 
     def test_endpoints_other_host_excluded(self):
         eps = mitm.endpoints(FakeMitm(), FLOWS, "cdn.example.com")

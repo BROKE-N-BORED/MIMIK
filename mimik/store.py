@@ -18,6 +18,7 @@ import base64
 import json
 import os
 import re
+import tempfile
 from datetime import datetime
 
 DEFAULT_DATA_DIR = os.path.join(
@@ -123,6 +124,17 @@ def _embed_bodies(mitm, flows):
                     except UnicodeDecodeError:
                         g[f"_saved_{side}_body"] = base64.b64encode(raw).decode("ascii")
                         g[f"_saved_{side}_body_b64"] = True
+            # WebSocket messages (v0.4 item 13): mitmweb's /flows JSON
+            # carries only message meta — the messages come from the
+            # content-view endpoint. A failed fetch never breaks the
+            # save, same as bodies.
+            if "websocket" in f:
+                try:
+                    messages = mitm.ws_messages(f["id"])
+                except Exception:
+                    messages = None
+                if messages:
+                    g["_saved_ws_messages"] = messages
         out.append(g)
     return out
 
@@ -172,10 +184,72 @@ def open_private(path, mode="w"):
     file is created, so chmod afterwards too: a file left 0644 by an
     older version tightens on the next write to the same path.
     Returns a file object, like open().
+
+    This is for live handles (the recorder log, written incrementally).
+    One-shot saves should use atomic_write() instead — same 0600, plus
+    the write is all-or-nothing.
     """
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     os.chmod(path, 0o600)
     return os.fdopen(fd, mode)
+
+
+def ensure_private_dir(path):
+    """Create a directory 0700 (owner only), tightening an existing one.
+
+    The data dir and its subdirs hold live session tokens — they must
+    not be group/other-readable. os.makedirs' mode is masked by umask
+    and only applies at creation, so chmod afterwards too: a dir left
+    0755 by an older version tightens on next use. A failed chmod never
+    breaks the caller (best effort on odd filesystems). Returns path.
+    """
+    os.makedirs(path, exist_ok=True)
+    try:
+        os.chmod(path, 0o700)
+    except OSError:
+        pass
+    return path
+
+
+def atomic_write(path, data, private=True):
+    """Write bytes/str to path atomically: temp file in the same
+    directory, fsync, os.replace. An interrupted save leaves the
+    previous good file intact (or no file, if there was none) — never
+    a partial file. private=True (default) keeps the file 0600;
+    private=False writes 0644. Returns the path.
+
+    A crashed save can leave a stray `.mimik-tmp-*` file in the
+    directory; the store only reads *.json, so strays are invisible
+    to it (and tiny — one per crash at most).
+    """
+    directory = os.path.dirname(path) or "."
+    fd, tmp = tempfile.mkstemp(prefix=".mimik-tmp-", dir=directory)
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(data if isinstance(data, bytes)
+                     else data.encode("utf-8"))
+            fh.flush()
+            os.fsync(fh.fileno())
+        if private:
+            os.chmod(tmp, 0o600)
+        else:
+            os.chmod(tmp, 0o644)
+        os.replace(tmp, path)
+        try:  # fsync the directory so the rename itself is durable
+            dfd = os.open(directory, os.O_RDONLY)
+            try:
+                os.fsync(dfd)
+            finally:
+                os.close(dfd)
+        except OSError:
+            pass
+    except BaseException:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
+    return path
 
 
 def save_flows(flows, mitm=None, base=None, meta=None):
@@ -204,7 +278,8 @@ def save_flows(flows, mitm=None, base=None, meta=None):
             by_host.setdefault(req["host"], []).append(f)
     if not by_host:
         return []
-    os.makedirs(captures_dir(base), exist_ok=True)
+    ensure_private_dir(base)
+    ensure_private_dir(captures_dir(base))
     stamp = _stamp()
     paths = []
     for host, host_flows in sorted(by_host.items()):
@@ -230,13 +305,20 @@ def save_flows(flows, mitm=None, base=None, meta=None):
                 f"{_safe_host(host)}_{stamp}_{n}.json",
             )
             n += 1
-        with open_private(path, "w") as fh:
-            json.dump(
-                {"host": host, "saved_at": stamp, "flows": embedded,
-                 "meta": meta or {}}, fh
-            )
+        atomic_write(path, json.dumps(
+            {"host": host, "saved_at": stamp, "flows": embedded,
+             "meta": meta or {}}))
         paths.append(path)
     return paths
+
+
+def load_capture_file(path):
+    """Flows from one capture save file, or None if it can't be read."""
+    data = _read_capture(path)
+    if data is None:
+        return None
+    flows = data.get("flows")
+    return flows if isinstance(flows, list) else []
 
 
 def load_host(host, base=None):
@@ -425,10 +507,10 @@ def delete_host(host, base=None):
 def save_client_copy(name, source, base=None):
     """Keep a copy of a generated client under clients/. Returns the path."""
     base = base or data_dir()
-    os.makedirs(clients_dir(base), exist_ok=True)
+    ensure_private_dir(base)
+    ensure_private_dir(clients_dir(base))
     path = os.path.join(clients_dir(base), name)
-    with open(path, "w") as fh:
-        fh.write(source)
+    atomic_write(path, source, private=False)
     return path
 
 

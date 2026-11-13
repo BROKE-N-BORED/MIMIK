@@ -14,6 +14,7 @@ A check's "fix" is the plain-language remedy shown when it fails;
 "detail" (Reblend only) is an extra line shown when it passes.
 """
 import os
+import shutil
 import socket
 import sys
 
@@ -65,7 +66,7 @@ def doctor():
         {
             "name": "proxy (mitmweb or uvx)",
             "ok": mitmweb_cmd() is not None,
-            "fix": ("pip install mitmproxy  — or install uv: "
+            "fix": ("pip install mitmproxy, or install uv: "
                     "https://astral.sh/uv"),
         },
         {
@@ -100,7 +101,7 @@ def doctor():
         {
             "name": "wine (Windows capture target)",
             "ok": wine.wine_available(),
-            "fix": ("WinLinx brings Wine — install WinLinx to capture "
+            "fix": ("WinLinx brings Wine, install WinLinx to capture "
                     "Windows programs"),
         },
         {
@@ -115,6 +116,22 @@ def doctor():
                     "`mimik build-pack --reblend PATH`)"),
             "detail": f"Reblend folder: {rb}" if rb else None,
         },
+        {
+            "name": "git (fetch unpinning scripts)",
+            "ok": shutil.which("git") is not None,
+            "fix": "install git to use `mimik unpin` (pinned apps)",
+        },
+        {
+            "name": "frida (defeat pinning in the app)",
+            "ok": shutil.which("frida") is not None,
+            "fix": "pipx install frida-tools to use `mimik unpin`",
+        },
+        {
+            "name": "objection (patch APKs for the Frida gadget)",
+            "ok": shutil.which("objection") is not None,
+            "fix": ("pipx install objection to unpin a stock Android "
+                    "phone (APK path only)"),
+        },
     ]
 
     saved = store.list_captures()
@@ -122,7 +139,7 @@ def doctor():
     info = [
         f"saved captures: {len(saved)} host(s) under "
         f"{store.captures_dir()}",
-        f"disk usage: {store.format_size(usage['total'])} total — "
+        f"disk usage: {store.format_size(usage['total'])} total, "
         f"captures {store.format_size(usage['captures'])}, clients "
         f"{store.format_size(usage['clients'])}, assets "
         f"{store.format_size(usage['assets'])}, packs "

@@ -4,6 +4,7 @@ One window, seven tabs: Record | Hosts and Learn | Generate | Assets |
 Clients | Doctor | Presets. Dark, plain, big readable text. Accent
 violet #b48fdd only where needed.
 """
+import base64
 import html
 import os
 import subprocess
@@ -11,8 +12,8 @@ import sys
 import threading
 import time
 
-from PySide6.QtCore import Qt, QThread, QTimer, QUrl, Signal
-from PySide6.QtGui import QAction, QDesktopServices, QPixmap
+from PySide6.QtCore import QSettings, QSize, Qt, QThread, QTimer, QUrl, Signal
+from PySide6.QtGui import QAction, QDesktopServices, QIcon, QPixmap
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDialog, QFileDialog, QGroupBox,
     QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem,
@@ -20,7 +21,7 @@ from PySide6.QtWidgets import (
     QTableWidget, QTableWidgetItem, QTextEdit, QVBoxLayout, QWidget,
 )
 
-from . import assets, codegen, doctor, export, filters, launch, log, presets, reblend_bridge, sample, store, update, wine
+from . import assets, codegen, diff, doctor, export, filters, launch, log, presets, reblend_bridge, replay, sample, screenshot, store, unpin, update, websocket, wine
 from . import __version__
 from .flows import fetch_flows
 from .recorder import ProxySession
@@ -28,6 +29,17 @@ from .sources import har
 from .sources import mitm as mitm_mod
 
 ACCENT = "#b48fdd"
+
+# QSettings identity — explicit args, not the application name, so the
+# settings location is the same whether the window came from main() or
+# was constructed directly (tests, embeds).
+SETTINGS_ORG = "BrokeNBored"
+SETTINGS_APP = "MIMIK"
+
+
+def _settings():
+    """The app's QSettings (window geometry, theme — item 8, item 9)."""
+    return QSettings(SETTINGS_ORG, SETTINGS_APP)
 
 STYLESHEET = """
 QMainWindow, QWidget { background: #17171c; color: #e8e8ea; font-size: 14px; }
@@ -45,12 +57,41 @@ QGroupBox { border: 1px solid #33333a; margin-top: 12px; padding-top: 8px; }
 QGroupBox::title { color: #b48fdd; }
 """
 
+LIGHT_STYLESHEET = """
+QMainWindow, QWidget { background: #f2f2f4; color: #1c1c1e; font-size: 14px; }
+QTabWidget::pane { border: 1px solid #c9c9cf; }
+QTabBar::tab { background: #e2e2e8; padding: 10px 18px; margin-right: 2px; }
+QTabBar::tab:selected { background: #ffffff; color: #6b3fa0; }
+QPushButton { background: #ffffff; border: 1px solid #b9b9c0; padding: 10px 16px; }
+QPushButton:hover { border-color: #b48fdd; }
+QPushButton:disabled { color: #9a9aa2; }
+QPushButton#big { font-size: 16px; padding: 14px; background: #e8ddf2; }
+QListWidget, QTableWidget, QTextEdit, QComboBox {
+    background: #ffffff; border: 1px solid #c9c9cf; }
+QComboBox { padding: 6px; }
+QGroupBox { border: 1px solid #c9c9cf; margin-top: 12px; padding-top: 8px; }
+QGroupBox::title { color: #6b3fa0; }
+"""
+
+THEMES = ("dark", "light")
+
+
+def current_theme():
+    """The saved theme name ("dark" default — the theme before v0.4)."""
+    theme = _settings().value("theme", "dark")
+    return theme if theme in THEMES else "dark"
+
+
+def theme_stylesheet(name):
+    """The stylesheet for a theme name (unknown names get dark)."""
+    return LIGHT_STYLESHEET if name == "light" else STYLESHEET
+
 # Record-tab instructions, worded for the GUI (item 21): they point at
 # tabs and buttons, never at terminal commands. The CLI keeps its own
 # wording in cli.py (ANDROID_STEPS etc.) — a terminal user IS in a
 # terminal, so `mimik hosts` is right there and wrong here.
 GUI_ANDROID_STEPS = """
-Android phone capture — do this once, then just reopen the app to add traffic:
+Android phone capture: do this once, then just reopen the app to add traffic:
 
   1. Phone → Settings → Wi-Fi → your network → Proxy → Manual
         Hostname: {ip}      Port: 8080
@@ -64,14 +105,14 @@ Android phone capture — do this once, then just reopen the app to add traffic:
 
   mitmweb dashboard: http://127.0.0.1:8081   (MIMIK reads flows from here)
 
-  Android 7+ apps only trust user-installed CAs if the app opts in — some
+  Android 7+ apps only trust user-installed CAs if the app opts in, so some
   apps show no traffic because of that, and pinned apps (banks, Instagram)
   show none at all. If the Hosts and Learn tab shows the app's API host,
   you're good.
 """
 
 GUI_LINUX_APP_STEPS = """
-Linux app capture — run the app through the proxy:
+Linux app capture: run the app through the proxy:
 
   Launch it yourself with the proxy env vars, for example:
 
@@ -86,11 +127,11 @@ Linux app capture — run the app through the proxy:
 """
 
 GUI_WEB_STEPS = """
-Web app capture — no proxy needed:
+Web app capture: no proxy needed:
 
   1. Browser → DevTools (F12) → Network → use the web app normally
   2. Right-click the network log → Save all as HAR → save session.har
-  3. On the Generate tab, press Import HAR… and pick session.har —
+  3. On the Generate tab, press Import HAR… and pick session.har,
      then pick the host and press Generate client.
 
   Or copy one request as cURL (right-click → Copy → Copy as cURL)
@@ -98,15 +139,15 @@ Web app capture — no proxy needed:
 """
 
 GUI_WINDOWS_STEPS = """
-Windows program capture (via WinLinx) — MIMIK captures, WinLinx runs:
+Windows program capture (via WinLinx): MIMIK captures, WinLinx runs:
 
   1. Launch the Windows program in WinLinx (it owns running Windows programs)
   2. MIMIK points its Wine prefix at this proxy and installs the mitmproxy
      CA into the prefix, so the program's HTTPS traffic can be captured
-  3. Use the program normally — its API traffic lands in MIMIK
+  3. Use the program normally: its API traffic lands in MIMIK
   4. Stop here restores the prefix's original proxy settings
 
-  Some Windows programs ignore the system proxy or pin their certificates —
+  Some Windows programs ignore the system proxy or pin their certificates,
   those show no traffic, same as pinned phone apps.
 """
 
@@ -114,8 +155,8 @@ TARGETS = [
     ("android", "Android phone (same Wi-Fi)"),
     ("linux-app", "Linux app (installed)"),
     ("file", "Program from file (AppImage / archive / ISO / .deb)"),
-    ("web", "Web app (HAR / cURL — no proxy)"),
-    ("windows", "Windows program (via WinLinx — capture only)"),
+    ("web", "Web app (HAR / cURL, no proxy)"),
+    ("windows", "Windows program (via WinLinx, capture only)"),
 ]
 
 
@@ -146,6 +187,18 @@ def _empty_table_row(table, text):
     item = QTableWidgetItem(text)
     item.setFlags(Qt.NoItemFlags)
     table.setItem(0, 0, item)
+
+
+def _ws_message_line(message):
+    """One WS message as a transcript line (item 13): the text, or a
+    byte count for binary."""
+    if message.get("b64") is not None:
+        try:
+            n = len(base64.b64decode(message["b64"]))
+        except (ValueError, TypeError):
+            return "<binary, undecodable>"
+        return f"<{n} bytes binary>"
+    return message.get("text", "")
 
 
 class RecordWorker(QThread):
@@ -281,7 +334,7 @@ class RecordWorker(QThread):
                             note = manifest.get("scan_note") or ""
                             self.status.emit(
                                 f"found {len(manifest['assets'])} asset "
-                                "file(s) in the program — saved for the "
+                                "file(s) in the program, saved for the "
                                 "asset pack"
                                 + (f" ({note})" if note else ""))
                     except Exception as e:
@@ -297,7 +350,7 @@ class RecordWorker(QThread):
             except mitm_mod.MitmError as e:
                 self.status.emit(str(e))
                 return
-            self.status.emit("proxy up — capturing")
+            self.status.emit("proxy up, capturing")
 
             if self.target == "windows":
                 self.status.emit("pointing the Wine prefix at the proxy…")
@@ -397,12 +450,48 @@ class TaskWorker(QThread):
             self.result.emit(True, value)
 
 
+def _icon_files():
+    """Candidate icon files, best first: installed hicolor PNGs, the
+    installed SVG, then the source tree's PNGs + SVG (dev runs from
+    the tree, where the installed icon doesn't exist yet)."""
+    home = os.path.expanduser("~")
+    hicolor = os.path.join(home, ".local", "share", "icons", "hicolor")
+    tree = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                        "..", "icons")
+    files = []
+    for size in (256, 128, 48):
+        files.append((os.path.join(hicolor, f"{size}x{size}", "apps",
+                                   "mimik.png"), size))
+    files.append((os.path.join(hicolor, "scalable", "apps", "mimik.svg"),
+                  None))
+    for size in (256, 128, 48):
+        files.append((os.path.join(tree, f"mimik-{size}.png"), size))
+    files.append((os.path.join(tree, "mimik.svg"), None))
+    return [(p, s) for p, s in files if os.path.exists(p)]
+
+
+def window_icon():
+    """The MIMIK window icon — every available size, so the window
+    decoration, taskbar and Alt-Tab all get a sharp icon. PNG when
+    present, SVG fallback (QIcon renders SVGs via QtSvg). Empty when
+    no icon file exists anywhere."""
+    icon = QIcon()
+    for path, size in _icon_files():
+        if size:
+            icon.addFile(path, QSize(size, size))
+        else:
+            icon.addFile(path)
+    return icon
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle(f"MIMIK {__version__} — any app, as a Python library")
-        self.setStyleSheet(STYLESHEET)  # dark theme, even without main()
+        self.setWindowTitle(f"MIMIK {__version__}: any app, as a Python library")
+        self.setWindowIcon(window_icon())
+        self.setStyleSheet(theme_stylesheet(current_theme()))
         self.resize(900, 650)  # 620 + room for the status bar (item 7)
+        self._restore_geometry()  # reopens where it was left (item 8)
         self.worker = None
         self.plan = None
         self.file_path = None
@@ -492,7 +581,7 @@ class MainWindow(QMainWindow):
         if self.worker is not None and self._record_started is not None:
             elapsed = time.monotonic() - self._record_started
             self.status_proxy.setText(
-                f"● Recording — {_fmt_elapsed(elapsed)}")
+                f"● Recording: {_fmt_elapsed(elapsed)}")
             flows = "flow" if self._flow_count == 1 else "flows"
             hosts = "host" if self._host_count == 1 else "hosts"
             self.status_flows.setText(
@@ -551,8 +640,32 @@ class MainWindow(QMainWindow):
             if not self._confirm_stop_recording():
                 event.ignore()
                 return
+            self._take_stop_screenshot()
             worker.force_stop()
+        # The close is going ahead — remember where the window was.
+        _settings().setValue("geometry", self.saveGeometry())
         event.accept()
+
+    def _restore_geometry(self):
+        """Reopen where the window was left (size + position). A saved
+        geometry entirely off the current screen (monitor changed)
+        falls back to the default size at a sane position — a window
+        restored off-screen is a lost window."""
+        geometry = _settings().value("geometry")
+        if geometry is None:
+            return
+        try:
+            restored = self.restoreGeometry(geometry)
+        except (TypeError, ValueError):
+            return
+        if not restored:
+            return
+        screen = QApplication.primaryScreen()
+        if screen is not None:
+            available = screen.availableGeometry()
+            if not available.intersects(self.frameGeometry()):
+                self.resize(900, 650)
+                self.move(100, 100)
 
     def check_stale_wine_state(self):
         """A saved Wine proxy state means a capture ended without
@@ -560,7 +673,7 @@ class MainWindow(QMainWindow):
         if not wine.has_saved_state():
             return
         answer = QMessageBox.question(
-            self, "MIMIK — Wine proxy settings",
+            self, "MIMIK: Wine proxy settings",
             "MIMIK saved your Wine proxy settings during a capture that "
             "didn't finish cleanly, so your Wine prefix may still be "
             "pointing at MIMIK's proxy.\n\n"
@@ -614,7 +727,7 @@ class MainWindow(QMainWindow):
             self.cancel_btn.setEnabled(False)
             self.cancel_btn.setText("Cancelling…")
             self.progress_label.setText(
-                self.progress_label.text() + " — cancelling…")
+                self.progress_label.text() + ", cancelling…")
 
     def _task_finished(self, ok, value):
         worker = self._task
@@ -667,6 +780,14 @@ class MainWindow(QMainWindow):
         import_curl = QAction("Import cURL…", self)
         import_curl.triggered.connect(self._import_curl)
         file_menu.addAction(import_curl)
+        compare_act = QAction("Compare captures…", self)
+        compare_act.triggered.connect(self._compare_captures)
+        file_menu.addAction(compare_act)
+        self._compare_action = compare_act
+        unpin_act = QAction("Unpin a pinned app…", self)
+        unpin_act.triggered.connect(self._unpin_dialog)
+        file_menu.addAction(unpin_act)
+        self._unpin_action = unpin_act
         file_menu.addSeparator()
         quit_act = QAction("Quit", self)
         quit_act.setShortcut("Ctrl+Q")
@@ -689,6 +810,13 @@ class MainWindow(QMainWindow):
         refresh_act.triggered.connect(self._menu_refresh_current_tab)
         view_menu.addAction(refresh_act)
         self._refresh_action = refresh_act
+        view_menu.addSeparator()
+        dark_act = QAction("Dark theme", self)
+        dark_act.setCheckable(True)
+        dark_act.setChecked(current_theme() == "dark")
+        dark_act.triggered.connect(self._menu_toggle_theme)
+        view_menu.addAction(dark_act)
+        self._dark_theme_action = dark_act
 
         help_menu = menubar.addMenu("Help")
         about_act = QAction("About MIMIK", self)
@@ -702,6 +830,25 @@ class MainWindow(QMainWindow):
         update_act.triggered.connect(self._check_for_updates)
         help_menu.addAction(update_act)
         self._update_action = update_act
+
+    def _menu_toggle_theme(self):
+        """View menu theme toggle — the action's checked state is the theme."""
+        action = self.sender()
+        checked = action.isChecked() if action is not None else True
+        self.set_theme("dark" if checked else "light")
+
+    def set_theme(self, name):
+        """Switch the theme now + persist it (item 9). The window's own
+        stylesheet wins over the app-level one, so both are set."""
+        name = name if name in THEMES else "dark"
+        _settings().setValue("theme", name)
+        sheet = theme_stylesheet(name)
+        app = QApplication.instance()
+        if app is not None:
+            app.setStyleSheet(sheet)
+        self.setStyleSheet(sheet)
+        if hasattr(self, "_dark_theme_action"):
+            self._dark_theme_action.setChecked(name == "dark")
 
     def _menu_go_to_tab(self):
         """View menu tab jump — the action carries its tab index."""
@@ -801,6 +948,15 @@ class MainWindow(QMainWindow):
         frow.addWidget(manage_btn)
         lay.addLayout(frow)
 
+        # Stop-time screenshot (v0.4 item 15): one desktop screenshot
+        # when recording stops, saved with the capture.
+        self.screenshot_check = QCheckBox(
+            "Screenshot the desktop when recording stops")
+        self.screenshot_check.setChecked(presets.screenshot_enabled())
+        self.screenshot_check.stateChanged.connect(
+            self._screenshot_toggled)
+        lay.addWidget(self.screenshot_check)
+
         self.lan_label = QLabel(f"LAN IP for the phone proxy: {doctor.lan_ip()}:8080")
         lay.addWidget(self.lan_label)
 
@@ -848,7 +1004,7 @@ class MainWindow(QMainWindow):
         self.host_list = QListWidget()
         self.host_list.setMaximumHeight(110)
         self.host_list.addItem(_empty_item(
-            "No live hosts yet — start the proxy and use the app."))
+            "No live hosts yet. Start the proxy and use the app."))
         lay.addWidget(QLabel("Live hosts while recording:"))
         lay.addWidget(self.host_list)
 
@@ -887,7 +1043,7 @@ class MainWindow(QMainWindow):
                 "Archives are extracted to ~/.cache/mimik/runs/ and the main\n"
                 "program is auto-picked (change it in the list). Disk images\n"
                 "are mounted READ-ONLY and you pick the program inside.\n\n"
-                "Windows .exe/.msi are WinLinx's job — MIMIK never runs them.\n"
+                "Windows .exe/.msi are WinLinx's job: MIMIK never runs them.\n"
                 "To capture one, run it in WinLinx and use the Windows target.")
             self.start_btn.setEnabled(self.plan is not None
                                       and self.plan.command is not None)
@@ -895,7 +1051,7 @@ class MainWindow(QMainWindow):
         elif key == "web":
             self.steps.setText(GUI_WEB_STEPS)
             self.start_btn.setEnabled(False)
-            self.start_btn.setText("No proxy needed — import a HAR instead")
+            self.start_btn.setText("No proxy needed: import a HAR instead")
         elif key == "windows":
             self.steps.setText(GUI_WINDOWS_STEPS + "\nCommands MIMIK will run:\n"
                 "  wine regedit /s <proxy.reg>\n"
@@ -918,7 +1074,7 @@ class MainWindow(QMainWindow):
         dlg.resize(500, 400)
         lay = QVBoxLayout(dlg)
         lay.addWidget(QLabel(
-            "Hosts never captured — their traffic is dropped before\n"
+            "Hosts never captured: their traffic is dropped before\n"
             "it reaches the store or the host list. Subdomains of a\n"
             "listed host are excluded too."))
         lst = QListWidget()
@@ -1078,16 +1234,38 @@ class MainWindow(QMainWindow):
         self._update_status_bar()
         if not rows:
             self.host_list.addItem(_empty_item(
-                "Listening — use the app and its hosts appear here."))
+                "Listening. Use the app and its hosts appear here."))
             return
         for host, n in rows:
             self.host_list.addItem(f"{n:>6}  {host}")
 
     def _stop_recording(self):
         if self.worker is not None:
+            self._take_stop_screenshot()
             self.worker.request_stop()
             self.stop_btn.setEnabled(False)
             self.steps.append("stopping…")
+
+    def _screenshot_toggled(self):
+        presets.set_screenshot_enabled(
+            self.screenshot_check.isChecked())
+
+    def _take_stop_screenshot(self):
+        """The stop-time screenshot (v0.4 item 15), on the GUI thread
+        while the target app is still up. Called from Stop and from
+        window-close; never raises."""
+        if not self.screenshot_check.isChecked():
+            return
+        try:
+            path = screenshot.capture_for_session()
+        except Exception as e:
+            log.log_error("stop screenshot", e)
+            path = None
+        if path:
+            self.steps.append(f"screenshot saved: {path}")
+        else:
+            self.steps.append(
+                "screenshot failed (no screenshot tool found)")
 
     def _recording_finished(self):
         self.worker = None
@@ -1127,7 +1305,7 @@ class MainWindow(QMainWindow):
         self.hosts_list = QListWidget()
         self.hosts_list.currentItemChanged.connect(self._host_selected)
         self.hosts_list.addItem(_empty_item(
-            "No captures yet — record an app, or import a HAR on the "
+            "No captures yet. Record an app, or import a HAR on the "
             "Generate tab."))
         lay.addWidget(self.hosts_list, 1)
         lay.addWidget(QLabel("Endpoints for the selected host:"))
@@ -1146,6 +1324,17 @@ class MainWindow(QMainWindow):
         _empty_table_row(self.ep_table,
                          "Select a host to see its endpoints.")
         lay.addWidget(self.ep_table, 2)
+        rrow = QHBoxLayout()
+        self.replay_btn = QPushButton("Replay selected…")
+        self.replay_btn.clicked.connect(self._replay_selected)
+        self.replay_btn.setEnabled(False)
+        rrow.addWidget(self.replay_btn)
+        rrow.addWidget(QLabel("Re-sends the selected request, shows the "
+                              "response."))
+        rrow.addStretch(1)
+        lay.addLayout(rrow)
+        self.ep_table.itemSelectionChanged.connect(
+            self._update_replay_button)
         # No fetch here — the tab loads on first show (_tab_shown).
         return w
 
@@ -1192,7 +1381,7 @@ class MainWindow(QMainWindow):
             self.hosts_list.clear()
             if not rows:
                 self.hosts_list.addItem(_empty_item(
-                    "No captures yet — record an app, or import a HAR "
+                    "No captures yet. Record an app, or import a HAR "
                     "on the Generate tab."))
                 return
             for host, n, truncated, size in rows:
@@ -1200,7 +1389,7 @@ class MainWindow(QMainWindow):
                 if size:
                     text += f"  ({store.format_size(size)})"
                 if truncated:
-                    text += ("  (truncated — showing newest %d)"
+                    text += ("  (truncated, showing newest %d)"
                              % store.MAX_FLOWS_PER_HOST)
                 item = QListWidgetItem(text)
                 item.setData(Qt.UserRole, host)
@@ -1292,11 +1481,311 @@ class MainWindow(QMainWindow):
             for i, e in enumerate(eps):
                 self.ep_table.setItem(i, 0, QTableWidgetItem(e["method"]))
                 self.ep_table.setItem(i, 1, QTableWidgetItem(e["path"]))
-                self.ep_table.setItem(
-                    i, 2, QTableWidgetItem(str(e["status"])))
+                status = str(e["status"])
+                if e.get("websocket"):
+                    status += " (WS)"
+                self.ep_table.setItem(i, 2, QTableWidgetItem(status))
+                # The endpoint carries its sample flow (item 10) — the
+                # Replay button re-sends it.
+                self.ep_table.item(i, 0).setData(Qt.UserRole, e)
+            self._update_replay_button()
             self._filter_ep_table()
 
         return self._run_task(f"loading endpoints for {host}…", work, done)
+
+    def _update_replay_button(self):
+        """The Replay button is live only when a row with a flow is
+        selected (empty-state rows carry no endpoint)."""
+        row = self.ep_table.currentRow()
+        enabled = False
+        if row >= 0:
+            item = self.ep_table.item(row, 0)
+            enabled = bool(item is not None
+                           and item.data(Qt.UserRole))
+        self.replay_btn.setEnabled(enabled)
+
+    def _replay_selected(self):
+        """Replay the selected endpoint's captured request (item 10):
+        re-send it on a worker thread, show the response in a dialog.
+        State-changing methods ask first — replaying a POST can repeat
+        the action it did."""
+        row = self.ep_table.currentRow()
+        if row < 0:
+            QMessageBox.warning(self, "MIMIK", "select an endpoint first")
+            return
+        item = self.ep_table.item(row, 0)
+        endpoint = item.data(Qt.UserRole) if item is not None else None
+        if not endpoint or not endpoint.get("flow"):
+            QMessageBox.warning(self, "MIMIK", "select an endpoint first")
+            return
+        method = (endpoint.get("method") or "GET").upper()
+        if method not in ("GET", "HEAD"):
+            answer = QMessageBox.question(
+                self, "MIMIK",
+                f"Replay this {method} request?\n\n"
+                "It may repeat the action (send again, create a "
+                "duplicate).",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+            if answer != QMessageBox.Yes:
+                return
+        flow = endpoint["flow"]
+        if endpoint.get("websocket"):
+            # WebSocket replay (item 13): re-send the captured client
+            # messages, show the transcript. The endpoint's messages
+            # cover both paths — live flows don't carry theirs in the
+            # flow dict.
+            ws_messages = [m for m in endpoint.get("ws_messages") or []
+                           if m.get("from_client")]
+
+            def ws_work(worker):
+                return websocket.replay_ws(flow, messages=ws_messages)
+
+            def ws_done(ok, result):
+                if not ok:
+                    return
+                self._show_ws_replay_result(flow, ws_messages, result)
+
+            self._run_task(f"replaying WS {flow['request']['path']}…",
+                           ws_work, ws_done)
+            return
+        # Empty means "use the captured body" — live flows don't carry
+        # theirs in the flow dict, saved ones do (exact bytes).
+        body = endpoint.get("request_body") or None
+        original_status = endpoint.get("status")
+
+        def work(worker):
+            return replay.replay_flow(flow, body=body)
+
+        def done(ok, result):
+            if not ok:
+                return
+            self._show_replay_result(flow, original_status, result)
+
+        self._run_task(f"replaying {method} "
+                       f"{flow['request']['path']}…", work, done)
+
+    def _show_replay_result(self, flow, original_status, result):
+        """The replay result, in a non-modal dialog (item 10)."""
+        req = flow.get("request") or {}
+        url = replay.flow_url(flow)
+        lines = [f"{req.get('method', 'GET')} {url}", ""]
+        if result["ok"]:
+            lines.append(
+                f"Replay: {result['status']} {result['reason']} "
+                f"({result['elapsed']:.2f} s)")
+            if original_status is not None:
+                lines.append(f"Original: {original_status}")
+            lines.append("")
+            lines.append("--- response headers ---")
+            for name, value in result["headers"].items():
+                lines.append(f"{name}: {value}")
+            lines.append("")
+            lines.append("--- body ---")
+            lines.append(result["body"] or "(empty)")
+            if result["truncated"]:
+                lines.append(
+                    f"... (truncated to {replay.BODY_PREVIEW_CHARS} chars)")
+        else:
+            lines.append(f"Replay failed: {result['error']}")
+        self._show_result_dialog("Replay result", "\n".join(lines))
+
+    def _show_ws_replay_result(self, flow, sent_messages, result):
+        """The WS replay transcript, in a non-modal dialog (item 13)."""
+        lines = [f"{websocket.ws_url(flow)} (WebSocket replay)", ""]
+        if not result["ok"]:
+            lines.append(f"Replay failed: {result['error']}")
+            self._show_result_dialog("Replay result", "\n".join(lines))
+            return
+        lines.append(f"Sent {result['sent']} message(s), received "
+                     f"{len(result['received'])}.")
+        lines.append("")
+        lines.append("--- sent ---")
+        for message in sent_messages:
+            lines.append("→ " + _ws_message_line(message))
+        lines.append("")
+        lines.append("--- received ---")
+        for item in result["received"]:
+            lines.append("← " + _ws_message_line(item))
+        if not result["received"]:
+            lines.append("(nothing came back)")
+        self._show_result_dialog("Replay result", "\n".join(lines))
+
+    def _show_result_dialog(self, title, text):
+        """A non-modal text dialog (replay results, HTTP + WS)."""
+        dlg = QDialog(self)
+        dlg.setWindowTitle(title)
+        dlg.resize(700, 450)
+        lay = QVBoxLayout(dlg)
+        text_widget = QTextEdit()
+        text_widget.setReadOnly(True)
+        text_widget.setPlainText(text)
+        lay.addWidget(text_widget)
+        self._replay_text = text_widget
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(dlg.close)
+        lay.addWidget(close_btn)
+        self._replay_dialog = dlg
+        dlg.show()
+
+    # ---- capture diff dialog (item 12) ----------------------------------------
+
+    def _compare_captures(self):
+        """Compare two captures — hosts or files — in a dialog."""
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Compare captures")
+        dlg.resize(700, 450)
+        lay = QVBoxLayout(dlg)
+        lay.addWidget(QLabel(
+            "Pick two captures: a saved host, or a capture/HAR file. "
+            "New/removed endpoints and changed responses are listed."))
+        self._diff_combo_a = self._diff_picker(lay, "From:")
+        self._diff_combo_b = self._diff_picker(lay, "To:")
+        compare_btn = QPushButton("Compare")
+        compare_btn.clicked.connect(self._run_diff_dialog)
+        lay.addWidget(compare_btn)
+        self._diff_text = QTextEdit()
+        self._diff_text.setReadOnly(True)
+        lay.addWidget(self._diff_text)
+        self._diff_dialog = dlg
+        dlg.show()
+
+    def _diff_picker(self, lay, label_text):
+        """One side of the diff dialog: hosts + a file-browse entry."""
+        row = QHBoxLayout()
+        row.addWidget(QLabel(label_text))
+        combo = QComboBox()
+        for host, _n, _latest in store.list_captures():
+            combo.addItem(f"{host}", ("host", host))
+        combo.addItem("Browse for a file…", ("browse", None))
+        # activated (not currentIndexChanged) fires even when the
+        # browse entry is already current — the no-hosts case.
+        combo.activated.connect(self._diff_browse)
+        row.addWidget(combo, 1)
+        lay.addLayout(row)
+        return combo
+
+    def _diff_browse(self):
+        """A diff picker chose "Browse for a file…" — swap in the file."""
+        combo = self.sender()
+        if combo is None:
+            return
+        data = combo.currentData()
+        if not data or data[0] != "browse":
+            return
+        path, _selected = QFileDialog.getOpenFileName(
+            self, "Pick a capture", "",
+            "Captures (*.json *.har);;All files (*)")
+        if not path:
+            combo.setCurrentIndex(0)
+            return
+        idx = combo.findData(("browse", None))
+        combo.insertItem(idx, f"File: {os.path.basename(path)}",
+                         ("file", path))
+        combo.setCurrentIndex(idx)
+
+    def _run_diff_dialog(self):
+        """Run the dialog's comparison on a worker thread."""
+        def _source(combo):
+            data = combo.currentData()
+            if not data or data[0] not in ("host", "file"):
+                return None
+            return data[1]
+
+        a = _source(self._diff_combo_a)
+        b = _source(self._diff_combo_b)
+        if a is None or b is None:
+            QMessageBox.warning(self, "MIMIK", "pick two captures first")
+            return
+
+        def work(worker):
+            flows_a, label_a = diff.load_source(a)
+            flows_b, label_b = diff.load_source(b)
+            return diff.format_diff(diff.diff_captures(flows_a, flows_b),
+                                    label_a, label_b)
+
+        def done(ok, value):
+            if not ok:
+                # The failure (unknown host, unreadable file) goes in
+                # the results area, not a modal — the dialog stays up.
+                self._diff_text.setPlainText(
+                    f"Could not compare:\n{value}")
+                return
+            self._diff_text.setPlainText(value)
+
+        self._run_task("comparing captures…", work, done)
+
+    def _unpin_dialog(self):
+        """Prepare a Frida unpinning run (v0.4 item 14)."""
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Unpin a pinned app")
+        dlg.resize(700, 450)
+        lay = QVBoxLayout(dlg)
+        intro = QLabel(
+            "A pinned app rejects the proxy's certificate, so it shows "
+            "no traffic. Frida hooks the app's TLS check at runtime. "
+            "MIMIK fetches the maintained unpinning scripts, bakes in "
+            "your mitmproxy CA + proxy address, and gives you the exact "
+            "command to run.")
+        intro.setWordWrap(True)
+        lay.addWidget(intro)
+        row = QHBoxLayout()
+        row.addWidget(QLabel("Target:"))
+        self._unpin_target = QLineEdit()
+        self._unpin_target.setPlaceholderText(
+            "com.example.app, an .apk file, or a Linux program")
+        row.addWidget(self._unpin_target, 1)
+        browse_btn = QPushButton("Browse…")
+        browse_btn.clicked.connect(self._unpin_browse)
+        row.addWidget(browse_btn)
+        lay.addLayout(row)
+        row = QHBoxLayout()
+        row.addWidget(QLabel("Kind:"))
+        self._unpin_kind = QComboBox()
+        self._unpin_kind.addItem("Auto detect", None)
+        self._unpin_kind.addItem("Android app", "android")
+        self._unpin_kind.addItem("Linux program", "linux")
+        row.addWidget(self._unpin_kind)
+        row.addStretch(1)
+        lay.addLayout(row)
+        prepare_btn = QPushButton("Prepare")
+        prepare_btn.clicked.connect(self._run_unpin_dialog)
+        lay.addWidget(prepare_btn)
+        self._unpin_text = QTextEdit()
+        self._unpin_text.setReadOnly(True)
+        lay.addWidget(self._unpin_text)
+        self._unpin_dialog_ref = dlg
+        dlg.show()
+
+    def _unpin_browse(self):
+        """Pick an APK file as the unpin target."""
+        path, _selected = QFileDialog.getOpenFileName(
+            self, "Pick an APK", "",
+            "Android apps (*.apk);;All files (*)")
+        if path:
+            self._unpin_target.setText(path)
+
+    def _run_unpin_dialog(self):
+        """Run the dialog's preparation on a worker thread."""
+        target = self._unpin_target.text().strip()
+        if not target:
+            QMessageBox.warning(self, "MIMIK", "enter a target first")
+            return
+        platform = self._unpin_kind.currentData()
+
+        def work(worker):
+            plan = unpin.prepare(target, platform=platform)
+            return unpin.format_plan(plan, target)
+
+        def done(ok, value):
+            if not ok:
+                # The failure (no CA, no git, no objection) goes in
+                # the results area, not a modal — the dialog stays up.
+                self._unpin_text.setPlainText(
+                    f"Could not prepare:\n{value}")
+                return
+            self._unpin_text.setPlainText(value)
+
+        self._run_task("preparing unpin…", work, done)
 
     # ---- list filtering (item 22) -------------------------------------------
 
@@ -1371,7 +1860,7 @@ class MainWindow(QMainWindow):
         w = QWidget()
         lay = QVBoxLayout(w)
         lay.addWidget(QLabel(
-            "Generate a Python client from captured traffic — "
+            "Generate a Python client from captured traffic: "
             "deterministic and free, no LLM."))
 
         row = QHBoxLayout()
@@ -1382,7 +1871,7 @@ class MainWindow(QMainWindow):
         # placeholderText stores the value but never forwards it to
         # the line edit in this Qt build, so nothing renders.
         self.gen_host.lineEdit().setPlaceholderText(
-            "No hosts yet — record an app or import a HAR")
+            "No hosts yet. Record an app or import a HAR")
         row.addWidget(self.gen_host, 1)
         refresh = QPushButton("Refresh hosts")
         refresh.clicked.connect(self._refresh_gen_hosts_clicked)
@@ -1578,7 +2067,7 @@ class MainWindow(QMainWindow):
                     # Cancelled — the generated source is still shown,
                     # so the work isn't lost.
                     self.gen_log.setText(
-                        f"not saved — {os.path.basename(out)} already "
+                        f"not saved: {os.path.basename(out)} already "
                         f"exists (generation cancelled)\n\n{src[:3000]}")
                     return
                 if choice == "numbered":
@@ -1646,7 +2135,7 @@ class MainWindow(QMainWindow):
         w = QWidget()
         lay = QVBoxLayout(w)
         lay.addWidget(QLabel(
-            "Assets captured from your apps — images, models, audio, "
+            "Assets captured from your apps: images, models, audio, "
             "fonts. Build them into a Reblend pack."))
 
         row = QHBoxLayout()
@@ -1669,7 +2158,7 @@ class MainWindow(QMainWindow):
         self.asset_table.horizontalHeader().setStretchLastSection(True)
         self.asset_table.itemDoubleClicked.connect(self._preview_asset_item)
         _empty_table_row(self.asset_table,
-                         "No assets yet — capture an app or import a HAR.")
+                         "No assets yet. Capture an app or import a HAR.")
         frow = QHBoxLayout()
         frow.addWidget(QLabel("Filter:"))
         self.asset_filter = QLineEdit()
@@ -1783,14 +2272,14 @@ class MainWindow(QMainWindow):
         self.asset_group.clear()
         for gdir, manifest in groups:
             n = len(manifest.get("assets", []))
-            label = (f"{manifest.get('group')} — "
+            label = (f"{manifest.get('group')}: "
                      f"{manifest.get('captured_at', '')} ({n} assets)")
             self.asset_group.addItem(label, gdir)
         if not groups:
             # No data — a placeholder item (no UserRole data, so
             # _asset_group_selected treats it as "nothing selected").
             self.asset_group.addItem(
-                "No captures yet — record an app or import a HAR")
+                "No captures yet. Record an app or import a HAR")
         self.asset_group.blockSignals(False)
         if current:
             idx = self.asset_group.findData(current)
@@ -1803,7 +2292,7 @@ class MainWindow(QMainWindow):
         gdir = self.asset_group.currentData()
         if not gdir:
             _empty_table_row(self.asset_table,
-                             "No assets yet — capture an app or import "
+                             "No assets yet. Capture an app or import "
                              "a HAR.")
             return
         status_map = self._pack_status_map()
@@ -1918,7 +2407,7 @@ class MainWindow(QMainWindow):
         label.setAlignment(Qt.AlignCenter)
         lay.addWidget(label)
         lay.addWidget(QLabel(
-            f"{pix.width()} × {pix.height()} px — "
+            f"{pix.width()} × {pix.height()} px, "
             f"{store.format_size(os.path.getsize(path))}"))
         row = QHBoxLayout()
         row.addStretch(1)
@@ -2013,7 +2502,7 @@ class MainWindow(QMainWindow):
             self.reblend_label.setText(f"Reblend found at {path}")
         else:
             self.reblend_label.setText(
-                "Reblend not found — pick your Reblend folder to convert "
+                "Reblend not found. Pick your Reblend folder to convert "
                 "models (capture and listing still work without it)")
 
     def _choose_reblend(self):
@@ -2085,7 +2574,7 @@ class MainWindow(QMainWindow):
     def _build_pack(self):
         gdir = self.asset_group.currentData()
         if not gdir:
-            QMessageBox.warning(self, "MIMIK", "no captured assets yet — "
+            QMessageBox.warning(self, "MIMIK", "no captured assets yet. "
                                 "record an app or import a HAR first")
             return
         host = None
@@ -2178,7 +2667,7 @@ class MainWindow(QMainWindow):
             self, "MIMIK",
             f"Delete the pack {os.path.basename(self.pack_dir)} "
             f"({store.format_size(store.dir_size(self.pack_dir))})?\n\n"
-            "The source assets stay — only the built pack goes. "
+            "The source assets stay. Only the built pack goes. "
             "This cannot be undone.",
             QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
         if answer != QMessageBox.Yes:
@@ -2248,7 +2737,7 @@ class MainWindow(QMainWindow):
         w = QWidget()
         lay = QVBoxLayout(w)
         lay.addWidget(QLabel(
-            "Presets are rules MIMIK learns from your captures — sign-in, "
+            "Presets are rules MIMIK learns from your captures: sign-in, "
             "endpoints, assets. They never hold passwords or tokens."))
 
         row = QHBoxLayout()
@@ -2331,22 +2820,22 @@ class MainWindow(QMainWindow):
         saved = presets.list_presets()
         if not saved:
             self.presets_list.addItem(_empty_item(
-                "No presets yet — learn one from a capture above."))
+                "No presets yet. Learn one from a capture above."))
         for p in saved:
             item = QListWidgetItem(
-                f"{p['name']} ({p['scope']}) — {presets.summary(p)}")
+                f"{p['name']} ({p['scope']}): {presets.summary(p)}")
             item.setData(Qt.UserRole, p["name"])
             self.presets_list.addItem(item)
         self.pattern_presets_list.clear()
         patterns = presets.list_pattern_presets()
         if not patterns:
             self.pattern_presets_list.addItem(_empty_item(
-                "No pattern presets yet — learn one from a capture "
+                "No pattern presets yet. Learn one from a capture "
                 "above."))
         for p in patterns:
             learned_from = p.get("learned_from") or []
             item = QListWidgetItem(
-                f"{p.get('display_name') or p['name']} — learned from "
+                f"{p.get('display_name') or p['name']}, learned from "
                 f"{len(learned_from)} "
                 f"app{'s' if len(learned_from) != 1 else ''}")
             item.setData(Qt.UserRole, p["name"])
@@ -2403,7 +2892,7 @@ class MainWindow(QMainWindow):
             result, patterns, _matched = value
             if result is None:
                 self.presets_log.setText(
-                    f"nothing to learn from for {name} yet — "
+                    f"nothing to learn from for {name} yet. "
                     "capture it first")
                 return
             preset, _path, created = result
@@ -2564,7 +3053,7 @@ class MainWindow(QMainWindow):
         clients = store.list_clients()
         if not clients:
             self.clients_list.addItem(_empty_item(
-                "No clients yet — generate one on the Generate tab."))
+                "No clients yet. Generate one on the Generate tab."))
             return
         for name, path, size in clients:
             item = QListWidgetItem(f"{name}  ({size} bytes)")
@@ -2607,7 +3096,7 @@ class MainWindow(QMainWindow):
         answer = QMessageBox.question(
             self, "MIMIK",
             f"Delete the generated client {name}?\n\n"
-            "This deletes the kept copy — the client file in the "
+            "This deletes the kept copy: the client file in the "
             "folder it was generated into (if any) stays. "
             "This cannot be undone.",
             QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
@@ -2631,7 +3120,7 @@ class MainWindow(QMainWindow):
             answer = QMessageBox.question(
                 self, "MIMIK",
                 f"{os.path.basename(path)} was not generated by "
-                f"MIMIK.\n\nThe smoke test runs the file's code — "
+                f"MIMIK.\n\nThe smoke test runs the file's code, "
                 f"only run it if you trust where it came from. "
                 f"Run it anyway?",
                 QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
@@ -2694,7 +3183,7 @@ class MainWindow(QMainWindow):
     def _doctor_tab(self):
         w = QWidget()
         lay = QVBoxLayout(w)
-        lay.addWidget(QLabel("Setup check — green is good, red has a fix."))
+        lay.addWidget(QLabel("Setup check: green is good, red has a fix."))
         refresh = QPushButton("Re-check")
         refresh.clicked.connect(self._run_doctor)
         about = QPushButton("About MIMIK")
@@ -2727,8 +3216,8 @@ class MainWindow(QMainWindow):
             f"MIMIK {__version__}\n\n"
             "Intercept any app, then call it from Python like a "
             "library.\n"
-            "Capture your own session with mitmproxy — or import a "
-            "HAR file or cURL paste — and MIMIK reuses your real "
+            "Capture your own session with mitmproxy, or import a "
+            "HAR file or cURL paste, and MIMIK reuses your real "
             "auth so the server can't tell your script from the "
             "app.\n\n"
             "Linux port of littledivy/mimic (MIT).\n"
@@ -2746,7 +3235,7 @@ class MainWindow(QMainWindow):
         text.setReadOnly(True)
         tail = log.read_tail()
         text.setPlainText(
-            tail or "(the log is empty — no errors recorded yet)")
+            tail or "(the log is empty: no errors recorded yet)")
         lay.addWidget(text, 1)
         close = QPushButton("Close")
         close.clicked.connect(dlg.accept)
@@ -2772,8 +3261,8 @@ class MainWindow(QMainWindow):
             "3. generate a client."))
         lay.addWidget(QLabel(
             "No app to record yet? Load a sample capture of a demo "
-            "game API (demo.example.com) and try the whole flow — "
-            "hosts, preset, generated client — with no recording."))
+            "game API (demo.example.com) and try the whole flow: "
+            "hosts, preset, generated client, with no recording."))
         row = QHBoxLayout()
         load_btn = QPushButton("Load the sample capture")
         load_btn.clicked.connect(self._sample_offer_accept)
@@ -2828,7 +3317,7 @@ class MainWindow(QMainWindow):
             f"{result['assets']} "
             f"asset{'s' if result['assets'] != 1 else ''}"
             + (", preset learned" if result["preset"] else "")
-            + ".\n\nYour first client is one press away — open the "
+            + ".\n\nYour first client is one press away. Open the "
               "Generate tab and press Generate."))
         row = QHBoxLayout()
         go_btn = QPushButton("Take me to Generate")
@@ -2959,10 +3448,10 @@ def _handle_uncaught(exc_type, exc, tb):
         pass
     try:
         QMessageBox.critical(
-            None, "MIMIK — something went wrong",
+            None, "MIMIK: something went wrong",
             f"MIMIK hit an unexpected error:\n\n{exc}\n\n"
             f"The details were written to:\n{log.log_path()}\n\n"
-            "MIMIK is still running — you can keep working, or "
+            "MIMIK is still running. You can keep working, or "
             "restart it if something looks wrong.")
     except Exception:
         pass
@@ -2980,7 +3469,8 @@ def main():
     _install_crash_handler()
     app = QApplication(sys.argv)
     app.setApplicationName("MIMIK")
-    app.setStyleSheet(STYLESHEET)
+    app.setWindowIcon(window_icon())
+    app.setStyleSheet(theme_stylesheet(current_theme()))
     win = MainWindow()
     win.show()
     # After the first event-loop turn: warn if a previous capture left

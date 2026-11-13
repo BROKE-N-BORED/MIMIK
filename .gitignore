@@ -11,3 +11,8 @@ providers.json
 *.key
 credentials.json
 secrets.json
+
+# Icon PNGs are derived artifacts — rendered from icons/mimik.svg at
+# install time (tools/render_icons.py). The repo holds only the SVG:
+# the GitHub push path can't carry binary files.
+icons/*.png

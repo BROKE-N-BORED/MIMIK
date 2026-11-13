@@ -143,10 +143,10 @@ def load_preset(name, scope=None, base=None):
 
 def _save_preset(preset, base=None):
     base = base or store.data_dir()
-    os.makedirs(presets_dir(base), exist_ok=True)
+    store.ensure_private_dir(base)
+    store.ensure_private_dir(presets_dir(base))
     path = preset_path(preset["name"], preset["scope"], base)
-    with store.open_private(path, "w") as fh:
-        json.dump(preset, fh, indent=2)
+    store.atomic_write(path, json.dumps(preset, indent=2))
     return path
 
 
@@ -221,10 +221,10 @@ def load_pattern_preset(fid, base=None):
 
 def _save_pattern_preset(preset, base=None):
     base = base or store.data_dir()
-    os.makedirs(patterns_dir(base), exist_ok=True)
+    store.ensure_private_dir(base)
+    store.ensure_private_dir(patterns_dir(base))
     path = pattern_preset_path(preset["name"], base)
-    with store.open_private(path, "w") as fh:
-        json.dump(preset, fh, indent=2)
+    store.atomic_write(path, json.dumps(preset, indent=2))
     return path
 
 
@@ -902,14 +902,21 @@ def auto_learn_enabled(base=None):
     return bool(_read_settings(base).get("auto_learn_presets", False))
 
 
+def _write_settings(settings, base):
+    """Write settings.json atomically (0644 — settings hold toggles and
+    host lists, no secrets). One writer for all four setters so a torn
+    settings file can't break startup reads."""
+    store.ensure_private_dir(base)
+    store.atomic_write(_settings_path(base),
+                       json.dumps(settings, indent=2), private=False)
+
+
 def set_auto_learn(enabled, base=None):
     """Turn the "Learn presets from captures" setting on or off."""
     base = base or store.data_dir()
     settings = _read_settings(base)
     settings["auto_learn_presets"] = bool(enabled)
-    os.makedirs(base, exist_ok=True)
-    with open(_settings_path(base), "w") as fh:
-        json.dump(settings, fh, indent=2)
+    _write_settings(settings, base)
     return bool(enabled)
 
 
@@ -925,9 +932,7 @@ def set_sample_offered(base=None):
     base = base or store.data_dir()
     settings = _read_settings(base)
     settings["sample_offered"] = True
-    os.makedirs(base, exist_ok=True)
-    with open(_settings_path(base), "w") as fh:
-        json.dump(settings, fh, indent=2)
+    _write_settings(settings, base)
     return True
 
 
@@ -955,9 +960,7 @@ def set_excluded_hosts(hosts, base=None):
         if h and h not in seen:
             seen.append(h)
     settings["excluded_hosts"] = seen
-    os.makedirs(base, exist_ok=True)
-    with open(_settings_path(base), "w") as fh:
-        json.dump(settings, fh, indent=2)
+    _write_settings(settings, base)
     return seen
 
 
@@ -971,9 +974,22 @@ def set_filtering_enabled(enabled, base=None):
     base = base or store.data_dir()
     settings = _read_settings(base)
     settings["filtering_enabled"] = bool(enabled)
-    os.makedirs(base, exist_ok=True)
-    with open(_settings_path(base), "w") as fh:
-        json.dump(settings, fh, indent=2)
+    _write_settings(settings, base)
+    return bool(enabled)
+
+
+def screenshot_enabled(base=None):
+    """The "screenshot the desktop when recording stops" toggle
+    (v0.4 item 15). Default OFF: a desktop screenshot is opt-in."""
+    return bool(_read_settings(base).get("screenshot_enabled", False))
+
+
+def set_screenshot_enabled(enabled, base=None):
+    """Turn the stop-time screenshot on or off."""
+    base = base or store.data_dir()
+    settings = _read_settings(base)
+    settings["screenshot_enabled"] = bool(enabled)
+    _write_settings(settings, base)
     return bool(enabled)
 
 
@@ -1075,7 +1091,7 @@ def describe(preset):
     token_eps = auth.get("token_endpoints") or []
     lines.append("How this app signs in:")
     if not (headers or cookies or token_eps):
-        lines.append("  nothing learned yet — no signed-in requests seen")
+        lines.append("  nothing learned yet, no signed-in requests seen")
     for h in headers:
         extra = ""
         if h.lower() == "authorization" and schemes:
@@ -1092,7 +1108,7 @@ def describe(preset):
         lines.append("  none learned yet")
     for e in eps:
         seen = e.get("seen", 1)
-        lines.append(f"  {e['method']} {e['path']} — seen {seen} "
+        lines.append(f"  {e['method']} {e['path']}, seen {seen} "
                      f"time{'s' if seen != 1 else ''}")
     lines.append("")
     mapping = preset.get("asset_mapping") or []
@@ -1102,7 +1118,7 @@ def describe(preset):
     for m in mapping:
         kind = assets.KIND_LABELS.get(m["kind"], m["kind"])
         seen = m.get("seen", 1)
-        lines.append(f"  {m['pattern']} — {kind.lower()} "
+        lines.append(f"  {m['pattern']}, {kind.lower()} "
                      f"(seen {seen} time{'s' if seen != 1 else ''})")
     lines.append("")
     pack = preset.get("pack") or {}
@@ -1112,5 +1128,5 @@ def describe(preset):
         lines.append(f"  model scale: {pack['scale']} cm per unit"
                      + (f" (last pack {last})" if last else ""))
     else:
-        lines.append("  no pack built yet — the default scale (100) applies")
+        lines.append("  no pack built yet, the default scale (100) applies")
     return lines

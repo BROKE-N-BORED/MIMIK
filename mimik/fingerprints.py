@@ -65,7 +65,7 @@ FINGERPRINTS = {
     "api-key-header": {
         "name": "API key header",
         "kind": "auth",
-        "about": "an X-Api-Key-style header on at least 2 endpoints — "
+        "about": "an X-Api-Key-style header on at least 2 endpoints, "
                  "one lone key header never claims this alone",
     },
     "session-cookie": {
@@ -104,19 +104,19 @@ FINGERPRINTS = {
         "name": "Express web framework",
         "kind": "framework",
         "about": 'X-Powered-By response header naming "Express" '
-                 "(unambiguous — the server declares it)",
+                 "(unambiguous, the server declares it)",
     },
     "aspnet": {
         "name": "ASP.NET web framework",
         "kind": "framework",
         "about": 'X-Powered-By response header naming "ASP.NET" '
-                 "(unambiguous — the server declares it)",
+                 "(unambiguous, the server declares it)",
     },
     "php": {
         "name": "PHP backend",
         "kind": "framework",
         "about": 'X-Powered-By response header naming "PHP" '
-                 "(unambiguous — the server declares it)",
+                 "(unambiguous, the server declares it)",
     },
     "stripe-api": {
         "name": "Stripe API",

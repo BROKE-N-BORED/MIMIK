@@ -61,7 +61,7 @@ class ProxySession:
         cmd = mitmweb_cmd()
         if not cmd:
             raise MitmError(
-                "no proxy available — install mitmproxy "
+                "no proxy available, install mitmproxy "
                 "(`pip install mitmproxy`) or uv (https://astral.sh/uv) "
                 "so MIMIK can run mitmweb for you"
             )
@@ -83,7 +83,7 @@ class ProxySession:
                 self._cleanup_failed_start()
                 raise MitmError(
                     f"mitmweb exited right away (code {code}) "
-                    f"— see {self.log_path}"
+                    f", see {self.log_path}"
                 )
             self._discover_token()
             try:

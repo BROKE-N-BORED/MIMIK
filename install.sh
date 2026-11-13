@@ -26,6 +26,12 @@ fi
 
 mkdir -p "$PREFIX" "$BIN"
 
+# Exec bits — a fresh clone has every file 100644 (the GitHub push path
+# can't set file modes), so fix the scripts' bits here. The Release zip
+# already carries 0o100755 for these; this only matters for clones.
+# Never fatal: the tree may be read-only.
+chmod +x "$DIR/install.sh" "$DIR/uninstall.sh" "$DIR/Install MIMIK.desktop" 2>/dev/null || true
+
 if [ ! -x "$VENV/bin/python" ]; then
   echo "Creating virtualenv at $VENV …"
   python3 -m venv "$VENV"
@@ -67,15 +73,33 @@ if ! GUI_ERR="$("$VENV/bin/python" -c "import PySide6.QtWidgets, mimik.gui" 2>&1
   echo
 fi
 
-# Icons
+# Icons — the repo holds only icons/mimik.svg (the GitHub push path
+# can't carry binary files), so render the PNGs from the SVG when they
+# aren't in the tree (fresh clone). The Release zip carries prebuilt
+# PNGs, so this step is skipped there. Icons must NEVER fail the
+# install: a missing PNG is a warning, and the menu launcher below is
+# written regardless.
+if [ ! -f "$DIR/icons/mimik-48.png" ] && [ -f "$DIR/icons/mimik.svg" ]; then
+  if ! QT_QPA_PLATFORM=offscreen "$VENV/bin/python" "$DIR/tools/render_icons.py" "$DIR/icons" 2>/dev/null; then
+    echo "WARNING: could not render icon PNGs from the SVG — the menu icon will use the SVG."
+  fi
+fi
 for spec in "48 mimik-48.png" "128 mimik-128.png" "256 mimik-256.png"; do
   set -- $spec
-  dest="$HOME/.local/share/icons/hicolor/${1}x${1}/apps"
-  mkdir -p "$dest"
-  cp "$DIR/icons/$2" "$dest/mimik.png"
+  if [ -f "$DIR/icons/$2" ]; then
+    dest="$HOME/.local/share/icons/hicolor/${1}x${1}/apps"
+    mkdir -p "$dest"
+    cp "$DIR/icons/$2" "$dest/mimik.png"
+  else
+    echo "WARNING: $DIR/icons/$2 is missing — skipping the ${1}px icon."
+  fi
 done
-mkdir -p "$HOME/.local/share/icons/hicolor/scalable/apps"
-cp "$DIR/icons/mimik.svg" "$HOME/.local/share/icons/hicolor/scalable/apps/mimik.svg"
+if [ -f "$DIR/icons/mimik.svg" ]; then
+  mkdir -p "$HOME/.local/share/icons/hicolor/scalable/apps"
+  cp "$DIR/icons/mimik.svg" "$HOME/.local/share/icons/hicolor/scalable/apps/mimik.svg"
+else
+  echo "WARNING: $DIR/icons/mimik.svg is missing — no icon installed."
+fi
 if command -v gtk-update-icon-cache >/dev/null 2>&1; then
   gtk-update-icon-cache -f -t "$HOME/.local/share/icons/hicolor" 2>/dev/null || true
 fi

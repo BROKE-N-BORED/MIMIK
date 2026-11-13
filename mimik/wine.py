@@ -65,19 +65,19 @@ def check_ready():
     """(ok, message) — wine + WinLinx + prefix present?"""
     if not wine_available():
         return False, (
-            "wine is not installed — WinLinx runs Windows programs, so "
+            "wine is not installed, WinLinx runs Windows programs, so "
             "install WinLinx (it brings Wine) and launch the program there "
             "first, then come back to MIMIK to capture it."
         )
     if not winlinx_available():
         return False, (
-            "WinLinx not found — WinLinx runs Windows programs. Install it "
+            "WinLinx not found, WinLinx runs Windows programs. Install it "
             "and launch the program there first, then use MIMIK to capture "
             "its traffic."
         )
     if not os.path.isdir(wine_prefix()):
         return False, (
-            f"no Wine prefix at {wine_prefix()} yet — launch a Windows "
+            f"no Wine prefix at {wine_prefix()} yet, launch a Windows "
             "program in WinLinx once to create it."
         )
     return True, ""
@@ -245,7 +245,7 @@ def install_ca(ca_path=None, prefix=None, runner=None):
     ca = ca_path or mitm_ca_path()
     if not os.path.exists(ca):
         raise WineError(
-            f"no mitmproxy CA cert at {ca} yet — run `mimik record` once "
+            f"no mitmproxy CA cert at {ca} yet, run `mimik record` once "
             "(any target) so mitmproxy creates it, then retry"
         )
     env = dict(os.environ)

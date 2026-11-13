@@ -1,5 +1,116 @@
 # MIMIK Changelog
 
+## v0.4 — 2026-11-13
+
+Every fix from the fresh-clone repo audit (see
+`~/workspace/mimik-review/task-list-repo-audit.md`): the suite and the
+installer are green from a fresh clone, not just from the Release zip.
+Items in build order:
+
+- Icon PNGs green from a fresh clone (audit #1): the repo holds only
+  `icons/mimik.svg` — the GitHub push path can't carry binary, so the
+  PNGs are rendered from the SVG at install time (Qt `QSvgRenderer`,
+  `rsvg-convert` fallback) and the icon loop never fails the install;
+  tests generate their PNG fixture when the icon file is absent.
+- Exec bits (audit #2): the push path can't set file modes either, so
+  `install.sh` chmods its own scripts (fresh clone: 660 → 770,
+  verified) and the Release zip stays the install path — a new test
+  pins the zip's stored modes (scripts 0o100755, files 0o100644).
+- Capture store: 0700 data dir + atomic writes (audit #3): the data
+  dir and its subdirs are created 0700 (existing ones tighten on
+  next use); every save — captures, presets, settings, pack/asset
+  manifests — writes to a temp file + fsync + atomic rename, so an
+  interrupted save leaves the previous good file intact, never a
+  partial one (16 new tests, incl. a simulated kill mid-save).
+- Front door (audit #4): a LICENSE file with the MIT text (both
+  copyright lines — Joshua Lofland + Divy Srivastava), carried in the
+  release zip; repo description/topics/homepage are set on the GitHub
+  repo page at ship time.
+- Docs accuracy + one version source (audit #5): README's 3 stale
+  "v0.1" mentions fixed; CHANGELOG's "6th Assets tab" → 4th, the
+  wrong "324/324 (252…)" breakdown dropped, and the fresh-unzip claim
+  now says what's actually verified (zip, not clone); pyproject.toml
+  is the one version source (`__version__` and `build_zip.py` read
+  it); the zip default is now `./dist/`; the vestigial
+  capture/gui/all extras are gone.
+- CI (audit #6): `.github/workflows/ci.yml` runs the suite from a
+  fresh checkout on every push to main, in both envs (system Python
+  + Qt offscreen) — the guard that would have caught the fresh-clone
+  icon defect. NOTE: the snapshot push can't carry workflow files
+  (403s), so this file goes in via the GitHub web UI at ship time.
+- Window icon set in code (audit #7): the main window (and every
+  dialog, via the application icon) carries the MIMIK icon — PNG
+  sizes 48/128/256 when present, SVG fallback; verified by rendering
+  the window icon's pixmap and matching its pixels to the source PNG.
+  Flake fix in passing: the LaunchCheckedTests used a Python child
+  that can outlast the 0.3 s settle window under load (3 failures in
+  the Qt env) — they now use /bin/sh children (3/3 clean).
+- Capture diff (audit #12): `mimik diff A B` (CLI) and File →
+  Compare captures (GUI) diff two captures — hosts, capture files,
+  or HAR files. New/removed endpoints (paths generalized, so a new
+  id isn't a new endpoint) and changed responses (status, or JSON
+  top-level keys added/removed — same shape with different values
+  is not a change). Verified by screenshot.
+- Single-sample flagging (audit #11): endpoints built from one
+  captured call are marked in the generated client — a "# Single
+  sample" comment on the method, and the module docstring counts
+  them ("2 of 3 endpoints come from a single captured sample").
+  Sample counts come from the endpoint builders (live, saved, HAR)
+  and sum when paths generalize (/users/123 + /users/456 = 2).
+- GUI replay button (audit #10): the Hosts and Learn tab has a
+  Replay button — pick an endpoint, re-send its captured request
+  (same method/URL/headers/body, minus per-request noise), and see
+  the response in a dialog next to the original status. State-changing
+  methods ask first. Verified against a local stub (200 OK + body
+  round-trip, headers forwarded, noise dropped) and by screenshot.
+- Dark-mode toggle (audit #9): View → Dark theme switches the whole
+  app between the dark theme and a light one (same layout, light
+  backgrounds, violet accent); the choice persists across restarts.
+  Verified by screenshot — light theme renders with readable dark
+  text on light backgrounds.
+- Geometry persistence (audit #8): the window reopens where it was
+  left — size + position saved to QSettings on close, restored on
+  start, with a fallback to a visible spot when the saved geometry
+  is entirely off the current screen.
+- WebSocket capture + replay (audit #13): mitmproxy sees WS traffic
+  and MIMIK now captures it — messages are fetched from mitmweb
+  (text exact, binary exact via the hex-dump view), saved with the
+  capture, and replayed from the generated client (`*_ws` methods
+  calling `Session.ws_replay`, stdlib-only, no new dependency). The
+  GUI marks WS endpoints "101 (WS)" and replays them with a
+  sent/received transcript. Verified live end-to-end against real
+  mitmweb 12.3.1 and a real echo server. Defects fixed in passing:
+  the WS client swallowed a frame arriving in the same packet as
+  the 101 handshake (now stashed and replayed); an IP host produced
+  the invalid class name `127Client` (now `Host127Client`).
+- UI copy (U33, design-rules.md): em-dashes removed from all 55
+  visible GUI strings (commas, colons, periods instead), pinned by
+  a guard test that fails the suite if one comes back.
+- Frida unpin port (audit #14): `mimik unpin <target>` and File →
+  Unpin a pinned app… defeat certificate pinning so pinned apps can
+  be captured — rooted Android (frida-server), stock Android (Frida
+  gadget via objection patchapk), and Linux programs. MIMIK fetches
+  the maintained upstream scripts, bakes in your mitmproxy CA +
+  proxy address, and prints the exact frida command; the script list
+  is discovered from the repo at run time, not hardcoded. Doctor
+  lists git/frida/objection as optional checks. Honest limits: the
+  hooks cover OpenSSL/BoringSSL (Flutter + other TLS stacks still
+  show no traffic), and live Frida execution needs a real device or
+  app — the suite verifies the orchestration and the pinning premise
+  (real-TLS stub), not the hook itself.
+- Stop-time screenshot (audit #15): `mimik record --screenshot`, or
+  the Record tab checkbox, takes one desktop screenshot when recording
+  stops (while the target app is still up) and saves it with the
+  capture at `captures/screenshots/screenshot-<timestamp>.png`, for
+  reference. Off by default. The GUI grabs with Qt (GUI thread only);
+  the CLI uses gnome-screenshot, scrot, or ImageMagick's import. A
+  failed screenshot never loses the capture.
+- Release-zip fix (found in final verification): the zip excluded
+  `tools/` + `.github/`, which left the fresh-unzip suite red (9
+  errors: the builder, icon-renderer, and CI tests need those files).
+  The zip now carries them, pinned by a test; the fresh-unzip suite
+  is green.
+
 ## v0.3 — 2026-11-12
 
 Every fix from the v0.2 full review (see `~/workspace/mimik-review/report.md`):
@@ -409,7 +520,7 @@ MIMIK–Reblend bridge: a clone gets its look, not just its code.
   program group name (a scanned program folder has no host — its group
   is named after the program). Host matches win, then group name,
   then group folder name.
-- GUI: new 6th "Assets" tab — per-capture asset list with conversion
+- GUI: new 4th "Assets" tab — per-capture asset list with conversion
   status, Reblend picker, Build asset pack, Open pack folder, Open in
   Reblend. Doctor (CLI + GUI) reports the Reblend install.
 - Learned presets (`mimik/presets.py`): MIMIK teaches itself rules
@@ -435,10 +546,10 @@ MIMIK–Reblend bridge: a clone gets its look, not just its code.
   `pack.json` records `pattern_presets_applied`. New CLI:
   `mimik presets match <host|group>` (dry run). The Presets tab has
   a Pattern presets section (fingerprint name + learned-from count).
-- 324/324 tests green (252 app presets + 67 pattern presets + 5
-  recorder), verified
-  from a fresh unzip; pack scenes load through Reblend's own scene
-  loader.
+- 324/324 tests green, verified from a fresh unzip of the Release zip
+  (not from a fresh clone — the repo's missing icon PNGs broke 18
+  tests from a clone, fixed in v0.4); pack scenes load through
+  Reblend's own scene loader.
 - Installer fix (reported from a real PC): v0.1.x installed WITHOUT
   PySide6 or mitmproxy — they lived in optional extras nothing ever
   requested — so the menu icon silently did nothing (`mimik-gui`

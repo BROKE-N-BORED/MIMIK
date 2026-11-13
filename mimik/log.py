@@ -49,7 +49,7 @@ def _append(text):
     app it's reporting on."""
     try:
         path = log_path()
-        os.makedirs(os.path.dirname(path), exist_ok=True)
+        store.ensure_private_dir(os.path.dirname(path))
         _rotate(path)
         with open(path, "a", encoding="utf-8") as f:
             f.write(text)

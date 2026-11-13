@@ -259,6 +259,52 @@ class CliTests(unittest.TestCase):
         # sys.exit(msg) carries the message as the exit code, not stdout
         self.assertIn("wine is not installed", str(code))
 
+    def test_record_screenshot_flag_parses(self):
+        with mock.patch.object(cli, "cmd_record") as record_cmd:
+            cli.main(["record", "--target", "android", "--screenshot"])
+        record_cmd.assert_called_once()
+        self.assertTrue(record_cmd.call_args[0][0].screenshot)
+
+    def test_record_with_screenshot_calls_capture_before_stop(self):
+        # v0.4 item 15: --screenshot takes the shot in the finally,
+        # before the launched program is stopped.
+        args = argparse.Namespace(target="android", file=None, pick=None,
+                                  deb_install=False, launch=None,
+                                  screenshot=True)
+        calls = []
+        session = mock.Mock()
+        session.run_forever.return_value = []
+        with mock.patch.dict(os.environ,
+                             {"MIMIK_DATA_DIR": self.tmp}), \
+             mock.patch.object(cli, "ProxySession",
+                               return_value=session), \
+             mock.patch.object(cli.screenshot, "capture_for_session",
+                               side_effect=lambda: calls.append("capture")
+                               or "/tmp/shot.png"), \
+             mock.patch.object(cli.launch, "stop_process",
+                               side_effect=lambda p: calls.append("stop")):
+            out, code = run_cmd(cli.cmd_record, args)
+        self.assertEqual(code, 0)
+        self.assertEqual(calls, ["capture", "stop"])
+        self.assertIn("screenshot saved: /tmp/shot.png", out)
+
+    def test_record_without_screenshot_takes_none(self):
+        args = argparse.Namespace(target="android", file=None, pick=None,
+                                  deb_install=False, launch=None,
+                                  screenshot=False)
+        session = mock.Mock()
+        session.run_forever.return_value = []
+        with mock.patch.dict(os.environ,
+                             {"MIMIK_DATA_DIR": self.tmp}), \
+             mock.patch.object(cli, "ProxySession",
+                               return_value=session), \
+             mock.patch.object(cli.screenshot, "capture_for_session") \
+             as capture:
+            out, code = run_cmd(cli.cmd_record, args)
+        self.assertEqual(code, 0)
+        capture.assert_not_called()
+        self.assertNotIn("screenshot", out)
+
     def test_main_parses_gen(self):
         with mock.patch.object(cli, "cmd_gen") as gen:
             cli.main(["gen", "api.example.com", "--har", FIXTURE,
@@ -266,6 +312,90 @@ class CliTests(unittest.TestCase):
         gen.assert_called_once()
         self.assertEqual(gen.call_args[0][0].host, "api.example.com")
         self.assertEqual(gen.call_args[0][0].polish, "none")
+
+    def test_main_parses_diff(self):
+        with mock.patch.object(cli, "cmd_diff") as diff_cmd:
+            cli.main(["diff", "a.example.com", "b.example.com"])
+        diff_cmd.assert_called_once()
+        self.assertEqual(diff_cmd.call_args[0][0].a, "a.example.com")
+        self.assertEqual(diff_cmd.call_args[0][0].b, "b.example.com")
+
+    def test_diff_two_hosts(self):
+        from mimik import store
+
+        store.save_flows([{
+            "id": "1",
+            "request": {"host": "a.example.com", "method": "GET",
+                        "path": "/api/old", "scheme": "https",
+                        "port": 443, "headers": []},
+            "response": {"status_code": 200, "headers": []},
+        }])
+        store.save_flows([{
+            "id": "2",
+            "request": {"host": "b.example.com", "method": "GET",
+                        "path": "/api/new", "scheme": "https",
+                        "port": 443, "headers": []},
+            "response": {"status_code": 200, "headers": []},
+        }])
+        args = argparse.Namespace(a="a.example.com", b="b.example.com")
+        out, code = run_cmd(cli.cmd_diff, args)
+        self.assertEqual(code, 0)
+        self.assertIn("Capture diff: a.example.com -> b.example.com", out)
+        self.assertIn("--- New ---", out)
+        self.assertIn("GET /api/new", out)
+        self.assertIn("--- Removed ---", out)
+        self.assertIn("GET /api/old", out)
+
+    def test_diff_unknown_host_exits_with_message(self):
+        args = argparse.Namespace(a="nobody.example.com",
+                                  b="b.example.com")
+        out, code = run_cmd(cli.cmd_diff, args)
+        self.assertIn("no captures for host: nobody.example.com",
+                      str(code))
+
+    def test_main_parses_unpin(self):
+        with mock.patch.object(cli, "cmd_unpin") as unpin_cmd:
+            cli.main(["unpin", "com.example.app", "--android",
+                      "--proxy-host", "192.168.1.5"])
+        unpin_cmd.assert_called_once()
+        args = unpin_cmd.call_args[0][0]
+        self.assertEqual(args.target, "com.example.app")
+        self.assertEqual(args.platform, "android")
+        self.assertEqual(args.proxy_host, "192.168.1.5")
+
+    def test_unpin_prints_the_plan(self):
+        from mimik import unpin as unpin_mod
+
+        plan = {"kind": "android", "scripts": [],
+                "command": "frida -U \\\n    -f com.example.app",
+                "steps": ["Run this to launch the app:",
+                          "Use the app."],
+                "notes": ["Own apps only."],
+                "patched_apk": None, "proxy_host": "192.168.1.5"}
+        args = argparse.Namespace(target="com.example.app",
+                                  platform="android", ca=None,
+                                  proxy_host="192.168.1.5",
+                                  workdir=None)
+        with mock.patch.object(unpin_mod, "prepare",
+                               return_value=plan) as prep:
+            out, code = run_cmd(cli.cmd_unpin, args)
+        self.assertEqual(code, 0)
+        prep.assert_called_once()
+        self.assertIn("Android app, rooted", out)
+        self.assertIn("frida -U", out)
+        self.assertIn("192.168.1.5:8080", out)
+
+    def test_unpin_error_exits_with_message(self):
+        from mimik import unpin as unpin_mod
+
+        args = argparse.Namespace(target="com.example.app",
+                                  platform=None, ca=None,
+                                  proxy_host=None, workdir=None)
+        with mock.patch.object(unpin_mod, "prepare",
+                               side_effect=unpin_mod.UnpinError(
+                                   "no mitmproxy CA")):
+            out, code = run_cmd(cli.cmd_unpin, args)
+        self.assertIn("no mitmproxy CA", str(code))
 
 
 class DeleteCliTests(unittest.TestCase):
@@ -455,12 +585,16 @@ class VersionTests(unittest.TestCase):
     """Item 20: --version + one version source."""
 
     def test_version_flag_prints_version(self):
+        from mimik import __version__
+
         out = io.StringIO()
         with redirect_stdout(out):
             with self.assertRaises(SystemExit) as cm:
                 cli.main(["--version"])
         self.assertEqual(cm.exception.code, 0)
-        self.assertEqual(out.getvalue().strip(), "mimik 0.3.0")
+        # Derived from the package version, not hardcoded — a version
+        # bump must not break this test.
+        self.assertEqual(out.getvalue().strip(), f"mimik {__version__}")
 
     def test_version_matches_pyproject(self):
         # The runtime version and the packaged version must not drift

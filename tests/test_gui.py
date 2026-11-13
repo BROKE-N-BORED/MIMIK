@@ -10,8 +10,10 @@ import gc
 import os
 import sys
 import tempfile
+import threading
 import time
 import unittest
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from unittest import mock
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -72,6 +74,46 @@ class GuiSourceTests(unittest.TestCase):
             src = f.read()
         self.assertNotIn(".connect(lambda", src)
         self.assertNotIn(".connect(functools.partial", src)
+
+    def test_no_em_dash_in_app_strings(self):
+        # U33 (design-rules.md, immutable): no em-dashes in visible UI
+        # text. Enforced on every string constant in every module under
+        # mimik/ except docstrings — comments never reach the AST, and
+        # a code string is one refactor from being displayed (GUI
+        # status bar, dialogs, logs, CLI output, generated clients).
+        # v0.4 swept 55 gui.py strings, then the verifier swept 108
+        # more package-wide (Doctor tab, scan notes, CLI, generated
+        # -client templates); this guard keeps them out.
+        import ast
+
+        root = os.path.join(os.path.dirname(__file__), "..", "mimik")
+        bad = []
+        for dirpath, dirnames, filenames in os.walk(root):
+            dirnames[:] = [d for d in dirnames if d != "__pycache__"]
+            for filename in sorted(filenames):
+                if not filename.endswith(".py"):
+                    continue
+                path = os.path.join(dirpath, filename)
+                with open(path, encoding="utf-8") as f:
+                    tree = ast.parse(f.read())
+                docstrings = set()
+                for node in ast.walk(tree):
+                    if isinstance(node, (ast.Module, ast.ClassDef,
+                                         ast.FunctionDef,
+                                         ast.AsyncFunctionDef)):
+                        first = node.body[0] if node.body else None
+                        if (isinstance(first, ast.Expr)
+                                and isinstance(first.value, ast.Constant)
+                                and isinstance(first.value.value, str)):
+                            docstrings.add(id(first.value))
+                for node in ast.walk(tree):
+                    if (isinstance(node, ast.Constant)
+                            and isinstance(node.value, str)
+                            and id(node) not in docstrings
+                            and "—" in node.value):
+                        bad.append((os.path.relpath(path, root),
+                                    node.lineno, node.value[:60]))
+        self.assertEqual(bad, [])
 
 
 HAS_REBLEND = _has_reblend()
@@ -2189,6 +2231,661 @@ class GuiTests(unittest.TestCase):
             win._import_curl()
         self.assertTrue(warn.called)
         self.assertIn("no URL found", warn.call_args[0][2])
+        win.close()
+
+
+@unittest.skipUnless(HAS_QT, "PySide6 not available")
+class WindowIconTests(unittest.TestCase):
+    """v0.4 item 7: the window carries the MIMIK icon in code."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.mkdtemp()
+        os.environ["MIMIK_DATA_DIR"] = cls.tmp
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        cls.app = QApplication.instance() or QApplication(sys.argv)
+
+    @classmethod
+    def tearDownClass(cls):
+        del os.environ["MIMIK_DATA_DIR"]
+
+    def tearDown(self):
+        self.app.processEvents()
+        gc.collect()
+
+    def test_main_window_has_a_non_null_icon(self):
+        from mimik.gui import MainWindow
+
+        win = MainWindow()
+        self.assertFalse(win.windowIcon().isNull())
+        win.close()
+
+    def test_window_icon_is_non_null(self):
+        from mimik import gui
+
+        # The tree always holds at least the SVG, so the icon is never
+        # null — PNG when present, SVG fallback otherwise.
+        self.assertFalse(gui.window_icon().isNull())
+
+    def test_window_icon_carries_png_sizes_when_pngs_exist(self):
+        from PySide6.QtCore import QSize
+
+        from mimik import gui
+
+        if not any(s is not None for _p, s in gui._icon_files()):
+            self.skipTest("no PNG icon in this tree (fresh clone: SVG only)")
+        sizes = gui.window_icon().availableSizes()
+        self.assertIn(QSize(256, 256), sizes)
+        self.assertIn(QSize(48, 48), sizes)
+
+    def test_svg_fallback_when_no_png_exists(self):
+        from mimik import gui
+
+        svg = os.path.join(os.path.dirname(__file__), "..", "icons",
+                           "mimik.svg")
+        with mock.patch.object(gui, "_icon_files",
+                               return_value=[(svg, None)]):
+            icon = gui.window_icon()
+        self.assertFalse(icon.isNull())
+
+    def test_no_icon_files_means_null_icon(self):
+        from mimik import gui
+
+        with mock.patch.object(gui, "_icon_files", return_value=[]):
+            icon = gui.window_icon()
+        self.assertTrue(icon.isNull())
+
+
+@unittest.skipUnless(HAS_QT, "PySide6 not available")
+class GeometryTests(unittest.TestCase):
+    """v0.4 item 8: the window reopens where it was left."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.mkdtemp()
+        cls.settings_dir = tempfile.mkdtemp()
+        os.environ["MIMIK_DATA_DIR"] = cls.tmp
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        cls.app = QApplication.instance() or QApplication(sys.argv)
+        # Redirect QSettings at the config root so the tests never
+        # touch the real ~/.config — and restore it afterwards.
+        from PySide6.QtCore import QSettings
+
+        from mimik.gui import SETTINGS_APP, SETTINGS_ORG
+
+        probe = QSettings(SETTINGS_ORG, SETTINGS_APP)
+        cls._orig_base = os.path.dirname(
+            os.path.dirname(probe.fileName()))
+        QSettings.setPath(QSettings.IniFormat, QSettings.UserScope,
+                          cls.settings_dir)
+
+    @classmethod
+    def tearDownClass(cls):
+        from PySide6.QtCore import QSettings
+
+        QSettings.setPath(QSettings.IniFormat, QSettings.UserScope,
+                          cls._orig_base)
+        del os.environ["MIMIK_DATA_DIR"]
+
+    def tearDown(self):
+        self.app.processEvents()
+        gc.collect()
+
+    def _clear_settings(self):
+        from PySide6.QtCore import QSettings
+
+        from mimik.gui import SETTINGS_APP, SETTINGS_ORG
+
+        QSettings(SETTINGS_ORG, SETTINGS_APP).clear()
+
+    def test_default_geometry_when_nothing_saved(self):
+        from mimik.gui import MainWindow
+
+        self._clear_settings()
+        win = MainWindow()
+        self.assertEqual(win.width(), 900)
+        self.assertEqual(win.height(), 650)
+        win.close()
+
+    def test_geometry_restores_after_restart(self):
+        from mimik.gui import MainWindow
+
+        self._clear_settings()
+        win1 = MainWindow()
+        win1.show()
+        # The layout minimum is 796x640, so a 700x500 resize clamps up
+        # to it; the saved frame must fit the 800x800 offscreen screen
+        # or Qt shifts it on restore (its own on-screen adjustment).
+        win1.resize(700, 500)
+        win1.move(0, 60)
+        self.app.processEvents()
+        saved = win1.frameGeometry().getRect()
+        win1.close()  # closeEvent saves the geometry
+        self.app.processEvents()
+
+        win2 = MainWindow()
+        win2.show()  # the frame isn't realized until show()
+        self.app.processEvents()
+        self.assertEqual(win2.frameGeometry().getRect(), saved)
+        win2.close()
+
+    def test_offscreen_geometry_falls_back_to_a_visible_spot(self):
+        from PySide6.QtCore import QSettings
+
+        from mimik.gui import MainWindow, SETTINGS_APP, SETTINGS_ORG
+
+        self._clear_settings()
+        win1 = MainWindow()
+        win1.show()
+        win1.move(9999, 9999)
+        self.app.processEvents()
+        QSettings(SETTINGS_ORG, SETTINGS_APP).setValue(
+            "geometry", win1.saveGeometry())
+        win1.close()
+
+        win2 = MainWindow()
+        screen = self.app.primaryScreen()
+        available = screen.availableGeometry()
+        self.assertTrue(available.intersects(win2.frameGeometry()),
+                        f"restored {win2.frameGeometry().getRect()} "
+                        f"outside {available.getRect()}")
+        win2.close()
+
+
+@unittest.skipUnless(HAS_QT, "PySide6 not available")
+class ThemeTests(unittest.TestCase):
+    """v0.4 item 9: light/dark toggle, persisted."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.mkdtemp()
+        cls.settings_dir = tempfile.mkdtemp()
+        os.environ["MIMIK_DATA_DIR"] = cls.tmp
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        cls.app = QApplication.instance() or QApplication(sys.argv)
+        # Redirect QSettings at the config root so the tests never
+        # touch the real ~/.config — and restore it afterwards.
+        from PySide6.QtCore import QSettings
+
+        from mimik.gui import SETTINGS_APP, SETTINGS_ORG
+
+        probe = QSettings(SETTINGS_ORG, SETTINGS_APP)
+        cls._orig_base = os.path.dirname(
+            os.path.dirname(probe.fileName()))
+        QSettings.setPath(QSettings.IniFormat, QSettings.UserScope,
+                          cls.settings_dir)
+
+    @classmethod
+    def tearDownClass(cls):
+        from PySide6.QtCore import QSettings
+
+        QSettings.setPath(QSettings.IniFormat, QSettings.UserScope,
+                          cls._orig_base)
+        del os.environ["MIMIK_DATA_DIR"]
+
+    def tearDown(self):
+        self.app.processEvents()
+        gc.collect()
+
+    def _clear_settings(self):
+        from PySide6.QtCore import QSettings
+
+        from mimik.gui import SETTINGS_APP, SETTINGS_ORG
+
+        QSettings(SETTINGS_ORG, SETTINGS_APP).clear()
+
+    def test_default_theme_is_dark(self):
+        from mimik.gui import MainWindow
+
+        self._clear_settings()
+        win = MainWindow()
+        self.assertIn("#17171c", win.styleSheet())
+        self.assertTrue(win._dark_theme_action.isChecked())
+        win.close()
+
+    def test_toggle_switches_the_theme(self):
+        from mimik.gui import MainWindow
+
+        self._clear_settings()
+        win = MainWindow()
+        win.set_theme("light")
+        self.assertIn("#f2f2f4", win.styleSheet())
+        self.assertNotIn("#17171c", win.styleSheet())
+        self.assertFalse(win._dark_theme_action.isChecked())
+        win.set_theme("dark")
+        self.assertIn("#17171c", win.styleSheet())
+        self.assertTrue(win._dark_theme_action.isChecked())
+        win.close()
+
+    def test_menu_action_toggles_the_theme(self):
+        from mimik.gui import MainWindow
+
+        self._clear_settings()
+        win = MainWindow()
+        win._dark_theme_action.trigger()  # unchecks: dark -> light
+        self.assertIn("#f2f2f4", win.styleSheet())
+        win._dark_theme_action.trigger()  # checks: light -> dark
+        self.assertIn("#17171c", win.styleSheet())
+        win.close()
+
+    def test_theme_persists_across_restarts(self):
+        from mimik.gui import MainWindow
+
+        self._clear_settings()
+        win1 = MainWindow()
+        win1.set_theme("light")
+        win1.close()
+        self.app.processEvents()
+
+        win2 = MainWindow()
+        self.assertIn("#f2f2f4", win2.styleSheet())
+        self.assertFalse(win2._dark_theme_action.isChecked())
+        win2.close()
+
+
+class _ReplayStub(BaseHTTPRequestHandler):
+    """Local stub for the GUI replay tests — answers one fixed body."""
+
+    body = b'{"hello": "from-stub"}'
+
+    def _handle(self):
+        payload = _ReplayStub.body
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    do_GET = _handle
+    do_POST = _handle
+
+    def log_message(self, *args):
+        pass
+
+
+@unittest.skipUnless(HAS_QT, "PySide6 not available")
+class ReplayTests(unittest.TestCase):
+    """v0.4 item 10: the Replay button re-sends a flow, shows the reply."""
+
+    @classmethod
+    def setUpClass(cls):
+        from test_websocket import EchoServer
+
+        cls.tmp = tempfile.mkdtemp()
+        os.environ["MIMIK_DATA_DIR"] = cls.tmp
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        cls.app = QApplication.instance() or QApplication(sys.argv)
+        cls.server = ThreadingHTTPServer(("127.0.0.1", 0), _ReplayStub)
+        cls.port = cls.server.server_address[1]
+        cls.thread = threading.Thread(target=cls.server.serve_forever,
+                                      daemon=True)
+        cls.thread.start()
+        cls.ws_server = EchoServer()
+        cls.ws_server.__enter__()
+        cls.ws_port = cls.ws_server.port
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.ws_server.__exit__(None, None, None)
+        cls.server.shutdown()
+        cls.server.server_close()
+        del os.environ["MIMIK_DATA_DIR"]
+
+    def tearDown(self):
+        self.app.processEvents()
+        gc.collect()
+
+    def _seed_flow(self):
+        from mimik import store
+
+        store.save_flows([{
+            "id": "r1",
+            "request": {"host": "127.0.0.1", "method": "GET",
+                        "path": "/api/hello", "scheme": "http",
+                        "port": self.port, "headers": []},
+            "response": {"status_code": 200, "headers": []},
+        }])
+
+    def _seed_ws_flow(self):
+        from mimik import store
+
+        store.save_flows([{
+            "id": "w1",
+            "request": {"host": "127.0.0.1", "method": "GET",
+                        "path": "/chat", "scheme": "http",
+                        "port": self.ws_port, "headers": []},
+            "response": {"status_code": 101, "headers": []},
+            "websocket": {"messages_meta": {"count": 2}},
+            "_saved_ws_messages": [
+                {"from_client": True, "timestamp": 1.0,
+                 "text": "hello-ws"},
+                {"from_client": False, "timestamp": 1.1,
+                 "text": "hello-ws"},
+            ],
+        }])
+
+    def _open_hosts_tab(self, win):
+        win.tabs.setCurrentIndex(1)  # Hosts tab loads on first show
+        self.assertTrue(_wait_for(
+            self.app,
+            lambda: win.hosts_list.count() == 1
+            and "127.0.0.1" in win.hosts_list.item(0).text()))
+
+    def test_replay_button_disabled_without_a_selection(self):
+        from mimik.gui import MainWindow
+
+        self._seed_flow()
+        win = MainWindow()
+        win.show()
+        self._open_hosts_tab(win)
+        # Hosts loaded, no endpoint selected — Replay stays disabled.
+        self.assertFalse(win.replay_btn.isEnabled())
+        win.close()
+
+    def test_replay_shows_the_stub_response(self):
+        from mimik.gui import MainWindow
+
+        self._seed_flow()
+        win = MainWindow()
+        win.show()
+        self._open_hosts_tab(win)
+        win.hosts_list.setCurrentRow(0)
+        self.assertTrue(_wait_for(
+            self.app, lambda: win.ep_table.rowCount() == 1))
+        self.assertEqual(win.ep_table.item(0, 1).text(), "/api/hello")
+        win.ep_table.selectRow(0)
+        self.app.processEvents()
+        self.assertTrue(win.replay_btn.isEnabled())
+
+        win._replay_selected()
+        self.assertTrue(_wait_for(
+            self.app,
+            lambda: getattr(win, "_replay_dialog", None) is not None))
+        text = win._replay_text.toPlainText()
+        self.assertIn("Replay: 200 OK", text)
+        self.assertIn("Original: 200", text)
+        self.assertIn("from-stub", text)
+        self.assertIn(f"http://127.0.0.1:{self.port}/api/hello", text)
+        win._replay_dialog.close()
+        win.close()
+
+    def test_ws_replay_shows_the_transcript(self):
+        """v0.4 item 13: a WS endpoint replays its client messages."""
+        from mimik.gui import MainWindow
+
+        self._seed_flow()
+        self._seed_ws_flow()
+        win = MainWindow()
+        win.show()
+        self._open_hosts_tab(win)
+        win.hosts_list.setCurrentRow(0)
+        # The HTTP flow may already be seeded — find the /chat row by
+        # path, whatever row it lands on.
+        self.assertTrue(_wait_for(
+            self.app,
+            lambda: any(win.ep_table.item(r, 1)
+                        and win.ep_table.item(r, 1).text() == "/chat"
+                        for r in range(win.ep_table.rowCount()))))
+        row = next(r for r in range(win.ep_table.rowCount())
+                   if win.ep_table.item(r, 1).text() == "/chat")
+        self.assertEqual(win.ep_table.item(row, 2).text(), "101 (WS)")
+        win.ep_table.selectRow(row)
+        self.app.processEvents()
+        self.assertTrue(win.replay_btn.isEnabled())
+
+        win._replay_selected()
+        self.assertTrue(_wait_for(
+            self.app,
+            lambda: getattr(win, "_replay_dialog", None) is not None))
+        text = win._replay_text.toPlainText()
+        self.assertIn("WebSocket replay", text)
+        self.assertIn(f"ws://127.0.0.1:{self.ws_port}/chat", text)
+        self.assertIn("Sent 1 message(s), received 1.", text)
+        self.assertIn("hello-ws", text)
+        win._replay_dialog.close()
+        win.close()
+
+
+@unittest.skipUnless(HAS_QT, "PySide6 not available")
+class DiffTests(unittest.TestCase):
+    """v0.4 item 12: the Compare captures dialog diffs two hosts."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.mkdtemp()
+        os.environ["MIMIK_DATA_DIR"] = cls.tmp
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        cls.app = QApplication.instance() or QApplication(sys.argv)
+
+    @classmethod
+    def tearDownClass(cls):
+        del os.environ["MIMIK_DATA_DIR"]
+
+    def tearDown(self):
+        self.app.processEvents()
+        gc.collect()
+
+    def _seed_hosts(self):
+        from mimik import store
+
+        store.save_flows([
+            {"id": "a1",
+             "request": {"host": "a.example.com", "method": "GET",
+                         "path": "/api/old", "scheme": "https",
+                         "port": 443, "headers": []},
+             "response": {"status_code": 200, "headers": []}},
+            {"id": "a2",
+             "request": {"host": "a.example.com", "method": "GET",
+                         "path": "/api/users", "scheme": "https",
+                         "port": 443, "headers": []},
+             "response": {"status_code": 200, "headers": []},
+             "_saved_response_body": '{"users": []}'},
+        ])
+        store.save_flows([
+            {"id": "b1",
+             "request": {"host": "b.example.com", "method": "GET",
+                         "path": "/api/new", "scheme": "https",
+                         "port": 443, "headers": []},
+             "response": {"status_code": 200, "headers": []}},
+            {"id": "b2",
+             "request": {"host": "b.example.com", "method": "GET",
+                         "path": "/api/users", "scheme": "https",
+                         "port": 443, "headers": []},
+             "response": {"status_code": 500, "headers": []},
+             "_saved_response_body": '{"users": [], "error": "x"}'},
+        ])
+
+    def test_dialog_diffs_two_hosts(self):
+        from mimik.gui import MainWindow
+
+        self._seed_hosts()
+        win = MainWindow()
+        win.show()
+        win._compare_captures()
+        dlg = win._diff_dialog
+        self.assertTrue(dlg.isVisible())
+        win._diff_combo_a.setCurrentIndex(
+            win._diff_combo_a.findText("a.example.com"))
+        win._diff_combo_b.setCurrentIndex(
+            win._diff_combo_b.findText("b.example.com"))
+        win._run_diff_dialog()
+        self.assertTrue(_wait_for(
+            self.app, lambda: bool(win._diff_text.toPlainText())))
+        text = win._diff_text.toPlainText()
+        self.assertIn("Capture diff: a.example.com -> b.example.com",
+                      text)
+        self.assertIn("--- New ---", text)
+        self.assertIn("GET /api/new", text)
+        self.assertIn("--- Removed ---", text)
+        self.assertIn("GET /api/old", text)
+        self.assertIn("--- Changed ---", text)
+        self.assertIn("GET /api/users: status 200 -> 500", text)
+        self.assertIn("+error", text)
+        dlg.close()
+        win.close()
+
+
+@unittest.skipUnless(HAS_QT, "PySide6 not available")
+class UnpinTests(unittest.TestCase):
+    """v0.4 item 14: the Unpin dialog prepares a Frida run."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.mkdtemp()
+        os.environ["MIMIK_DATA_DIR"] = cls.tmp
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        cls.app = QApplication.instance() or QApplication(sys.argv)
+
+    @classmethod
+    def tearDownClass(cls):
+        del os.environ["MIMIK_DATA_DIR"]
+
+    def tearDown(self):
+        self.app.processEvents()
+        gc.collect()
+
+    def _plan(self):
+        return {"kind": "android", "scripts": [],
+                "command": "frida -U \\\n    -f com.example.app",
+                "steps": ["Run this to launch the app:",
+                          "Use the app."],
+                "notes": ["Own apps only."],
+                "patched_apk": None, "proxy_host": "192.168.1.5"}
+
+    def test_menu_action_opens_the_dialog(self):
+        from mimik.gui import MainWindow
+
+        win = MainWindow()
+        win.show()
+        self.assertEqual(win._unpin_action.text(),
+                         "Unpin a pinned app…")
+        win._unpin_action.trigger()
+        dlg = win._unpin_dialog_ref
+        self.assertTrue(dlg.isVisible())
+        self.assertEqual(dlg.windowTitle(), "Unpin a pinned app")
+        dlg.close()
+        win.close()
+
+    def test_dialog_shows_the_prepared_plan(self):
+        from mimik import unpin as unpin_mod
+        from mimik.gui import MainWindow
+
+        win = MainWindow()
+        win.show()
+        win._unpin_dialog()
+        dlg = win._unpin_dialog_ref
+        win._unpin_target.setText("com.example.app")
+        with mock.patch.object(unpin_mod, "prepare",
+                               return_value=self._plan()) as prep:
+            win._run_unpin_dialog()
+            self.assertTrue(_wait_for(
+                self.app,
+                lambda: bool(win._unpin_text.toPlainText())))
+        prep.assert_called_once()
+        self.assertEqual(prep.call_args[1]["platform"], None)
+        text = win._unpin_text.toPlainText()
+        self.assertIn("Android app, rooted", text)
+        self.assertIn("frida -U", text)
+        self.assertIn("192.168.1.5:8080", text)
+        dlg.close()
+        win.close()
+
+    def test_dialog_shows_a_failure_in_place(self):
+        from mimik import unpin as unpin_mod
+        from mimik.gui import MainWindow
+
+        win = MainWindow()
+        win.show()
+        win._unpin_dialog()
+        dlg = win._unpin_dialog_ref
+        win._unpin_target.setText("com.example.app")
+        with mock.patch.object(unpin_mod, "prepare",
+                               side_effect=unpin_mod.UnpinError(
+                                   "no mitmproxy CA")):
+            win._run_unpin_dialog()
+            self.assertTrue(_wait_for(
+                self.app,
+                lambda: bool(win._unpin_text.toPlainText())))
+        text = win._unpin_text.toPlainText()
+        self.assertIn("Could not prepare:", text)
+        self.assertIn("no mitmproxy CA", text)
+        dlg.close()
+        win.close()
+
+
+@unittest.skipUnless(HAS_QT, "PySide6 not available")
+class ScreenshotTests(unittest.TestCase):
+    """v0.4 item 15: the stop-time screenshot checkbox + Stop wiring."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.mkdtemp()
+        os.environ["MIMIK_DATA_DIR"] = cls.tmp
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        cls.app = QApplication.instance() or QApplication(sys.argv)
+
+    @classmethod
+    def tearDownClass(cls):
+        del os.environ["MIMIK_DATA_DIR"]
+
+    def tearDown(self):
+        self.app.processEvents()
+        gc.collect()
+
+    def test_checkbox_default_off_and_persists(self):
+        from mimik import presets
+        from mimik.gui import MainWindow
+
+        win = MainWindow()
+        win.show()
+        self.assertFalse(win.screenshot_check.isChecked())
+        self.assertFalse(presets.screenshot_enabled())
+        win.screenshot_check.setChecked(True)
+        self.app.processEvents()
+        self.assertTrue(presets.screenshot_enabled())
+        win.screenshot_check.setChecked(False)
+        self.app.processEvents()
+        self.assertFalse(presets.screenshot_enabled())
+        win.close()
+
+    def test_stop_takes_the_screenshot_first(self):
+        from mimik import screenshot as shot_mod
+        from mimik.gui import MainWindow
+
+        win = MainWindow()
+        win.show()
+        win.screenshot_check.setChecked(True)
+        self.app.processEvents()
+        calls = []
+        worker = mock.Mock()
+        worker.request_stop.side_effect = lambda: calls.append("stop")
+        win.worker = worker
+        with mock.patch.object(
+                shot_mod, "capture_for_session",
+                side_effect=lambda: calls.append("capture")
+                or "/tmp/shot.png"):
+            win._stop_recording()
+        self.assertEqual(calls, ["capture", "stop"])
+        self.assertIn("screenshot saved: /tmp/shot.png",
+                      win.steps.toPlainText())
+        win.worker = None
+        win.close()
+
+    def test_stop_without_the_option_takes_none(self):
+        from mimik import screenshot as shot_mod
+        from mimik.gui import MainWindow
+
+        win = MainWindow()
+        win.show()
+        win.screenshot_check.setChecked(False)
+        self.app.processEvents()
+        worker = mock.Mock()
+        win.worker = worker
+        with mock.patch.object(shot_mod, "capture_for_session") as cap:
+            win._stop_recording()
+        cap.assert_not_called()
+        worker.request_stop.assert_called_once()
+        win.worker = None
         win.close()
 
 
