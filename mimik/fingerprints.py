@@ -28,7 +28,7 @@ import os
 import re
 from urllib.parse import parse_qsl, urlparse
 
-from . import assets, codegen, launch, store
+from . import assets, codegen, extract, launch, log, paths, store
 
 # ---- the catalog ---------------------------------------------------------------
 # id -> {name, kind, about}. "kind" groups fingerprints for display:
@@ -224,15 +224,6 @@ def is_key_header(name):
             or "api_key" in n or n.endswith("-key") or n.endswith("_key"))
 
 
-def _pairs(flow, side):
-    part = flow.get(side) or {}
-    out = []
-    for pair in part.get("headers") or []:
-        if isinstance(pair, (list, tuple)) and len(pair) == 2:
-            out.append((str(pair[0]), pair[1] or ""))
-    return out
-
-
 def _body_text(flow, side):
     """A saved flow's request/response body as text, or "".
 
@@ -251,9 +242,8 @@ def _body_text(flow, side):
     return raw if isinstance(raw, str) else ""
 
 
-def _json_body(flow, side):
-    """A saved body parsed as a JSON dict, or None."""
-    text = _body_text(flow, side)
+def _json_from_text(text):
+    """A body text parsed as a JSON dict, or None."""
     if len(text) > _MAX_BODY_PARSE:
         return None
     stripped = text.strip()
@@ -266,16 +256,30 @@ def _json_body(flow, side):
     return data if isinstance(data, dict) else None
 
 
-def _grant_types(flow):
-    """Known grant_type values in a request body (form or JSON)."""
-    text = _body_text(flow, "request")
+def _json_body(flow, side):
+    """A saved body parsed as a JSON dict, or None."""
+    return _json_from_text(_body_text(flow, side))
+
+
+_UNSET = object()
+
+
+def _grant_types(flow, req_text=_UNSET, req_body=_UNSET):
+    """Known grant_type values in a request body (form or JSON).
+
+    req_text / req_body let the caller share work it already did —
+    observe() extracts each body once and passes the results in, so a
+    flow's JSON is parsed once per side, not 3–4 times (review #21).
+    """
+    text = _body_text(flow, "request") if req_text is _UNSET else req_text
     found = set()
     if "grant_type" in text:
         if len(text) <= _MAX_BODY_PARSE:
             for key, value in parse_qsl(text, keep_blank_values=True):
                 if key == "grant_type" and value in _KNOWN_GRANT_TYPES:
                     found.add(value)
-        body = _json_body(flow, "request")
+        body = (_json_body(flow, "request") if req_body is _UNSET
+                else req_body)
         if body is not None:
             value = body.get("grant_type")
             if value in _KNOWN_GRANT_TYPES:
@@ -286,7 +290,7 @@ def _grant_types(flow):
 def _generalized_endpoint(flow):
     req = flow.get("request") or {}
     return ((req.get("method") or "").upper(),
-            codegen.generalize_path(req.get("path") or ""))
+            paths.generalize_path(req.get("path") or ""))
 
 
 def _query_params(path):
@@ -412,7 +416,7 @@ class _Evidence:
         if host == "api.stripe.com":
             self.stripe = True
 
-        for name, value in _pairs(flow, "request"):
+        for name, value in extract.flow_header_pairs(flow, "request"):
             lname = name.lower()
             if lname == "authorization":
                 self.auth_seen = True
@@ -432,7 +436,7 @@ class _Evidence:
                 _orig, eps = self.key_headers.setdefault(
                     lname, (name, set()))
                 eps.add(endpoint)
-        for name, value in _pairs(flow, "response"):
+        for name, value in extract.flow_header_pairs(flow, "response"):
             lname = name.lower()
             if lname == "set-cookie":
                 cname, has_attr = _set_cookie_parts(str(value))
@@ -450,7 +454,12 @@ class _Evidence:
                         and str(value).strip().lower().startswith("basic")):
                     self.basic_401 = True
 
-        self.grant_types |= _grant_types(flow)
+        # Each body is extracted + parsed once per flow and shared
+        # between the grant-type, JSON-RPC, and GraphQL checks
+        # (review #21 — this used to re-parse 3–4 times).
+        req_text = _body_text(flow, "request")
+        req_body = _json_from_text(req_text)
+        self.grant_types |= _grant_types(flow, req_text, req_body)
         params = _query_params(path)
         if ("authorize" in path_only.lower()
                 and params.get("response_type") == ["code"]):
@@ -458,7 +467,6 @@ class _Evidence:
         if _is_token_path(path_only):
             self.token_endpoints.add(endpoint)
 
-        req_body = _json_body(flow, "request")
         if req_body is not None:
             if (str(req_body.get("jsonrpc", "")).startswith("2.0")
                     and isinstance(req_body.get("method"), str)):
@@ -645,8 +653,11 @@ def fingerprint_flows(flows):
     for i, flow in enumerate(flows or []):
         try:
             ev.observe(i, flow)
-        except Exception:
-            continue  # one malformed flow never breaks fingerprinting
+        except Exception as e:
+            # One malformed flow never breaks fingerprinting — but the
+            # error is logged, not dropped (item 23).
+            log.log_error("fingerprints observe", e)
+            continue
     matches = ev.matches()
     order = list(FINGERPRINTS)
     matches.sort(key=lambda m: order.index(m["id"]))
@@ -717,6 +728,31 @@ def _code_signals_for_group(group_name, base):
     return out
 
 
+def _combine(flows, entries, code_signals):
+    """{"fingerprints": [...], "code_signals": {...}} for loaded data —
+    one fingerprint pass, in catalog order."""
+    found = fingerprint_flows(flows) + fingerprint_entries(entries)
+    order = list(FINGERPRINTS)
+    found.sort(key=lambda m: order.index(m["id"]))
+    return {"fingerprints": found, "code_signals": code_signals}
+
+
+def fingerprint_loaded(scope_type, scope_name, flows, entries, base=None):
+    """{"fingerprints": [...], "code_signals": {...}} for scope data the
+    caller already resolved and loaded — the same result as
+    fingerprint_scope without re-resolving the scope or re-loading
+    the flows (review #21: learn + match share one pass)."""
+    base = base or store.data_dir()
+    code_signals = {}
+    if scope_type == "host":
+        program = _program_for_host(scope_name, base)
+        if program:
+            code_signals = _code_signals_for_group(program, base)
+    else:
+        code_signals = _code_signals_for_group(scope_name, base)
+    return _combine(flows, entries, code_signals)
+
+
 def fingerprint_scope(name, base=None):
     """{"fingerprints": [...], "code_signals": {...}} for a host or
     program group name — the flows and assets the store holds for it,
@@ -745,7 +781,4 @@ def fingerprint_scope(name, base=None):
                 if gname:
                     code_signals = _code_signals_for_group(gname, base)
                 break
-    found = fingerprint_flows(flows) + fingerprint_entries(entries)
-    order = list(FINGERPRINTS)
-    found.sort(key=lambda m: order.index(m["id"]))
-    return {"fingerprints": found, "code_signals": code_signals}
+    return _combine(flows, entries, code_signals)

@@ -8,6 +8,7 @@ one — and the negative tests below pin that similar-but-different
 traffic does NOT match.
 """
 import argparse
+import gc
 import io
 import json
 import os
@@ -15,6 +16,7 @@ import sys
 import tempfile
 import unittest
 from contextlib import redirect_stdout
+from unittest import mock
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, os.path.dirname(__file__))  # for test_assets helpers
@@ -26,13 +28,12 @@ from mimik import assets, cli, codegen, fingerprints, presets, store  # noqa: E4
 from mimik import reblend_bridge  # noqa: E402
 from mimik.sources import mitm as mitm_mod  # noqa: E402
 
-# A JWT-shaped token (the public jwt.io example — not a real secret).
-JWT = ("eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0."
-       "SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c")
+# A JWT-shaped fake token (segments decode to "fake-*", not a real secret).
+JWT = "ZmFrZS1oZWFkZXI.ZmFrZS1wYXlsb2Fk.ZmFrZS1zaWduYXR1cmU"
 OPAQUE = "opaque-session-token-abcdef"
-API_KEY = "sk-live-pattern-987654321"
-COOKIE_VALUE = "pattern-cookie-secret-xyz"
-SIGNATURE = "sig-hmac-0123456789abcdef"
+API_KEY = "fake-api-key-for-tests-only"
+COOKIE_VALUE = "fake-cookie-value-for-tests"
+SIGNATURE = "fake-hmac-signature-for-tests"
 
 APP_A = "app-a.example.com"
 APP_B = "app-b.example.com"
@@ -520,6 +521,86 @@ class LearnPatternTests(_TmpBase):
         self.assertNotIn(JWT, text)
 
 
+class LearnOnceTests(_TmpBase):
+    """Review #21: learn + match fingerprint once per scope."""
+
+    def test_learn_all_fingerprints_once(self):
+        store.save_flows(oauth_app_flows(APP_A), base=self.tmp)
+        real_fp = fingerprints.fingerprint_flows
+        real_load = store.load_host
+        fp_calls = []
+        load_calls = []
+
+        def counting_fp(flows):
+            fp_calls.append(1)
+            return real_fp(flows)
+
+        def counting_load(host, base=None):
+            load_calls.append(1)
+            return real_load(host, base)
+
+        with mock.patch.object(fingerprints, "fingerprint_flows",
+                               counting_fp), \
+                mock.patch.object(store, "load_host", counting_load):
+            app, patterns, matched = presets.learn_all(
+                APP_A, base=self.tmp)
+        self.assertEqual(len(fp_calls), 1)
+        self.assertEqual(len(load_calls), 1)
+        self.assertIsNotNone(app)
+        self.assertEqual({p["name"] for p, _c in patterns},
+                         {"oauth2-code", "jwt-bearer"})
+        self.assertEqual(sorted(matched),
+                         ["jwt-bearer", "oauth2-code"])
+
+    def test_learn_all_matches_separate_calls(self):
+        # The one-pass learn produces identical presets to the old
+        # learn + learn_patterns + matched_pattern_ids path.
+        dir_a = tempfile.mkdtemp()
+        dir_b = tempfile.mkdtemp()
+        for d in (dir_a, dir_b):
+            store.save_flows(oauth_app_flows(APP_A), base=d)
+        app_a, pats_a, matched_a = presets.learn_all(APP_A, base=dir_a)
+        app_b = presets.learn(APP_A, base=dir_b)
+        pats_b = presets.learn_patterns(APP_A, base=dir_b)
+        matched_b = presets.matched_pattern_ids(APP_A, base=dir_b)
+
+        def scrub(preset):
+            preset = json.loads(json.dumps(preset))
+            preset.pop("learned_at", None)
+            for e in preset.get("endpoints") or []:
+                e.pop("first_seen", None)
+                e.pop("last_seen", None)
+            return preset
+
+        self.assertEqual(scrub(app_a[0]), scrub(app_b[0]))
+        by_name = lambda pats: sorted(
+            (scrub(p) for p, _c in pats), key=lambda p: p["name"])
+        self.assertEqual(by_name(pats_a), by_name(pats_b))
+        self.assertEqual(sorted(matched_a), sorted(matched_b))
+
+    def test_observe_parses_each_body_once(self):
+        # One flow's JSON bodies are parsed once per side, not 3–4
+        # times (the grant-type check used to re-parse the request
+        # body observe() was about to parse anyway).
+        req = json.dumps({"jsonrpc": "2.0", "method": "ping",
+                          "grant_type": "authorization_code"})
+        resp = json.dumps({"access_token": JWT,
+                           "token_type": "Bearer"})
+        f = flow("m1", APP_A, "/rpc", method="POST",
+                 req_body=req, resp_body=resp)
+        real_loads = json.loads
+        calls = []
+
+        def counting_loads(text, *args, **kwargs):
+            calls.append(text)
+            return real_loads(text, *args, **kwargs)
+
+        with mock.patch.object(fingerprints.json, "loads",
+                               counting_loads):
+            fingerprints.fingerprint_flows([f])
+        self.assertEqual(len(calls), 2)
+
+
 class MatchTests(_TmpBase):
     def test_match_names_patterns_and_signals(self):
         store.save_flows(oauth_app_flows(APP_A), base=self.tmp)
@@ -840,11 +921,19 @@ class PatternGuiTests(unittest.TestCase):
     def tearDownClass(cls):
         del os.environ["MIMIK_DATA_DIR"]
 
+    def tearDown(self):
+        # Same deterministic cleanup as GuiTests: collect the abandoned
+        # MainWindow's cycles here, when no worker thread is running —
+        # never leave them for a mid-task GC (segfault, see test_gui).
+        self.app.processEvents()
+        gc.collect()
+
     def test_presets_tab_lists_pattern_preset(self):
         from mimik.gui import MainWindow
 
         win = MainWindow()
         win.show()
+        win.tabs.setCurrentIndex(6)  # Presets tab loads on first show
         self.app.processEvents()
         self.assertGreaterEqual(win.pattern_presets_list.count(), 1)
         texts = [win.pattern_presets_list.item(i).text()

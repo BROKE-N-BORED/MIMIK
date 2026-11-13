@@ -31,18 +31,26 @@ import hashlib
 import json
 import os
 import re
+import shutil
 from datetime import datetime
 from urllib.parse import urlparse
 
-from . import store
+from . import extract, store
 
 MAX_FILE_BYTES = 50 * 1024 * 1024      # 50 MB per file
 MAX_GROUP_BYTES = 500 * 1024 * 1024    # 500 MB per capture group
 
+# Scan guards (review #19): a folder scan must be bounded — the GUI lets
+# the user pick any folder, including home.
+MAX_SCAN_DEPTH = 12        # directory levels below the scanned root
+MAX_SCAN_FILES = 50000     # files visited (assets or not)
+
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".svg"}
-MODEL_EXTS = {".glb", ".gltf", ".obj"}
+MODEL_EXTS = {".glb", ".gltf", ".obj", ".fbx", ".dae"}
 AUDIO_EXTS = {".mp3", ".wav", ".ogg"}
 FONT_EXTS = {".woff2", ".woff", ".ttf", ".otf"}
+VIDEO_EXTS = {".mp4", ".webm"}
+TEXTURE_EXTS = {".dds", ".ktx2"}
 
 IMAGE_TYPES = {"image/png", "image/jpeg", "image/webp", "image/gif",
                "image/svg+xml", "image/x-icon"}
@@ -53,6 +61,8 @@ AUDIO_TYPES = {"audio/mpeg", "audio/wav", "audio/x-wav", "audio/ogg",
 FONT_TYPES = {"font/woff2", "font/woff", "font/ttf", "font/otf",
               "application/font-woff", "application/font-woff2",
               "application/x-font-ttf", "application/x-font-opentype"}
+VIDEO_TYPES = {"video/mp4", "video/webm"}
+TEXTURE_TYPES = {"image/ktx2", "image/dds"}
 
 _EXT_KIND = {}
 for _ext in IMAGE_EXTS:
@@ -63,6 +73,10 @@ for _ext in AUDIO_EXTS:
     _EXT_KIND[_ext] = "audio"
 for _ext in FONT_EXTS:
     _EXT_KIND[_ext] = "font"
+for _ext in VIDEO_EXTS:
+    _EXT_KIND[_ext] = "video"
+for _ext in TEXTURE_EXTS:
+    _EXT_KIND[_ext] = "texture"
 
 _TYPE_KIND = {}
 for _t in IMAGE_TYPES:
@@ -73,13 +87,18 @@ for _t in AUDIO_TYPES:
     _TYPE_KIND[_t] = "audio"
 for _t in FONT_TYPES:
     _TYPE_KIND[_t] = "font"
+for _t in VIDEO_TYPES:
+    _TYPE_KIND[_t] = "video"
+for _t in TEXTURE_TYPES:
+    _TYPE_KIND[_t] = "texture"
 
 # application/octet-stream matches anything binary, so it only counts
 # when the URL extension also says model — see detect_kind.
 _GENERIC_TYPES = {"application/octet-stream"}
 
 KIND_LABELS = {"image": "Image", "model": "3D model",
-               "audio": "Audio", "font": "Font"}
+               "audio": "Audio", "font": "Font",
+               "video": "Video", "texture": "Texture"}
 
 
 def assets_dir(base=None):
@@ -109,7 +128,8 @@ def _now_iso():
 
 
 def detect_kind(url, content_type=None):
-    """'image' | 'model' | 'audio' | 'font' | None for a URL + type.
+    """'image' | 'model' | 'audio' | 'font' | 'video' | 'texture' | None
+    for a URL + type.
 
     The URL extension decides first (a .glb served as octet-stream is
     still a model); the Content-Type is the fallback for extensionless
@@ -124,17 +144,6 @@ def detect_kind(url, content_type=None):
     if ctype in _GENERIC_TYPES:
         return None
     return _TYPE_KIND.get(ctype)
-
-
-def _headers_dict(pairs):
-    """Response/request headers (list of [k, v]) -> {lower-name: value}."""
-    out = {}
-    for pair in pairs or []:
-        if isinstance(pair, (list, tuple)) and len(pair) == 2:
-            out[str(pair[0]).lower()] = pair[1]
-        elif isinstance(pair, dict) and "name" in pair:
-            out[str(pair["name"]).lower()] = pair.get("value", "")
-    return out
 
 
 def _flow_url(flow):
@@ -204,6 +213,19 @@ class AssetGroup:
         self._names.add(candidate)
         return candidate
 
+    def _skip_for_group_cap(self, name, kind, source_path, size,
+                            max_group_bytes, url=None):
+        """Record a skip: the group would pass its byte cap (one source
+        of truth for the reason — used by add_bytes and by the scan's
+        pre-read check, so both report the same words)."""
+        self.manifest["skipped"].append({
+            "name": name, "url": url, "source_path": source_path,
+            "size": size, "kind": kind,
+            "reason": f"group would pass the "
+                      f"{max_group_bytes // (1024 * 1024)} MB cap — "
+                      "skipped, nothing saved",
+        })
+
     def add_bytes(self, data, name, kind, url=None, source_path=None,
                   content_type=None, max_file_bytes=MAX_FILE_BYTES,
                   max_group_bytes=MAX_GROUP_BYTES):
@@ -225,13 +247,8 @@ class AssetGroup:
             })
             return None
         if self.manifest["total_bytes"] + size > max_group_bytes:
-            self.manifest["skipped"].append({
-                "name": name, "url": url, "source_path": source_path,
-                "size": size, "kind": kind,
-                "reason": f"group would pass the "
-                          f"{max_group_bytes // (1024 * 1024)} MB cap — "
-                          "skipped, nothing saved",
-            })
+            self._skip_for_group_cap(name, kind, source_path, size,
+                                     max_group_bytes, url=url)
             return None
         digest = hashlib.sha256(data).hexdigest()
         duplicate = digest in self._by_hash
@@ -282,7 +299,7 @@ def extract_from_flows(flows, group, mitm=None, base=None, host=None,
         if host and req.get("host") != host:
             continue
         resp = flow.get("response") or {}
-        ctype = _headers_dict(resp.get("headers")).get("content-type")
+        ctype = extract.header_dict(resp.get("headers")).get("content-type")
         url = _flow_url(flow)
         kind = detect_kind(url, ctype)
         if kind is None:
@@ -329,7 +346,7 @@ def extract_from_har(har_path, base=None, max_file_bytes=MAX_FILE_BYTES,
         content = resp.get("content", {})
         ctype = content.get("mimeType", "")
         if not ctype:
-            ctype = _headers_dict(
+            ctype = extract.header_dict(
                 [(h.get("name"), h.get("value")) for h in
                  resp.get("headers", [])]).get("content-type")
         kind = detect_kind(url, ctype)
@@ -369,7 +386,10 @@ def extract_from_har(har_path, base=None, max_file_bytes=MAX_FILE_BYTES,
 
 def scan_program_tree(root, program, base=None,
                       max_file_bytes=MAX_FILE_BYTES,
-                      max_group_bytes=MAX_GROUP_BYTES):
+                      max_group_bytes=MAX_GROUP_BYTES,
+                      max_depth=MAX_SCAN_DEPTH,
+                      max_files=MAX_SCAN_FILES,
+                      cancelled=None):
     """Copy asset files out of a program tree (extraction / mount / folder).
 
     Copies only, never moves, never executes anything. Returns
@@ -380,16 +400,49 @@ def scan_program_tree(root, program, base=None,
     well-known library/engine files by name (see
     mimik.fingerprints.CODE_SIGNALS) — a weak signal that can
     corroborate a traffic fingerprint, never one on its own.
+
+    Bounded (review #19): the walk stops descending past `max_depth`
+    levels below the root and stops entirely after `max_files` files
+    visited; either limit lands a "scan_note" in the manifest so the
+    partial result says so. `cancelled` is an optional callable the
+    walk checks per file — when it returns True the scan stops early
+    and what was found so far is saved, with a "scan cancelled" note.
+    The group cap is checked BEFORE a file is read, so a file the
+    group has no room for is never loaded into memory.
     """
     # Lazy import: fingerprints imports this module for scoping.
     from . import fingerprints as fp_mod
 
     agroup = AssetGroup(program, "program-files", base=base, program=program)
     code_signals = {}
+    visited = 0
+    stopped = None      # hard stop: file cap or cancel (ends the walk)
+    depth_limited = False
     for dirpath, dirnames, filenames in os.walk(root):
+        if stopped is not None:
+            break
+        if cancelled is not None and cancelled():
+            stopped = "scan cancelled — partial results"
+            break
+        rel = os.path.relpath(dirpath, root)
+        depth = 0 if rel == "." else rel.count(os.sep) + 1
         dirnames[:] = [d for d in dirnames
                        if not os.path.islink(os.path.join(dirpath, d))]
+        if depth >= max_depth and dirnames:
+            # Don't descend deeper — but still scan this level's files.
+            depth_limited = True
+            dirnames[:] = []
         for name in sorted(filenames):
+            if stopped is not None:
+                break
+            if cancelled is not None and cancelled():
+                stopped = "scan cancelled — partial results"
+                break
+            visited += 1
+            if visited > max_files:
+                stopped = (f"scan stopped at the {max_files}-file cap "
+                           "— some files were not scanned")
+                break
             full = os.path.join(dirpath, name)
             if os.path.islink(full):
                 continue
@@ -417,6 +470,16 @@ def scan_program_tree(root, program, base=None,
                               "per-file cap — skipped, nothing saved",
                 })
                 continue
+            # Group cap BEFORE reading: a file the group has no room
+            # for is skipped without ever loading it into memory
+            # (a duplicate would cost 0 bytes, but its hash can't be
+            # known without reading — failing closed is the safe side).
+            if (agroup.manifest["total_bytes"] + size
+                    > max_group_bytes):
+                agroup._skip_for_group_cap(
+                    name, kind, os.path.relpath(full, root), size,
+                    max_group_bytes)
+                continue
             try:
                 with open(full, "rb") as fh:
                     data = fh.read()
@@ -426,6 +489,12 @@ def scan_program_tree(root, program, base=None,
                              source_path=os.path.relpath(full, root),
                              max_file_bytes=max_file_bytes,
                              max_group_bytes=max_group_bytes)
+    if stopped is not None:
+        agroup.manifest["scan_note"] = stopped
+    elif depth_limited:
+        agroup.manifest["scan_note"] = (
+            f"scan did not descend past {max_depth} levels — "
+            "deeper files were not scanned")
     if not agroup.manifest["assets"] and not agroup.manifest["skipped"]:
         try:
             os.rmdir(agroup.dir)
@@ -467,6 +536,37 @@ def list_asset_groups(base=None):
         out.append((os.path.join(adir, name), manifest))
     out.sort(key=lambda gm: gm[1].get("captured_at", ""), reverse=True)
     return out
+
+
+def find_groups(name, base=None):
+    """[(group_dir, manifest)] whose dir name or manifest group name
+    matches `name` — one name can match several extraction events."""
+    out = []
+    for gdir, manifest in list_asset_groups(base):
+        if os.path.basename(gdir) == name or manifest.get("group") == name:
+            out.append((gdir, manifest))
+    return out
+
+
+def delete_group(gdir, base=None):
+    """Delete one asset group directory (files + manifest). Returns
+    {"deleted": path or None, "bytes_freed": n}; None when it doesn't
+    exist or isn't inside assets/. Packs built from the group are
+    self-contained (they hold their own copies), so deleting a group
+    never orphans a pack."""
+    base = base or store.data_dir()
+    adir = os.path.abspath(assets_dir(base))
+    target = os.path.abspath(gdir)
+    if os.path.commonpath([target, adir]) != adir:
+        return {"deleted": None, "bytes_freed": 0}
+    if target == adir or not os.path.isdir(target):
+        return {"deleted": None, "bytes_freed": 0}
+    freed = store.dir_size(target)
+    try:
+        shutil.rmtree(target)
+    except OSError:
+        return {"deleted": None, "bytes_freed": 0}
+    return {"deleted": target, "bytes_freed": freed}
 
 
 def list_assets(base=None, host=None, group=None, group_name=None):
@@ -513,6 +613,50 @@ def resolve_scope(arg, base=None):
     if any(os.path.basename(g) == arg for g, _ in groups):
         return {"group": arg}
     return {"host": arg}
+
+
+def model_info(path):
+    """Short human-readable info for a 3D model file, or None when the
+    file doesn't exist. .obj files get vertex/face counts; .glb files
+    get a mesh/primitive count from the JSON chunk; anything else gets
+    the format + size. Counts are best-effort — a file that can't be
+    read still gets its format + size."""
+    if not os.path.isfile(path):
+        return None
+    ext = os.path.splitext(path)[1].lower()
+    size = os.path.getsize(path)
+    lines = [f"format: {ext[1:].upper() or 'unknown'}",
+             f"size: {store.format_size(size)}"]
+    if ext == ".obj" and size <= 20 * 1024 * 1024:
+        try:
+            verts = faces = 0
+            with open(path, "r", errors="ignore") as fh:
+                for line in fh:
+                    if line.startswith("v "):
+                        verts += 1
+                    elif line.startswith("f "):
+                        faces += 1
+            lines.append(f"vertices: {verts}")
+            lines.append(f"faces: {faces}")
+        except OSError:
+            pass
+    elif ext == ".glb":
+        try:
+            with open(path, "rb") as fh:
+                header = fh.read(12)
+                raw = fh.read(8)
+                if (len(header) == 12 and header[:4] == b"glTF"
+                        and len(raw) == 8 and raw[4:] == b"JSON"):
+                    chunk_len = int.from_bytes(raw[:4], "little")
+                    if chunk_len <= 1024 * 1024:
+                        doc = json.loads(fh.read(chunk_len))
+                        meshes = doc.get("meshes", [])
+                        lines.append(f"meshes: {len(meshes)}")
+                        lines.append(
+                            f"primitives: {sum(len(m.get('primitives', [])) for m in meshes)}")
+        except (OSError, ValueError):
+            pass
+    return "\n".join(lines)
 
 
 def asset_file_path(entry, base=None):

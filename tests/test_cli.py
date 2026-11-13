@@ -80,7 +80,47 @@ class CliTests(unittest.TestCase):
                                   polish="none", prompt_only=False)
         out, code = run_cmd(cli.cmd_gen, args)
         self.assertEqual(code, 0)
-        self.assertTrue(os.path.exists(os.path.join(self.tmp, "api_client.py")))
+        self.assertTrue(
+            os.path.exists(os.path.join(self.tmp,
+                                        "api_example_com_client.py")))
+
+    def test_default_out_uses_full_host(self):
+        self.assertEqual(cli._default_out("api.foo.com"),
+                         "api_foo_com_client.py")
+        self.assertEqual(cli._default_out("api.bar.com"),
+                         "api_bar_com_client.py")
+        self.assertNotEqual(cli._default_out("api.foo.com"),
+                            cli._default_out("api.bar.com"))
+        self.assertEqual(cli._default_out("192.168.1.5"),
+                         "192_168_1_5_client.py")
+        self.assertEqual(cli._default_out("API.Example.COM"),
+                         "api_example_com_client.py")
+
+    def test_unique_out_numbers_on_collision(self):
+        open(os.path.join(self.tmp, "api_foo_com_client.py"), "w").write("x")
+        self.assertEqual(cli._unique_out("api.foo.com", self.tmp),
+                         "api_foo_com_client_2.py")
+        open(os.path.join(self.tmp, "api_foo_com_client_2.py"), "w").write("x")
+        self.assertEqual(cli._unique_out("api.foo.com", self.tmp),
+                         "api_foo_com_client_3.py")
+        self.assertEqual(cli._unique_out("api.bar.com", self.tmp),
+                         "api_bar_com_client.py")
+
+    def test_gen_twice_writes_numbered_copy(self):
+        args = argparse.Namespace(host="api.example.com", har=FIXTURE,
+                                  curl=None, out=None, model=None,
+                                  polish="none", prompt_only=False)
+        out, code = run_cmd(cli.cmd_gen, args)
+        self.assertEqual(code, 0)
+        first = os.path.join(self.tmp, "api_example_com_client.py")
+        second = os.path.join(self.tmp, "api_example_com_client_2.py")
+        with open(first) as f:
+            original = f.read()
+        out, code = run_cmd(cli.cmd_gen, args)
+        self.assertEqual(code, 0)
+        self.assertTrue(os.path.exists(second))
+        with open(first) as f:
+            self.assertEqual(f.read(), original)
 
     def test_gen_prompt_only(self):
         args = argparse.Namespace(host="api.example.com", har=FIXTURE,
@@ -102,7 +142,8 @@ class CliTests(unittest.TestCase):
                                   polish="none", prompt_only=False)
         out, code = run_cmd(cli.cmd_gen, args)
         self.assertEqual(code, 0)
-        self.assertTrue(os.path.exists(os.path.join(self.tmp, "api_client.py")))
+        self.assertTrue(os.path.exists(os.path.join(
+            self.tmp, "api_example_com_client.py")))
 
     def test_hosts_from_curl(self):
         curl_text = "curl 'https://api.example.com/v1/x' -H 'A: b'"
@@ -127,8 +168,57 @@ class CliTests(unittest.TestCase):
         self.assertIn("api_client.py", out)
         self.assertIn("api.example.com", out)
 
+    def test_prune_with_yes_deletes_old_saves(self):
+        from mimik import store
+
+        def _flow(fid):
+            return {"id": fid,
+                    "request": {"host": "api.example.com", "method": "GET",
+                                "path": "/x", "scheme": "https",
+                                "port": 443, "headers": []},
+                    "response": {"status_code": 200}}
+
+        stamps = ["20260101-12000%d" % i for i in range(1, 4)]
+        with mock.patch.object(store, "_stamp", side_effect=stamps):
+            for i in range(3):
+                store.save_flows([_flow(str(i))], base=self.tmp)
+        args = argparse.Namespace(keep=1, yes=True)
+        out, code = run_cmd(cli.cmd_prune, args)
+        self.assertEqual(code, 0)
+        self.assertIn("deleted 2 save(s)", out)
+        self.assertEqual(len(store.load_host("api.example.com",
+                                             base=self.tmp)), 1)
+
+    def test_prune_declined_keeps_files(self):
+        from mimik import store
+
+        def _flow(fid):
+            return {"id": fid,
+                    "request": {"host": "api.example.com", "method": "GET",
+                                "path": "/x", "scheme": "https",
+                                "port": 443, "headers": []},
+                    "response": {"status_code": 200}}
+
+        stamps = ["20260101-12000%d" % i for i in range(1, 3)]
+        with mock.patch.object(store, "_stamp", side_effect=stamps):
+            for i in range(2):
+                store.save_flows([_flow(str(i))], base=self.tmp)
+        args = argparse.Namespace(keep=1, yes=False)
+        with mock.patch("builtins.input", return_value="n"):
+            out, code = run_cmd(cli.cmd_prune, args)
+        self.assertEqual(code, 0)
+        self.assertIn("kept everything", out)
+        self.assertEqual(len(store.load_host("api.example.com",
+                                             base=self.tmp)), 2)
+
+    def test_prune_nothing_to_do(self):
+        args = argparse.Namespace(keep=20, yes=True)
+        out, code = run_cmd(cli.cmd_prune, args)
+        self.assertEqual(code, 0)
+        self.assertIn("nothing to prune", out)
+
     def test_doctor_reports_missing_proxy(self):
-        with mock.patch.object(cli, "mitmweb_cmd", return_value=None):
+        with mock.patch("mimik.doctor.mitmweb_cmd", return_value=None):
             out, code = run_cmd(cli.cmd_doctor, argparse.Namespace())
         self.assertEqual(code, 1)
         self.assertIn("MIMIK setup check", out)
@@ -138,7 +228,7 @@ class CliTests(unittest.TestCase):
     def test_doctor_passes_when_ready(self):
         fake_pyside = mock.Mock()
         with mock.patch.dict(sys.modules, {"PySide6": fake_pyside}), \
-             mock.patch.object(cli, "mitmweb_cmd",
+             mock.patch("mimik.doctor.mitmweb_cmd",
                                return_value=["mitmweb"]), \
              mock.patch("mimik.sources.mitm.Mitm") as mock_mitm:
             mock_mitm.return_value.flows.return_value = []
@@ -176,6 +266,213 @@ class CliTests(unittest.TestCase):
         gen.assert_called_once()
         self.assertEqual(gen.call_args[0][0].host, "api.example.com")
         self.assertEqual(gen.call_args[0][0].polish, "none")
+
+
+class DeleteCliTests(unittest.TestCase):
+    """Item 5: `mimik delete` + disk usage in `mimik doctor`."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        os.environ["MIMIK_DATA_DIR"] = self.tmp
+        self.orig_dir = os.getcwd()
+        os.chdir(self.tmp)
+
+    def tearDown(self):
+        os.chdir(self.orig_dir)
+        del os.environ["MIMIK_DATA_DIR"]
+
+    def _flow(self, fid, host="api.example.com"):
+        return {"id": fid,
+                "request": {"host": host, "method": "GET", "path": "/x",
+                            "scheme": "https", "port": 443, "headers": []},
+                "response": {"status_code": 200}}
+
+    def _args(self, **kw):
+        base = {"host": None, "client": None, "group": None, "pack": None,
+                "yes": True}
+        base.update(kw)
+        return argparse.Namespace(**base)
+
+    def test_delete_host_with_yes(self):
+        from mimik import store
+
+        store.save_flows([self._flow("1")], base=self.tmp)
+        out, code = run_cmd(cli.cmd_delete, self._args(host="api.example.com"))
+        self.assertEqual(code, 0)
+        self.assertIn("deleted 1 save file", out)
+        self.assertIn("freed", out)
+        self.assertEqual(store.load_host("api.example.com",
+                                         base=self.tmp), [])
+
+    def test_delete_host_declined_keeps_files(self):
+        from mimik import store
+
+        store.save_flows([self._flow("1")], base=self.tmp)
+        with mock.patch("builtins.input", return_value="n"):
+            out, code = run_cmd(
+                cli.cmd_delete,
+                self._args(host="api.example.com", yes=False))
+        self.assertEqual(code, 0)
+        self.assertIn("kept it", out)
+        self.assertEqual(len(store.load_host("api.example.com",
+                                             base=self.tmp)), 1)
+
+    def test_delete_host_missing_exits(self):
+        out, code = run_cmd(cli.cmd_delete,
+                            self._args(host="nobody.example.com"))
+        self.assertNotEqual(code, 0)
+        # sys.exit(msg) carries the message as the exit code.
+        self.assertIn("no saved captures", str(code))
+
+    def test_delete_client_without_suffix(self):
+        from mimik import store
+
+        path = os.path.join(self.tmp, "x_client.py")
+        with open(path, "w") as fh:
+            fh.write("# client\n")
+        store.save_client_copy("x_client.py", path, base=self.tmp)
+        out, code = run_cmd(cli.cmd_delete, self._args(client="x"))
+        self.assertEqual(code, 0)
+        self.assertIn("deleted x_client.py", out)
+        self.assertEqual(store.list_clients(base=self.tmp), [])
+
+    def test_delete_group_with_yes(self):
+        from mimik import assets
+
+        group = assets.AssetGroup("game.example.com", "traffic",
+                                  host="game.example.com")
+        group.add_bytes(b"\x89PNG fake", "icon.png", "image")
+        gdir, _m = group.finish()
+        out, code = run_cmd(cli.cmd_delete,
+                            self._args(group="game.example.com"))
+        self.assertEqual(code, 0)
+        self.assertIn("deleted 1 asset group", out)
+        self.assertFalse(os.path.exists(gdir))
+
+    def test_delete_pack_with_yes(self):
+        import json
+        from mimik import reblend_bridge
+
+        pdir = os.path.join(reblend_bridge.packs_dir(),
+                            "game_20260101-000000")
+        os.makedirs(pdir)
+        with open(os.path.join(pdir, "pack.json"), "w") as fh:
+            json.dump({"app": "game", "host": "game.example.com",
+                       "group": "game", "built_at": "2026-01-01"}, fh)
+        out, code = run_cmd(cli.cmd_delete, self._args(pack="game"))
+        self.assertEqual(code, 0)
+        self.assertIn("deleted 1 pack", out)
+        self.assertFalse(os.path.exists(pdir))
+
+    def test_doctor_shows_disk_usage(self):
+        from mimik import store
+
+        store.save_flows([self._flow("1")], base=self.tmp)
+        with mock.patch("mimik.doctor.mitmweb_cmd", return_value=None):
+            out, code = run_cmd(cli.cmd_doctor, argparse.Namespace())
+        self.assertEqual(code, 1)  # proxy missing, but usage still prints
+        self.assertIn("disk usage:", out)
+        self.assertIn("captures", out)
+
+
+class ImportCliTests(unittest.TestCase):
+    """Item 8: `mimik import` persists HAR/cURL traffic; malformed
+    input gets a plain message, never a traceback."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        os.environ["MIMIK_DATA_DIR"] = self.tmp
+        self.orig_dir = os.getcwd()
+        os.chdir(self.tmp)
+
+    def tearDown(self):
+        os.chdir(self.orig_dir)
+        del os.environ["MIMIK_DATA_DIR"]
+
+    def _bad_har(self):
+        path = os.path.join(self.tmp, "bad.har")
+        with open(path, "w") as fh:
+            fh.write("{not json")
+        return path
+
+    def test_import_har_persists(self):
+        from mimik import store
+
+        args = argparse.Namespace(har=FIXTURE, curl=None)
+        out, code = run_cmd(cli.cmd_import, args)
+        self.assertEqual(code, 0)
+        self.assertIn("imported 5 flow(s)", out)
+        self.assertIn("api.example.com", out)
+        # After a "restart" (no --har): the hosts come from the store.
+        out, code = run_cmd(cli.cmd_hosts,
+                            argparse.Namespace(har=None, curl=None))
+        self.assertEqual(code, 0)
+        self.assertIn("api.example.com", out)
+        self.assertIn("cdn.example.com", out)
+        self.assertEqual(len(store.load_host("api.example.com")), 4)
+
+    def test_import_har_twice_is_idempotent(self):
+        args = argparse.Namespace(har=FIXTURE, curl=None)
+        run_cmd(cli.cmd_import, args)
+        out, code = run_cmd(cli.cmd_import, args)
+        self.assertEqual(code, 0)
+        self.assertIn("nothing new", out)
+
+    def test_import_curl_persists(self):
+        from mimik import store
+
+        args = argparse.Namespace(
+            har=None,
+            curl="curl 'https://api.example.com/v1/x' "
+                 "-H 'Authorization: Bearer t'")
+        out, code = run_cmd(cli.cmd_import, args)
+        self.assertEqual(code, 0)
+        self.assertIn("imported 1 flow", out)
+        self.assertEqual(len(store.load_host("api.example.com")), 1)
+
+    def test_import_malformed_har_friendly(self):
+        args = argparse.Namespace(har=self._bad_har(), curl=None)
+        out, code = run_cmd(cli.cmd_import, args)
+        self.assertNotEqual(code, 0)
+        self.assertIn("not valid JSON", str(code))
+
+    def test_hosts_har_malformed_friendly(self):
+        out, code = run_cmd(cli.cmd_hosts,
+                            argparse.Namespace(har=self._bad_har(),
+                                               curl=None))
+        self.assertNotEqual(code, 0)
+        self.assertIn("not valid JSON", str(code))
+
+    def test_hosts_curl_no_url_friendly(self):
+        out, code = run_cmd(cli.cmd_hosts,
+                            argparse.Namespace(har=None,
+                                               curl="curl -H 'x: y'"))
+        self.assertNotEqual(code, 0)
+        self.assertIn("no URL found", str(code))
+
+
+class VersionTests(unittest.TestCase):
+    """Item 20: --version + one version source."""
+
+    def test_version_flag_prints_version(self):
+        out = io.StringIO()
+        with redirect_stdout(out):
+            with self.assertRaises(SystemExit) as cm:
+                cli.main(["--version"])
+        self.assertEqual(cm.exception.code, 0)
+        self.assertEqual(out.getvalue().strip(), "mimik 0.3.0")
+
+    def test_version_matches_pyproject(self):
+        # The runtime version and the packaged version must not drift
+        # (__init__ still said 0.2.0 when pyproject was already 0.3.0).
+        import tomllib
+
+        from mimik import __version__
+
+        root = os.path.join(os.path.dirname(__file__), "..")
+        with open(os.path.join(root, "pyproject.toml"), "rb") as f:
+            project = tomllib.load(f)["project"]
+        self.assertEqual(__version__, project["version"])
 
 
 if __name__ == "__main__":

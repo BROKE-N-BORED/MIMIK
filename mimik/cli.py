@@ -21,29 +21,20 @@
 Own accounts only: MIMIK replays YOUR session, for YOUR apps and accounts.
 """
 import argparse
+import json
 import os
 import re
 import shlex
 import shutil
-import socket
 import subprocess
 import sys
 
-from . import assets, codegen, launch, presets, reblend_bridge, store, wine
-from .recorder import ProxySession, mitmweb_cmd
+from . import assets, codegen, doctor, export, filters, launch, presets, reblend_bridge, sample, store, update, wine
+from . import __version__
+from .flows import fetch_flows
+from .recorder import ProxySession
 from .sources import curl, har
 from .sources import mitm as mitm_mod
-
-
-def _lan_ip():
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    try:
-        s.connect(("8.8.8.8", 80))
-        return s.getsockname()[0]
-    except OSError:
-        return "<this-machine-ip>"
-    finally:
-        s.close()
 
 
 # ---- flow resolution (HAR / cURL / live proxy / saved capture) --------------
@@ -51,7 +42,10 @@ def _lan_ip():
 def _flows_from_args(args):
     """(mitm_or_None, flows, source) — source is har/curl/live/saved."""
     if getattr(args, "har", None):
-        return None, har.load(args.har), "har"
+        try:
+            return None, har.load(args.har), "har"
+        except har.HarError as e:
+            raise SystemExit(str(e))
     if getattr(args, "curl", None):
         text = args.curl
         try:
@@ -59,31 +53,25 @@ def _flows_from_args(args):
                 text = f.read()
         except OSError:
             pass  # not a file: treat the argument itself as the cURL text
-        return None, curl.load(text), "curl"
-    try:
-        m = mitm_mod.Mitm()
-        flows = m.flows()
         try:
-            store.save_flows(flows, mitm=m)
-        except Exception:
-            pass
-        return m, flows, "live"
-    except mitm_mod.MitmError:
-        flows = store.load_all()
-        if flows:
-            return None, flows, "saved"
+            return None, curl.load(text), "curl"
+        except ValueError as e:
+            raise SystemExit(f"couldn't read that cURL paste: {e}")
+    m, flows, source = fetch_flows(where="cli")
+    if source == "saved" and not flows:
         raise SystemExit(
             "no proxy running and no saved captures — run `mimik record` "
             "first, or pass --har FILE / --curl FILE"
         )
+    return m, flows, source
 
 
 def _endpoints_from_args(args, m, flows, source):
     host = args.host
-    if source == "har":
-        return har.endpoints(args.har, host)
     if source == "live":
         return mitm_mod.endpoints(m, flows, host)
+    # HAR/cURL/saved flows all carry embedded bodies — one shared
+    # reader, and no second parse of the HAR file.
     return mitm_mod.endpoints_from_saved(flows, host)
 
 
@@ -184,8 +172,7 @@ def cmd_record(args):
             except (EOFError, KeyboardInterrupt):
                 sys.exit("\nno program picked — nothing launched")
             try:
-                plan = launch.prepare_file(args.file, pick=choice,
-                                           deb_install=args.deb_install)
+                plan = launch.pick_candidate(plan, choice)
             except launch.LaunchError as e:
                 print(f"  {e}")
         print(f"\nwill run:  {plan.command_display}")
@@ -217,7 +204,7 @@ def cmd_record(args):
     elif target == "linux-app":
         print(LINUX_APP_STEPS)
     else:
-        print(ANDROID_STEPS.format(ip=_lan_ip()))
+        print(ANDROID_STEPS.format(ip=doctor.lan_ip()))
 
     session = ProxySession(meta=meta, on_update=_print_hosts)
     try:
@@ -238,13 +225,11 @@ def cmd_record(args):
             env = dict(os.environ)
             env.update(launch.proxy_env())
             try:
-                app_proc = subprocess.Popen(
+                app_proc = launch.launch_checked(
                     shlex.split(args.launch), env=env,
-                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                    start_new_session=True,
-                )
+                    label=args.launch)
                 print(f"launched: {args.launch}")
-            except (OSError, ValueError) as e:
+            except (OSError, ValueError, launch.LaunchError) as e:
                 print(f"could not launch {args.launch!r}: {e}")
         rows = session.run_forever()
     finally:
@@ -305,12 +290,11 @@ def _record_stop_summary(rows):
     say which saved presets apply to the hosts just captured — app
     presets, and pattern presets the traffic matched."""
     hosts = [h for h, _n in rows]
-    for host, refreshed, has in presets.after_record(hosts):
+    for host, refreshed, has, matched in presets.after_record(hosts):
         if refreshed:
             print(f"Preset refreshed for {host}.")
         if has:
             print(f"Used the saved preset for {host}.")
-        matched = presets.matched_pattern_ids(host)
         if matched:
             print(f"Matched patterns: {', '.join(matched)}.")
 
@@ -318,75 +302,30 @@ def _record_stop_summary(rows):
 # ---- doctor ------------------------------------------------------------------
 
 def cmd_doctor(args):
-    ok = True
-
-    def check(name, present, fix):
-        nonlocal ok
-        mark = "ok " if present else "MISSING"
-        print(f"  [{mark}] {name}")
-        if not present:
-            ok = False
-            print(f"          → {fix}")
-
+    """Render the shared setup check (mimik.doctor) as plain text.
+    Exit 0 when every required check passes, 1 otherwise."""
+    result = doctor.doctor()
     print("MIMIK setup check:\n")
-    check(f"python {sys.version_info.major}.{sys.version_info.minor} "
-          f"(3.10+ needed)", sys.version_info >= (3, 10),
-          "install Python 3.12 from your distro")
-    try:
-        import requests  # noqa: F401
-
-        has_requests = True
-    except ImportError:
-        has_requests = False
-    check("requests library", has_requests, "pip install requests")
-    check("proxy (mitmweb or uvx)", mitmweb_cmd() is not None,
-          "pip install mitmproxy  — or install uv: "
-          "https://astral.sh/uv")
-    try:
-        import PySide6  # noqa: F401
-
-        has_qt = True
-    except ImportError:
-        has_qt = False
-    check("Qt GUI (PySide6)", has_qt, "pip install PySide6")
-    reachable = False
-    try:
-        mitm_mod.Mitm().flows()
-        reachable = True
-    except mitm_mod.MitmError:
-        pass
+    for c in result["required"]:
+        mark = "ok " if c["ok"] else "MISSING"
+        print(f"  [{mark}] {c['name']}")
+        if not c["ok"] and c.get("fix"):
+            print(f"          → {c['fix']}")
+    reachable = result["mitmweb_running"]
     print(f"  [{'ok ' if reachable else '  -'}] mitmweb running + reachable")
     if not reachable:
         print("          → run `mimik record` in another terminal")
-
-    def opt(name, present, fix):
-        print(f"  [{'ok ' if present else '  -'}] {name}")
-        if not present:
-            print(f"          → {fix}")
-
     print("\noptional:")
-    opt("Ollama (optional polish)", bool(codegen.ollama_models()),
-        "start Ollama if you want local-AI polish: ollama serve")
-    ca = os.path.join(os.path.expanduser("~"), ".mitmproxy",
-                      "mitmproxy-ca-cert.pem")
-    opt("mitmproxy CA cert", os.path.exists(ca),
-        "created automatically the first time you run `mimik record`")
-    opt("wine (Windows capture target)", wine.wine_available(),
-        "WinLinx brings Wine — install WinLinx to capture Windows programs")
-    opt("WinLinx (Windows capture target)", wine.winlinx_available(),
-        "install WinLinx to run Windows programs for capture")
-    rb = reblend_bridge.find_reblend()
-    opt("Reblend (asset packs)",
-        rb is not None,
-        "point MIMIK at your Reblend folder (Assets tab, or "
-        "`mimik build-pack --reblend PATH`)")
-    if rb:
-        print(f"          Reblend folder: {rb}")
-    saved = store.list_captures()
-    print(f"\nsaved captures: {len(saved)} host(s) under "
-          f"{store.captures_dir()}")
-    print(f"LAN IP for the phone proxy: {_lan_ip()}:8080")
-    sys.exit(0 if ok else 1)
+    for c in result["optional"]:
+        print(f"  [{'ok ' if c['ok'] else '  -'}] {c['name']}")
+        if not c["ok"] and c.get("fix"):
+            print(f"          → {c['fix']}")
+        if c.get("detail"):
+            print(f"          {c['detail']}")
+    print()
+    for line in result["info"]:
+        print(line)
+    sys.exit(0 if result["ok"] else 1)
 
 
 # ---- hosts / learn / gen / clients -------------------------------------------
@@ -403,7 +342,154 @@ def cmd_hosts(args):
     print(f"{'requests':>9}  host")
     for host, n in rows:
         print(f"{n:>9}  {host}")
+    if source == "saved":
+        for host, _n in rows:
+            stats = store.capture_stats(host)
+            if stats["truncated"]:
+                print(f"  note: {host}: {stats['flows']} flows saved, "
+                      f"showing the newest {stats['kept']}")
     print("\nPick your API host (usually the one with JSON, not media/cdn).")
+
+
+def cmd_prune(args):
+    keep = max(0, args.keep)
+    preview = store.prune(keep=keep, dry_run=True)
+    if not preview["deleted"]:
+        print(f"nothing to prune — every host has {keep} or fewer saves.")
+        return
+    print(f"This deletes {len(preview['deleted'])} old capture save(s) "
+          f"holding {preview['flows_lost']} flow(s), keeping the {keep} "
+          f"most recent save(s) per host.")
+    if not args.yes:
+        answer = input("Delete them? [y/N] ").strip().lower()
+        if answer not in ("y", "yes"):
+            print("kept everything.")
+            return
+    result = store.prune(keep=keep)
+    print(f"deleted {len(result['deleted'])} save(s), "
+          f"{result['flows_lost']} flow(s) gone, "
+          f"{result['kept']} save(s) kept.")
+
+
+def _confirm_delete(what, args):
+    """[y/N] prompt shared by the delete commands; --yes skips it."""
+    if args.yes:
+        return True
+    try:
+        answer = input(f"Delete {what}? [y/N] ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print("kept it.")
+        return False
+    if answer not in ("y", "yes"):
+        print("kept it.")
+        return False
+    return True
+
+
+def cmd_delete(args):
+    if args.host:
+        stats = store.capture_stats(args.host)
+        if not stats["files"]:
+            sys.exit(f"no saved captures for {args.host} — run "
+                     "`mimik hosts` to see them")
+        what = (f"all {stats['flows']} saved flow(s) for {args.host} "
+                f"({stats['files']} save file(s), "
+                f"{store.format_size(stats['bytes'])})")
+        if not _confirm_delete(what, args):
+            return
+        result = store.delete_host(args.host)
+        print(f"deleted {len(result['deleted'])} save file(s), "
+              f"{result['flows_lost']} flow(s) gone, "
+              f"{store.format_size(result['bytes_freed'])} freed.")
+        return
+    if args.client:
+        name = args.client
+        if not name.endswith("_client.py"):
+            name += "_client.py"
+        found = [n for n, _p, _s in store.list_clients() if n == name]
+        if not found:
+            sys.exit(f"no generated client named {name} — run "
+                     "`mimik clients` to see them")
+        if not _confirm_delete(f"the generated client {name}", args):
+            return
+        result = store.delete_client(name)
+        print(f"deleted {name} "
+              f"({store.format_size(result['bytes_freed'])} freed).")
+        return
+    if args.group:
+        groups = assets.find_groups(args.group)
+        if not groups:
+            sys.exit(f"no asset group named {args.group} — run "
+                     "`mimik assets` to see them")
+        names = ", ".join(os.path.basename(g) for g, _m in groups)
+        if not _confirm_delete(
+                f"{len(groups)} asset group(s): {names}", args):
+            return
+        freed = 0
+        for gdir, _manifest in groups:
+            freed += assets.delete_group(gdir)["bytes_freed"]
+        print(f"deleted {len(groups)} asset group(s), "
+              f"{store.format_size(freed)} freed.")
+        return
+    if args.pack:
+        packs = reblend_bridge.find_packs(args.pack)
+        if not packs:
+            sys.exit(f"no pack named {args.pack} — run `mimik assets` "
+                     "to see them")
+        names = ", ".join(os.path.basename(p) for p, _d in packs)
+        if not _confirm_delete(f"{len(packs)} pack(s): {names}", args):
+            return
+        freed = 0
+        for pdir, _data in packs:
+            freed += reblend_bridge.delete_pack(pdir)["bytes_freed"]
+        print(f"deleted {len(packs)} pack(s), "
+              f"{store.format_size(freed)} freed.")
+        return
+
+
+def cmd_import(args):
+    """Save HAR/cURL traffic into the capture store like a capture, so
+    the hosts persist (hosts/learn/gen/presets see them after a
+    restart). Re-importing the same file is a no-op — the store
+    dedupes on flow id."""
+    flows = []
+    label = ""
+    if args.har:
+        label = args.har
+        try:
+            flows = har.load(args.har)
+        except har.HarError as e:
+            raise SystemExit(str(e))
+    elif args.curl:
+        label = "cURL paste"
+        text = args.curl
+        try:
+            with open(text) as f:
+                text = f.read()
+        except OSError:
+            pass  # not a file: treat the argument itself as the cURL text
+        try:
+            flows = curl.load(text)
+        except ValueError as e:
+            raise SystemExit(f"couldn't read that cURL paste: {e}")
+    if not flows:
+        raise SystemExit(f"no flows in {label} — nothing imported")
+    paths = store.save_flows(
+        flows, meta={"source": "import", "from": label})
+    # The files written hold exactly the new flows — count those, so
+    # the message never claims flows that were already saved.
+    new = 0
+    for path in paths:
+        with open(path) as fh:
+            new += len(json.load(fh)["flows"])
+    hosts = sorted({f["request"]["host"] for f in flows
+                    if f.get("request", {}).get("host")})
+    if new == 0:
+        print(f"nothing new — all {len(flows)} flow(s) from {label} "
+              f"are already saved.")
+        return
+    print(f"imported {new} flow(s) for {len(hosts)} host(s) from "
+          f"{label}: {', '.join(hosts)}")
 
 
 def cmd_learn(args):
@@ -417,8 +503,26 @@ def cmd_learn(args):
 
 
 def _default_out(host):
-    stem = re.sub(r"[^a-z0-9]+", "_", host.split(".")[0].lower()).strip("_")
-    return f"{stem or 'app'}_client.py"
+    """Full host, sanitized, as the client filename: api.foo.com →
+    api_foo_com_client.py, 192.168.1.5 → 192_168_1_5_client.py. (The
+    old first-label-only name collided: api.foo.com and api.bar.com
+    both wrote api_client.py.) The stem is capped so the filename
+    stays under the 255-byte limit for very long hostnames."""
+    stem = re.sub(r"[^a-z0-9]+", "_", host.lower()).strip("_")
+    return f"{(stem or 'app')[:200]}_client.py"
+
+
+def _unique_out(host, directory):
+    """A collision-free output filename in `directory`: the default
+    name, or _2/_3/... when it already exists."""
+    name = _default_out(host)
+    if not os.path.exists(os.path.join(directory, name)):
+        return name
+    stem = name[: -len("_client.py")]
+    n = 2
+    while os.path.exists(os.path.join(directory, f"{stem}_client_{n}.py")):
+        n += 1
+    return f"{stem}_client_{n}.py"
 
 
 def _class_name(source):
@@ -436,7 +540,7 @@ def cmd_gen(args):
         print(codegen.build_prompt(args.host, eps))
         return
 
-    out = args.out or _default_out(args.host)
+    out = args.out or _unique_out(args.host, os.getcwd())
     preset, applied, _pattern_ids, auth_label = presets.resolve_for_gen(
         args.host, flows=flows)
     print(f"generating a client from {len(eps)} endpoints "
@@ -446,7 +550,6 @@ def cmd_gen(args):
     src = codegen.generate(args.host, eps, polish=args.polish,
                            model=args.model, preset=preset,
                            preset_label=auth_label, applied=applied)
-    import os
 
     parent = os.path.dirname(os.path.abspath(out))
     if parent:
@@ -480,11 +583,7 @@ def cmd_clients(args):
 # ---- assets / build-pack --------------------------------------------------------
 
 def _fmt_size(size):
-    if size >= 1024 * 1024:
-        return f"{size / (1024 * 1024):.1f} MB"
-    if size >= 1024:
-        return f"{size / 1024:.1f} KB"
-    return f"{size} B"
+    return store.format_size(size)
 
 
 def cmd_assets(args):
@@ -586,6 +685,131 @@ def cmd_build_pack(args):
 
 # ---- presets -------------------------------------------------------------------
 
+def cmd_exclude_list(args):
+    """`mimik exclude list` — the capture-exclusion list + toggle."""
+    state = "on" if presets.filtering_enabled() else "off"
+    print(f"Capture filtering: {state}")
+    hosts = presets.excluded_hosts()
+    if not hosts:
+        print("No hosts excluded.")
+        return
+    print("Excluded hosts:")
+    for h in hosts:
+        print(f"  {h}")
+
+
+def cmd_exclude_add(args):
+    hosts = presets.excluded_hosts()
+    host = args.host.strip().lower()
+    if host in hosts:
+        print(f"{host} is already excluded.")
+        return
+    hosts.append(host)
+    presets.set_excluded_hosts(hosts)
+    print(f"Excluded {host} from captures.")
+
+
+def cmd_exclude_remove(args):
+    hosts = presets.excluded_hosts()
+    host = args.host.strip().lower()
+    if host not in hosts:
+        print(f"{host} is not on the exclusion list.")
+        return
+    presets.set_excluded_hosts([h for h in hosts if h != host])
+    print(f"{host} will be captured again.")
+
+
+def cmd_exclude_reset(args):
+    presets.set_excluded_hosts(list(filters.DEFAULT_EXCLUDED))
+    print(f"Exclusion list restored to the {len(filters.DEFAULT_EXCLUDED)} "
+          "defaults.")
+
+
+def cmd_exclude_on(args):
+    presets.set_filtering_enabled(True)
+    print("Capture filtering on — excluded hosts are dropped.")
+
+
+def cmd_exclude_off(args):
+    presets.set_filtering_enabled(False)
+    print("Capture filtering off — all hosts are captured.")
+
+
+def cmd_update_check(args):
+    """Check GitHub for a newer MIMIK release (item 31)."""
+    result = update.check_for_update()
+    if result["error"]:
+        sys.exit(f"could not check for updates: {result['error']}")
+    if result["update_available"]:
+        print(f"MIMIK {result['latest']} is available "
+              f"(you have {result['current']}).")
+        print(f"Get it here: {result['url']}")
+    else:
+        print(f"MIMIK {result['current']} is the latest version.")
+
+
+def cmd_sample(args):
+    """Load the first-run sample capture (item 28)."""
+    result = sample.load_sample()
+    if result["already_loaded"]:
+        print(f"The sample capture is already loaded "
+              f"({result['flows']} flows for {sample.SAMPLE_HOST}).")
+    else:
+        print(f"Loaded the sample capture: {result['flows']} flows for "
+              f"{sample.SAMPLE_HOST}, {result['assets']} asset(s)"
+              + (f", preset {result['preset']} learned"
+                 if result["preset"] else "")
+              + ".")
+    print(f"Try: mimik gen {sample.SAMPLE_HOST}")
+
+
+def cmd_presets_export(args):
+    try:
+        path = export.export_preset(args.name, args.file)
+    except export.ExportError as e:
+        sys.exit(str(e))
+    print(f"Exported the preset for {args.name} to {path}.")
+
+
+def cmd_presets_import(args):
+    _import_export_cli(args.file, args.force)
+
+
+def _import_export_cli(path, force):
+    """Shared import path for `presets import` and `pack import`."""
+    try:
+        result = export.import_export(path, overwrite=force)
+    except export.ExportError as e:
+        sys.exit(str(e))
+    except FileExistsError as e:
+        sys.exit(f"{e} already exists — use --force to replace it")
+    print(f"Imported the {result['kind']} {result['name']}.")
+
+
+def cmd_pack_list(args):
+    packs = reblend_bridge.list_packs()
+    if not packs:
+        print("no packs yet — build one on the Assets tab")
+        return
+    print("Built packs (newest first):")
+    for pdir, pack in packs:
+        print(f"  {os.path.basename(pdir)} — "
+              f"{pack.get('app') or pack.get('host') or '?'} "
+              f"({pack.get('built_at', '')})")
+
+
+def cmd_pack_export(args):
+    try:
+        path = export.export_pack(args.name, args.file)
+    except export.ExportError as e:
+        sys.exit(str(e))
+    print(f"Exported the pack {args.name} to {path}.")
+
+
+def cmd_pack_import(args):
+    _import_export_cli(args.file, args.force)
+
+
 def cmd_presets(args):
     """`mimik presets` — list saved presets (+ the auto-learn setting).
 
@@ -631,8 +855,7 @@ def cmd_presets(args):
 
 
 def cmd_presets_learn(args):
-    result = presets.learn(args.name)
-    patterns = presets.learn_patterns(args.name)
+    result, patterns, _matched = presets.learn_all(args.name)
     if result is None:
         if presets.load_preset(args.name) is not None:
             print(f"no new captures for {args.name} — the saved preset "
@@ -727,6 +950,8 @@ def cmd_presets_delete(args):
 def main(argv=None):
     p = argparse.ArgumentParser(prog="mimik", description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--version", action="version",
+                   version=f"%(prog)s {__version__}")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     rp = sub.add_parser("record", help="start the proxy + capture a target")
@@ -776,6 +1001,44 @@ def main(argv=None):
     sub.add_parser("clients",
                    help="list generated clients + saved captures"
                    ).set_defaults(func=cmd_clients)
+
+    prp = sub.add_parser("prune",
+                         help="delete old capture saves, keeping the N "
+                         "most recent per host")
+    prp.add_argument("--keep", type=int, default=store.DEFAULT_KEEP_SAVES,
+                     metavar="N",
+                     help="saves to keep per host "
+                     f"(default: {store.DEFAULT_KEEP_SAVES})")
+    prp.add_argument("--yes", action="store_true",
+                     help="delete without asking")
+    prp.set_defaults(func=cmd_prune)
+
+    dp = sub.add_parser("delete",
+                        help="delete a host's captures, a generated "
+                        "client, an asset group, or a pack")
+    dgroup = dp.add_mutually_exclusive_group(required=True)
+    dgroup.add_argument("--host", metavar="HOST",
+                        help="delete all saved captures for this host")
+    dgroup.add_argument("--client", metavar="NAME",
+                        help="delete a generated client "
+                        "(_client.py suffix optional)")
+    dgroup.add_argument("--group", metavar="NAME",
+                        help="delete asset group(s) with this name")
+    dgroup.add_argument("--pack", metavar="NAME",
+                        help="delete pack(s) for this app or host")
+    dp.add_argument("--yes", action="store_true",
+                    help="delete without asking")
+    dp.set_defaults(func=cmd_delete)
+
+    ip = sub.add_parser("import",
+                        help="save HAR/cURL traffic into the capture "
+                        "store like a capture, so the hosts persist")
+    igroup = ip.add_mutually_exclusive_group(required=True)
+    igroup.add_argument("--har", metavar="FILE",
+                        help="HAR file to import")
+    igroup.add_argument("--curl", metavar="FILE",
+                        help="cURL paste (file or text) to import")
+    ip.set_defaults(func=cmd_import)
 
     ap = sub.add_parser("assets", help="list captured assets")
     ap.add_argument("host", nargs="?", default=None,
@@ -828,6 +1091,69 @@ def main(argv=None):
     dp.add_argument("--yes", action="store_true",
                     help="skip the confirmation question")
     dp.set_defaults(func=cmd_presets_delete)
+    xp = psub.add_parser("export", help="export a preset to a zip file")
+    xp.add_argument("name", help="host, program group, or pattern id")
+    xp.add_argument("file", help="zip file to write")
+    xp.set_defaults(func=cmd_presets_export)
+    ip = psub.add_parser("import", help="import a preset from a zip file")
+    ip.add_argument("file", help="export zip to import")
+    ip.add_argument("--force", action="store_true",
+                    help="replace the preset if it already exists")
+    ip.set_defaults(func=cmd_presets_import)
+
+    kp = sub.add_parser(
+        "pack", help="built asset packs: list, export, import")
+    kp.set_defaults(func=cmd_pack_list)
+    ksub = kp.add_subparsers(dest="pack_cmd")
+    ksub.add_parser("list",
+                    help="list built packs").set_defaults(
+                        func=cmd_pack_list)
+    kp_exp = ksub.add_parser("export", help="export a pack to a zip file")
+    kp_exp.add_argument("name",
+                        help="pack dir name, app, or host")
+    kp_exp.add_argument("file", help="zip file to write")
+    kp_exp.set_defaults(func=cmd_pack_export)
+    kp_imp = ksub.add_parser("import", help="import a pack from a zip file")
+    kp_imp.add_argument("file", help="export zip to import")
+    kp_imp.add_argument("--force", action="store_true",
+                        help="replace the pack if it already exists")
+    kp_imp.set_defaults(func=cmd_pack_import)
+
+    smp = sub.add_parser(
+        "sample",
+        help="load the sample capture (a demo game API) to try MIMIK "
+             "without recording anything")
+    smp.set_defaults(func=cmd_sample)
+
+    upd = sub.add_parser(
+        "update-check",
+        help="check GitHub for a newer MIMIK release")
+    upd.set_defaults(func=cmd_update_check)
+
+    ep = sub.add_parser(
+        "exclude",
+        help="capture filter: hosts never captured (telemetry, "
+             "analytics, noise)")
+    ep.set_defaults(func=cmd_exclude_list)
+    esub = ep.add_subparsers(dest="exclude_cmd")
+    esub.add_parser("list",
+                    help="list excluded hosts").set_defaults(
+                        func=cmd_exclude_list)
+    ap = esub.add_parser("add", help="exclude a host from captures")
+    ap.add_argument("host", help="host to exclude (subdomains too)")
+    ap.set_defaults(func=cmd_exclude_add)
+    rp = esub.add_parser("remove", help="stop excluding a host")
+    rp.add_argument("host", help="host to capture again")
+    rp.set_defaults(func=cmd_exclude_remove)
+    esub.add_parser("reset",
+                    help="restore the default exclusion list").set_defaults(
+                        func=cmd_exclude_reset)
+    esub.add_parser("on",
+                    help="turn capture filtering on").set_defaults(
+                        func=cmd_exclude_on)
+    esub.add_parser("off",
+                    help="turn capture filtering off").set_defaults(
+                        func=cmd_exclude_off)
 
     args = p.parse_args(argv)
     args.func(args)

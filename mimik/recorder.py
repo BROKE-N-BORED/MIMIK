@@ -13,7 +13,7 @@ import sys
 import tempfile
 import time
 
-from . import assets, store
+from . import assets, filters, log, store
 from .sources.mitm import Mitm, MitmError
 
 TOKEN_RE = re.compile(r"token=([A-Za-z0-9_\-]+)")
@@ -47,6 +47,9 @@ class ProxySession:
         self.on_update = on_update
         self.proc = None
         self.mitm = None
+        # The last set of hosts the capture filter dropped — the log
+        # line fires only when the set changes, not every 5 s poll.
+        self._last_dropped = set()
         self.log_path = os.path.join(
             tempfile.gettempdir(), "mimik-mitmweb.log"
         )
@@ -62,7 +65,7 @@ class ProxySession:
                 "(`pip install mitmproxy`) or uv (https://astral.sh/uv) "
                 "so MIMIK can run mitmweb for you"
             )
-        self._log_fh = open(self.log_path, "w")
+        self._log_fh = store.open_private(self.log_path, "w")
         # Unbuffered: mitmweb's startup lines (including the web-UI token)
         # sit in a block buffer forever when stdout is a file, so the
         # token was never discovered and /flows answered 403.
@@ -123,15 +126,29 @@ class ProxySession:
             pass
 
     def poll(self):
-        """Pull flows once, save them, report hosts. Returns (host, count) rows."""
+        """Pull flows once, save them, report hosts. Returns (host, count) rows.
+
+        The save is incremental — store.save_flows only writes flows it
+        hasn't seen, so re-pulling the same flows costs a local id scan
+        instead of a full body re-fetch + rewrite.
+        """
         if self.mitm is None:
             return []
         flows = self.mitm.flows()
+        # Capture filter (item 26): excluded hosts never reach the
+        # store or the host list — filter before saving AND before
+        # deriving the rows.
+        flows, dropped = filters.apply_capture_filter(flows)
+        if dropped and dropped != self._last_dropped:
+            log.log_info("recorder poll",
+                         "excluded %d host(s): %s"
+                         % (len(dropped), ", ".join(sorted(dropped))))
+        self._last_dropped = dropped
         if flows:
             try:
                 store.save_flows(flows, mitm=self.mitm, meta=self.meta)
-            except Exception:
-                pass
+            except Exception as e:
+                log.log_error("recorder poll save_flows", e)
         from .sources.mitm import hosts as _hosts
 
         rows = _hosts(flows)
@@ -151,6 +168,9 @@ class ProxySession:
             flows = self.mitm.flows()
         except Exception:
             return []
+        # Capture filter (item 26): an excluded host's assets are not
+        # extracted either.
+        flows, _dropped = filters.apply_capture_filter(flows)
         by_host = {}
         for f in flows:
             req = f.get("request") or {}
@@ -161,7 +181,8 @@ class ProxySession:
             try:
                 gdir, manifest = assets.extract_from_flows(
                     host_flows, host, mitm=self.mitm, host=host)
-            except Exception:
+            except Exception as e:
+                log.log_error("recorder extract_assets", e)
                 continue
             if gdir:
                 out.append((host, gdir, len(manifest["assets"])))
@@ -172,12 +193,12 @@ class ProxySession:
         if self.mitm is not None:
             try:
                 self.poll()
-            except Exception:
-                pass
+            except Exception as e:
+                log.log_error("recorder stop poll", e)
             try:
                 self.extract_assets()
-            except Exception:
-                pass
+            except Exception as e:
+                log.log_error("recorder stop extract_assets", e)
         if self.proc is not None and self.proc.poll() is None:
             self.proc.terminate()
             try:

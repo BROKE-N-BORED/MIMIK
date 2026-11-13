@@ -2,6 +2,7 @@
 import os
 import sys
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
@@ -95,6 +96,59 @@ class MitmTests(unittest.TestCase):
         eps = mitm.endpoints_from_saved(flows, "api.example.com")
         like = [e for e in eps if e["path"] == "/v1/like"][0]
         self.assertIn('"a": 1', like["request_body"])
+
+
+class NoProxyTests(unittest.TestCase):
+    """Item 32g: localhost mitmweb calls never go through a proxy."""
+
+    def test_requests_carry_no_proxy(self):
+        m = mitm.Mitm()
+        flows_resp = mock.Mock()
+        flows_resp.status_code = 200
+        flows_resp.json.return_value = []
+        body_resp = mock.Mock()
+        body_resp.content = b"body-bytes"
+        with mock.patch.object(m._http, "get",
+                               side_effect=[mock.Mock(), flows_resp,
+                                            body_resp]) as get:
+            self.assertEqual(m.flows(), [])
+            self.assertEqual(m.body("f1", "response"), b"body-bytes")
+        self.assertEqual(get.call_count, 3)  # _auth + /flows + body
+        for call in get.call_args_list:
+            self.assertEqual(call.kwargs.get("proxies"), mitm._NO_PROXY)
+
+    def test_env_proxy_cannot_reach_localhost(self):
+        """The mechanism, pinned: with HTTP/HTTPS/ALL proxies in the
+        environment and NO_PROXY unset, the explicit None proxies
+        still win — requests' select_proxy (the actual routing
+        decision) finds no proxy for the localhost URL. The control
+        proves the test would catch a regression: with no explicit
+        proxies, the env proxy is selected."""
+        import requests
+
+        # Both cases: urllib's getproxies scans the environment and
+        # the sandbox sets lowercase proxy vars too — whichever case
+        # comes later in environ wins, so set both to the same value.
+        env = {"HTTP_PROXY": "http://proxy.example.com:8080",
+               "http_proxy": "http://proxy.example.com:8080",
+               "HTTPS_PROXY": "http://proxy.example.com:8080",
+               "https_proxy": "http://proxy.example.com:8080",
+               "ALL_PROXY": "http://proxy.example.com:8080",
+               "all_proxy": "http://proxy.example.com:8080"}
+        with mock.patch.dict(os.environ, env, clear=False):
+            os.environ.pop("NO_PROXY", None)
+            os.environ.pop("no_proxy", None)
+            session = requests.Session()
+            url = "http://127.0.0.1:8081/flows"
+            merged = session.merge_environment_settings(
+                url, dict(mitm._NO_PROXY), True, True, None)
+            self.assertIsNone(requests.utils.select_proxy(
+                url, merged["proxies"]))
+            unguarded = session.merge_environment_settings(
+                url, {}, True, True, None)
+            self.assertEqual(requests.utils.select_proxy(
+                url, unguarded["proxies"]),
+                "http://proxy.example.com:8080")
 
 
 if __name__ == "__main__":

@@ -2,3 +2,12 @@ __pycache__/
 *.pyc
 .venv/
 *.egg-info/
+
+# Local secrets — never committed (immutable rule, 2026-11-13)
+.env
+.env.*
+providers.json
+*.pem
+*.key
+credentials.json
+secrets.json

@@ -173,6 +173,24 @@ class SessionTests(unittest.TestCase):
             app = ExampleApp()
         self.assertEqual(app.headers["Authorization"], "Bearer livetok")
 
+    def test_app_construction_writes_no_capture_files(self):
+        # Item 25 / review #23: constructing a client must not save
+        # flows — the recorder already saves on every poll. Hinge()
+        # with live mitmweb writes no new capture files.
+        class ExampleApp(App):
+            HOST = "api.example.com"
+
+        fake_mitm = mock.Mock()
+        fake_mitm.flows.return_value = [flow("1", "api.example.com",
+                                             "livetok")]
+        with mock.patch("mimik.session.Mitm",
+                        return_value=fake_mitm), \
+                mock.patch.object(store, "save_flows") as save:
+            app = ExampleApp()
+        self.assertEqual(app.headers["Authorization"], "Bearer livetok")
+        save.assert_not_called()
+        self.assertEqual(store.list_captures(), [])
+
     def test_app_explicit_args_skip_mitm(self):
         class ExampleApp(App):
             HOST = "api.example.com"
@@ -180,6 +198,109 @@ class SessionTests(unittest.TestCase):
         app = ExampleApp(base_url="https://x.example.com",
                          headers={"Authorization": "Bearer z"})
         self.assertEqual(app.base_url, "https://x.example.com")
+
+
+class TimeoutTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        os.environ["MIMIK_DATA_DIR"] = self.tmp
+
+    def tearDown(self):
+        del os.environ["MIMIK_DATA_DIR"]
+
+    def _session(self, responses, **kw):
+        s = Session("https://api.example.com",
+                    {"Authorization": "Bearer <redacted>"}, **kw)
+        s._http = mock.Mock()
+        s._http.request.side_effect = responses
+        return s
+
+    def test_default_timeout_is_30(self):
+        s = self._session([FakeResponse(200)])
+        self.assertEqual(s.timeout, 30)
+        s.get("/v1/users")
+        self.assertEqual(s._http.request.call_args[1]["timeout"], 30)
+
+    def test_constructor_override(self):
+        s = self._session([FakeResponse(200)], timeout=5)
+        s.get("/v1/users")
+        self.assertEqual(s._http.request.call_args[1]["timeout"], 5)
+
+    def test_per_call_override_wins(self):
+        s = self._session([FakeResponse(200)], timeout=5)
+        s.get("/v1/users", timeout=120)
+        self.assertEqual(s._http.request.call_args[1]["timeout"], 120)
+
+    def test_explicit_none_disables(self):
+        s = self._session([FakeResponse(200)])
+        s.get("/v1/users", timeout=None)
+        self.assertIsNone(s._http.request.call_args[1]["timeout"])
+
+    def test_app_inherits_default_and_override(self):
+        store.save_flows([flow("1", "api.example.com", "savedtok")],
+                         base=self.tmp)
+
+        class ExampleApp(App):
+            HOST = "api.example.com"
+
+        from mimik.sources.mitm import MitmError
+
+        with mock.patch("mimik.session.Mitm") as mock_mitm_cls:
+            mock_mitm_cls.return_value.flows.side_effect = MitmError("down")
+            app = ExampleApp()
+            self.assertEqual(app.timeout, 30)
+            app2 = ExampleApp(timeout=9)
+            self.assertEqual(app2.timeout, 9)
+
+    def test_hung_server_does_not_hang_forever(self):
+        import threading
+        import time
+        from http.server import (BaseHTTPRequestHandler,
+                                 ThreadingHTTPServer)
+
+        import requests
+
+        class SlowHandler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                time.sleep(5)  # hang longer than the timeout
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(b"{}")
+
+            def log_message(self, *args):
+                pass
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), SlowHandler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            port = server.server_address[1]
+            s = Session(f"http://127.0.0.1:{port}", {}, timeout=0.2)
+            start = time.monotonic()
+            with self.assertRaises(requests.Timeout):
+                s.get("/slow")
+            self.assertLess(time.monotonic() - start, 3)
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_generated_client_carries_timeout(self):
+        from mimik import codegen
+
+        eps = [{"method": "GET", "path": "/v1/users", "status": 200,
+                "query": "", "request_body": "",
+                "response_body": '{"users": []}'}]
+        src = codegen.generate_deterministic("api.example.com", eps)
+        self.assertIn("time out after 30 s", src)
+        namespace = {}
+        exec(compile(src, "api_example_com_client.py", "exec"), namespace)
+        cls = namespace["ExampleClient"]
+        client = cls(base_url="https://api.example.com", headers={})
+        self.assertEqual(client.timeout, 30)
+        client._http = mock.Mock()
+        client._http.request.return_value = FakeResponse(200, {"users": []})
+        client.get_users()
+        self.assertEqual(client._http.request.call_args[1]["timeout"], 30)
 
 
 if __name__ == "__main__":

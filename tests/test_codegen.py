@@ -104,10 +104,77 @@ class DeterministicGenTests(unittest.TestCase):
         self.assertIn("def like(self, subject_id=None, comment=None):",
                       self.src)
         self.assertIn("def create_message(self, recipient_id=None, "
-                      "text=None):", self.src)
+                      "text=None, platform=None):", self.src)
 
-    def test_constants_stay_as_defaults(self):
-        self.assertIn("'platform': 'ios'", self.src)
+    def test_strings_become_params_not_literals(self):
+        # Review #12: a short string like "ios" looks constant but is a
+        # value from the user's own traffic — it becomes an optional
+        # parameter, never a baked literal.
+        self.assertNotIn("'platform': 'ios'", self.src)
+        self.assertNotIn('"ios"', self.src)
+        self.assertIn("platform=None", self.src)
+
+    def test_safe_constants_still_baked(self):
+        # The allow-list: None, bool, small int, empty string.
+        self.assertIn("'retry': 2", self.src)
+        eps = [{"method": "POST", "path": "/v1/prefs", "status": 200,
+                "query": "",
+                "request_body": json.dumps(
+                    {"enabled": True, "note": "", "count": 3,
+                     "nothing": None}),
+                "response_body": "{}"}]
+        src = codegen.generate_deterministic("api.example.com", eps)
+        self.assertIn("'enabled': True", src)
+        self.assertIn("'note': ''", src)
+        self.assertIn("'count': 3", src)
+        self.assertIn("'nothing': None", src)
+
+    def test_short_personal_strings_not_baked(self):
+        # The review's verify case: name/city/role must not appear
+        # anywhere in the generated client — not as body literals, not
+        # as parameter defaults.
+        eps = [{"method": "POST", "path": "/v1/profile", "status": 200,
+                "query": "",
+                "request_body": json.dumps(
+                    {"name": "Josh", "city": "Dover", "role": "admin"}),
+                "response_body": "{}"}]
+        src = codegen.generate_deterministic("api.example.com", eps)
+        self.assertNotIn("Josh", src)
+        self.assertNotIn("Dover", src)
+        self.assertNotIn("admin", src)
+        self.assertIn("def create_profile(self, name=None, city=None, "
+                      "role=None):", src)
+
+    def test_id_varying_flows_collapse_without_preset(self):
+        # Review #2: 1,200 flows over one id-varying path used to make a
+        # 1,200-method client without a preset. Generalization is the
+        # default now — one method, no preset needed.
+        eps = [{"method": "GET", "path": "/api/users/%d" % i,
+                "status": 200, "query": "", "request_body": "",
+                "response_body": "{}"} for i in range(1200)]
+        src = codegen.generate_deterministic("api.example.com", eps)
+        compile(src, "<gen>", "exec")
+        self.assertEqual(src.count("def get_users_by_id("), 1)
+        self.assertNotIn("get_users_by_id_2", src)
+        self.assertLess(len(src), 20000)
+
+    def test_preset_output_unchanged_by_default_generalization(self):
+        # A preset's output is the same as before: generalization plus
+        # the auth block. (The preset path already generalized.)
+        preset = {"auth": {"headers": ["Authorization"],
+                           "schemes": ["Bearer"], "cookies": [],
+                           "token_endpoints": []},
+                  "endpoints": []}
+        eps = [{"method": "GET", "path": "/api/users/123",
+                "status": 200, "query": "", "request_body": "",
+                "response_body": "{}"},
+               {"method": "GET", "path": "/api/users/456",
+                "status": 200, "query": "", "request_body": "",
+                "response_body": "{}"}]
+        src = codegen.generate_deterministic("api.example.com", eps,
+                                             preset=preset)
+        self.assertEqual(src.count("def get_users_by_id("), 1)
+        self.assertIn("AUTH_HEADERS = ('Authorization',)", src)
         self.assertIn("'retry': 2", self.src)
 
     def test_no_token_literals_in_output(self):
@@ -166,7 +233,8 @@ class DeterministicGenTests(unittest.TestCase):
                 inst = cls.__new__(cls)
                 inst.get_recs()
                 inst.like(subject_id="s1", comment="hey")
-                inst.create_message(recipient_id="r1", text="hi")
+                inst.create_message(recipient_id="r1", text="hi",
+                                    platform="ios")
                 inst.get_users_by_user_id(user_id="u9")
             self.assertEqual(calls[0][0], "GET")
             self.assertEqual(calls[0][1], "/rec/v2")
@@ -185,7 +253,8 @@ class DeterministicGenTests(unittest.TestCase):
         compile(src, "<gen>", "exec")
         self.assertIn("class ExampleClient(App):", src)
         self.assertIn("def like(", src)
-        self.assertIn("def get_users_by_user_id(", src)
+        # The fixture's concrete user id generalizes to {id} by default.
+        self.assertIn("def get_users_by_id(", src)
         self.assertNotIn("9f2c4e77a1b8", src)
         self.assertNotIn("SECRETTOKEN123", src)
 
@@ -194,6 +263,31 @@ class DeterministicGenTests(unittest.TestCase):
              mock.patch("requests.post", side_effect=AssertionError("no net")):
             src = codegen.generate("api.example.com", EPS, polish="none")
         compile(src, "<gen>", "exec")
+
+
+class GeneratedMarkerTests(unittest.TestCase):
+    """Item 29: the generated-client marker the smoke test trusts."""
+
+    def test_generated_source_carries_marker(self):
+        src = codegen.generate_deterministic("api.example.com", EPS)
+        self.assertIn(codegen.GENERATED_MARKER, src)
+
+    def test_is_generated_client(self):
+        gen = os.path.join(tempfile.mkdtemp(), "gen_client.py")
+        with open(gen, "w") as fh:
+            fh.write(codegen.generate_deterministic("api.example.com",
+                                                    EPS))
+        foreign = os.path.join(tempfile.mkdtemp(), "foreign_client.py")
+        with open(foreign, "w") as fh:
+            fh.write("print('hello')\n")
+        binary = os.path.join(tempfile.mkdtemp(), "binary_client.py")
+        with open(binary, "wb") as fh:
+            fh.write(b"\x00\x01\x02 not text")
+        self.assertTrue(codegen.is_generated_client(gen))
+        self.assertFalse(codegen.is_generated_client(foreign))
+        self.assertFalse(codegen.is_generated_client(binary))
+        self.assertFalse(codegen.is_generated_client(
+            os.path.join(tempfile.mkdtemp(), "missing_client.py")))
 
 
 class PromptTests(unittest.TestCase):

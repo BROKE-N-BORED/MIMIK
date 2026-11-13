@@ -52,7 +52,9 @@ Or open the **MIMIK** GUI from the menu: Record → Hosts and Learn → Generate
 
 Captures are saved under `~/.local/share/mimik/captures/` as they're pulled,
 so `hosts`, `learn`, `gen`, and generated clients keep working after the
-proxy stops — and after a reboot.
+proxy stops — and after a reboot. Captures contain live session tokens:
+capture files, preset files, and the mitmweb log are all written with
+0600 permissions (owner only), so don't share them or loosen them.
 
 ## Capture targets
 
@@ -161,7 +163,9 @@ method + path (`GET /rec/v2` → `get_recs`, `POST /like` → `like`), values
 that vary per call (ids, text) become parameters, constants stay as
 defaults, and **no token or secret ever appears in the output**. The file
 subclasses `mimik.App`, pulls auth from live mitmweb or your saved capture,
-and compiles cleanly.
+and compiles cleanly. If a call gets a 401, the client re-authenticates
+from the live proxy (fresh headers from mitmweb) and retries once — so
+keep the proxy running while you use it against a live app.
 
 - `--polish ollama`: asks your local Ollama (localhost:11434) to improve
   names/docstrings. Uses a small model if one is already there (prefers

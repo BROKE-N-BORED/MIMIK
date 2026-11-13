@@ -16,6 +16,17 @@ DEFAULT_URL = os.environ.get("MITM_URL", "http://127.0.0.1:8081")
 DEFAULT_TOKEN = os.environ.get("MITM_TOKEN", "test")
 
 
+# Localhost calls must never go through a proxy (item 32g): every
+# request passes explicit None proxies instead of relying on NO_PROXY
+# being set in the environment. Per-request, not session-level —
+# requests strips None values when merging session proxies, so the
+# session attribute would silently do nothing (probed on 2.31.0).
+# "all" is in there too: requests' select_proxy falls back to the
+# "all" key, so an ALL_PROXY env var would otherwise still route
+# localhost through the proxy.
+_NO_PROXY = {"http": None, "https": None, "all": None}
+
+
 class MitmError(RuntimeError):
     pass
 
@@ -30,7 +41,8 @@ class Mitm:
 
     def _auth(self):
         try:
-            self._http.get(f"{self.url}/", params={"token": self.token}, timeout=5)
+            self._http.get(f"{self.url}/", params={"token": self.token},
+                           proxies=_NO_PROXY, timeout=5)
         except requests.RequestException as e:
             raise MitmError(
                 f"can't reach mitmweb at {self.url} — is it running? "
@@ -40,7 +52,8 @@ class Mitm:
     def flows(self):
         """All captured flows as a list of dicts (mitmweb's own schema)."""
         self._auth()
-        r = self._http.get(f"{self.url}/flows", timeout=15)
+        r = self._http.get(f"{self.url}/flows", proxies=_NO_PROXY,
+                           timeout=15)
         if r.status_code != 200:
             raise MitmError(f"mitmweb /flows returned {r.status_code}")
         return r.json()
@@ -48,13 +61,10 @@ class Mitm:
     def body(self, flow_id, side):
         """Raw request/response body bytes for a flow. side is 'request' or 'response'."""
         r = self._http.get(
-            f"{self.url}/flows/{flow_id}/{side}/content.data", timeout=15
+            f"{self.url}/flows/{flow_id}/{side}/content.data",
+            proxies=_NO_PROXY, timeout=15
         )
         return r.content
-
-
-def _headers_dict(req):
-    return {k: v for k, v in req.get("headers", [])}
 
 
 def hosts(flows):

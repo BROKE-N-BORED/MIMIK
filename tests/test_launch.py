@@ -1,8 +1,12 @@
 """Tests for mimik.launch — file-type detection, command building,
-archive extraction, ISO mount selection. No real mounts or execs."""
+archive extraction, ISO mount selection. No real mounts. LaunchCheckedTests
+run real short-lived `sys.executable -c` children."""
+import glob
+import io
 import os
 import stat
 import sys
+import tarfile
 import tempfile
 import unittest
 import zipfile
@@ -126,6 +130,75 @@ class ArchiveTests(unittest.TestCase):
         with self.assertRaises(launch.LaunchError):
             launch.extract_archive(zpath, os.path.join(self.tmp, "out2"))
 
+    def _make_sized_zip(self, name, sizes):
+        zpath = os.path.join(self.tmp, name)
+        with zipfile.ZipFile(zpath, "w") as zf:
+            for i, size in enumerate(sizes):
+                zf.writestr(f"file{i}.bin", b"x" * size)
+        return zpath
+
+    def test_extract_refuses_over_byte_cap(self):
+        zpath = self._make_sized_zip("big.zip", [100, 100])
+        dest = os.path.join(self.tmp, "out-big")
+        with self.assertRaises(launch.LaunchError) as ctx:
+            launch.extract_archive(zpath, dest, max_bytes=150)
+        self.assertIn("cap", str(ctx.exception))
+        self.assertFalse(os.path.exists(dest))
+
+    def test_extract_refuses_over_file_cap(self):
+        zpath = self._make_sized_zip("many.zip", [10, 10, 10])
+        dest = os.path.join(self.tmp, "out-many")
+        with self.assertRaises(launch.LaunchError) as ctx:
+            launch.extract_archive(zpath, dest, max_files=2)
+        self.assertIn("cap", str(ctx.exception))
+        self.assertFalse(os.path.exists(dest))
+
+    def test_extract_tar_refuses_over_byte_cap(self):
+        tpath = os.path.join(self.tmp, "big.tar")
+        with tarfile.open(tpath, "w") as tf:
+            for i in range(2):
+                info = tarfile.TarInfo(f"file{i}.bin")
+                data = b"x" * 100
+                info.size = len(data)
+                tf.addfile(info, io.BytesIO(data))
+        dest = os.path.join(self.tmp, "out-tar")
+        with self.assertRaises(launch.LaunchError) as ctx:
+            launch.extract_archive(tpath, dest, max_bytes=150)
+        self.assertIn("cap", str(ctx.exception))
+        self.assertFalse(os.path.exists(dest))
+
+    def test_extract_refusal_leaves_preexisting_dest(self):
+        zpath = self._make_sized_zip("big2.zip", [100, 100])
+        dest = os.path.join(self.tmp, "out-existing")
+        os.makedirs(dest)
+        marker = os.path.join(dest, "keep.txt")
+        with open(marker, "w") as fh:
+            fh.write("previous extraction")
+        with self.assertRaises(launch.LaunchError):
+            launch.extract_archive(zpath, dest, max_bytes=150)
+        self.assertTrue(os.path.exists(marker))
+
+    def test_extract_running_total_measures_disk(self):
+        # The running total comes from the disk, not the header: if a
+        # member lands bigger than its header claims, extraction stops
+        # even though the pre-check passed. (zipfile/tarfile enforce
+        # header sizes on read, so this is belt-and-braces — but the
+        # guard must actually measure the disk when it runs.)
+        zpath = self._make_sized_zip("disk.zip", [10, 10])
+        dest = os.path.join(self.tmp, "out-disk")
+        real_getsize = os.path.getsize
+
+        def lying_getsize(path):
+            if str(path).startswith(dest):
+                return 1000  # landed far bigger than the header says
+            return real_getsize(path)
+
+        with mock.patch("os.path.getsize", lying_getsize):
+            with self.assertRaises(launch.LaunchError) as ctx:
+                launch.extract_archive(zpath, dest, max_bytes=150)
+        self.assertIn("cap", str(ctx.exception))
+        self.assertFalse(os.path.exists(dest))
+
     def test_prepare_archive_autopicks_executable(self):
         plan = launch.prepare_file(self._make_zip())
         self.assertEqual(plan.kind, "archive")
@@ -154,9 +227,10 @@ class ArchiveTests(unittest.TestCase):
     def test_launch_process_uses_proxy_env(self):
         plan = launch.LaunchPlan("elf", "/tmp/x", command=["/bin/true"])
         fake_proc = mock.Mock()
+        fake_proc.poll.return_value = None  # still running at the check
         with mock.patch("subprocess.Popen",
                         return_value=fake_proc) as popen:
-            launch.launch_process(plan)
+            launch.launch_process(plan, settle=0)
         env = popen.call_args[1]["env"]
         self.assertEqual(env["http_proxy"], "http://127.0.0.1:8080")
         self.assertEqual(env["no_proxy"], "localhost,127.0.0.1")
@@ -236,6 +310,23 @@ class MountTests(unittest.TestCase):
                 m2.mount()
             self.assertIn("Disk Image Mounter", str(ctx.exception))
 
+    def test_mount_failure_releases_loop_device(self):
+        calls = []
+
+        def runner(cmd, **kw):
+            calls.append(cmd)
+            if "loop-setup" in cmd:
+                return mock.Mock(stdout="Mapped file as /dev/loop7.\n",
+                                 stderr="")
+            return mock.Mock(stdout="", stderr="")  # mount fails
+
+        m = launch.Mount("/tmp/disk.iso", method="udisksctl", runner=runner)
+        with self.assertRaises(launch.LaunchError):
+            m.mount()
+        self.assertIn([ "udisksctl", "loop-delete", "-b", "/dev/loop7"],
+                      calls)
+        self.assertIsNone(m.loopdev)
+
     def test_iso_requires_pick_with_several(self):
         m = mock.Mock()
         m.mount.return_value = "/mnt/iso"
@@ -252,6 +343,82 @@ class MountTests(unittest.TestCase):
         self.assertTrue(plan.needs_pick)
         self.assertIsNone(plan.command)
         self.assertEqual(len(plan.candidates), 2)
+
+
+class PrepareOnceTests(unittest.TestCase):
+    def _mocked_iso_plan(self):
+        """An ISO plan that needs a pick, with a fake Mount (no real
+        mount in the sandbox). Returns (plan, mount_mock, mount_calls)."""
+        m = mock.Mock()
+        m.mount.return_value = "/mnt/iso"
+        calls = []
+
+        def mount_cls(*args, **kwargs):
+            calls.append(args)
+            return m
+
+        with mock.patch.object(launch, "Mount",
+                               side_effect=mount_cls), \
+             mock.patch.object(launch, "find_executables",
+                               return_value=["/mnt/iso/a", "/mnt/iso/b"]):
+            with tempfile.NamedTemporaryFile(suffix=".iso",
+                                             delete=False) as f:
+                path = f.name
+            try:
+                plan = launch.prepare_file(path)
+            finally:
+                os.unlink(path)
+        return plan, m, calls
+
+    def test_pick_candidate_by_index(self):
+        plan, _m, _calls = self._mocked_iso_plan()
+        self.assertTrue(plan.needs_pick)
+        picked = launch.pick_candidate(plan, 2)
+        self.assertIs(picked, plan)
+        self.assertFalse(plan.needs_pick)
+        self.assertEqual(plan.command, ["/mnt/iso/b"])
+
+    def test_pick_candidate_by_name(self):
+        plan, _m, _calls = self._mocked_iso_plan()
+        launch.pick_candidate(plan, "/mnt/iso/a")
+        self.assertEqual(plan.command, ["/mnt/iso/a"])
+
+    def test_pick_candidate_out_of_range(self):
+        plan, _m, _calls = self._mocked_iso_plan()
+        with self.assertRaises(launch.LaunchError):
+            launch.pick_candidate(plan, 99)
+
+    def test_pick_candidate_does_not_remount(self):
+        plan, m, calls = self._mocked_iso_plan()
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(m.mount.call_count, 1)
+        launch.pick_candidate(plan, 1)
+        # Picking from the plan mounts nothing new.
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(m.mount.call_count, 1)
+
+    def test_plan_is_stale_after_unmount(self):
+        d = tempfile.mkdtemp()
+        mount = mock.Mock()
+        mount.mountpoint = None  # unmounted after a previous record
+        plan = launch.LaunchPlan("iso", "/tmp/disk.iso", mount=mount,
+                                 work_dir=d)
+        self.assertTrue(plan.is_stale)
+
+    def test_plan_is_stale_when_work_dir_deleted(self):
+        d = tempfile.mkdtemp()
+        plan = launch.LaunchPlan("archive", "/tmp/a.zip", work_dir=d)
+        self.assertFalse(plan.is_stale)
+        os.rmdir(d)
+        self.assertTrue(plan.is_stale)
+
+    def test_plan_not_stale_when_fresh(self):
+        d = tempfile.mkdtemp()
+        mount = mock.Mock()
+        mount.mountpoint = "/media/u/DISK"
+        plan = launch.LaunchPlan("iso", "/tmp/disk.iso", mount=mount,
+                                 work_dir=d)
+        self.assertFalse(plan.is_stale)
 
 
 class DebTests(unittest.TestCase):
@@ -272,6 +439,73 @@ class DebTests(unittest.TestCase):
         with mock.patch("shutil.which", return_value=None):
             with self.assertRaises(launch.LaunchError):
                 launch.extract_deb("/tmp/x.deb", "/tmp/out")
+
+
+class LaunchCheckedTests(unittest.TestCase):
+    """Item 16: a program that dies instantly is a failure with stderr."""
+
+    def _py(self, code):
+        return [sys.executable, "-c", code]
+
+    def _litter(self):
+        return glob.glob(os.path.join(tempfile.gettempdir(),
+                                      "mimik-launch-*.log"))
+
+    def test_instant_failure_reports_stderr(self):
+        before = self._litter()
+        with self.assertRaises(launch.LaunchError) as ctx:
+            launch.launch_checked(
+                self._py("import sys; print('boom line', file=sys.stderr); "
+                         "sys.exit(3)"),
+                settle=0.3, label="game.bin")
+        msg = str(ctx.exception)
+        self.assertIn("game.bin", msg)
+        self.assertIn("exit code 3", msg)
+        self.assertIn("boom line", msg)
+        self.assertNotIn("launched", msg)
+        self.assertEqual(self._litter(), before)
+
+    def test_stderr_shows_first_lines_only(self):
+        with self.assertRaises(launch.LaunchError) as ctx:
+            launch.launch_checked(
+                self._py("import sys; "
+                         "[print('line%d' % i, file=sys.stderr) "
+                         "for i in range(8)]; sys.exit(1)"),
+                settle=0.3)
+        msg = str(ctx.exception)
+        self.assertIn("line0", msg)
+        self.assertIn("line4", msg)
+        self.assertNotIn("line7", msg)
+
+    def test_no_stderr_says_so(self):
+        with self.assertRaises(launch.LaunchError) as ctx:
+            launch.launch_checked(self._py("import sys; sys.exit(7)"),
+                                  settle=0.3)
+        self.assertIn("exit code 7", str(ctx.exception))
+        self.assertIn("no error output", str(ctx.exception))
+
+    def test_running_child_returns_proc(self):
+        before = self._litter()
+        proc = launch.launch_checked(
+            self._py("import time; time.sleep(30)"), settle=0.2)
+        try:
+            self.assertIsNone(proc.poll())
+        finally:
+            launch.stop_process(proc)
+        self.assertEqual(self._litter(), before)
+
+    def test_exit_zero_counts_as_launched(self):
+        proc = launch.launch_checked(["/bin/true"], settle=0.2)
+        self.assertEqual(proc.poll(), 0)
+
+    def test_launch_process_reports_instant_failure(self):
+        plan = launch.LaunchPlan(
+            "elf", "/tmp/x",
+            command=self._py("import sys; print('missing lib', "
+                             "file=sys.stderr); sys.exit(1)"))
+        with self.assertRaises(launch.LaunchError) as ctx:
+            launch.launch_process(plan, settle=0.3)
+        self.assertIn("missing lib", str(ctx.exception))
 
 
 if __name__ == "__main__":

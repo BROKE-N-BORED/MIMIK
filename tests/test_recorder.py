@@ -61,6 +61,23 @@ class ProxySessionStartTests(unittest.TestCase):
             s._log_fh.close()
             s.proc = None
 
+    def test_start_writes_log_0600(self):
+        # Review #13: the mitmweb log holds the web-UI token — owner only.
+        with mock.patch.object(recorder, "mitmweb_cmd",
+                               return_value=["mitmweb"]), \
+             mock.patch.object(recorder.subprocess, "Popen") as popen, \
+             mock.patch.object(recorder, "Mitm") as mitm_cls:
+            proc = mock.Mock()
+            proc.poll.return_value = None
+            popen.return_value = proc
+            mitm_cls.return_value.flows.return_value = []
+            s = recorder.ProxySession()
+            self.assertTrue(s.start(timeout=5))
+            mode = stat.S_IMODE(os.stat(s.log_path).st_mode)
+            self.assertEqual(mode, 0o600)
+            s._log_fh.close()
+            s.proc = None
+
     def test_failed_start_kills_orphan(self):
         with mock.patch.object(recorder, "mitmweb_cmd",
                                return_value=["mitmweb"]), \

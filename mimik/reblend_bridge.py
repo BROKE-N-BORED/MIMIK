@@ -40,11 +40,12 @@ import importlib.util
 import json
 import os
 import shutil
-import subprocess
 import sys
 from datetime import datetime
 
 from . import assets as assets_mod
+from . import launch
+from . import log
 from . import store
 
 DEFAULT_SCALE = 100.0
@@ -59,7 +60,14 @@ AUDIO_NOTE = ("kept for the clone, not wired into a Reblend scene yet "
               "— Reblend has no audio support")
 FONT_NOTE = ("kept for the clone, not wired into a Reblend scene yet "
              "— Reblend has no font support")
+VIDEO_NOTE = ("kept for the clone, not wired into a Reblend scene yet "
+              "— Reblend has no video support")
+TEXTURE_NOTE = ("kept for the clone — convert to PNG to use it as a "
+                "Reblend texture (Reblend materials use procedural "
+                "textures, not DDS/KTX2 files)")
 GLTF_NOTE = "needs .glb — convert in Blender (File, Export, glTF 2.0)"
+FBX_DAE_NOTE = ("needs .glb — import in Blender (File, Import), then "
+                "Export glTF 2.0")
 IMAGE_MATERIAL_NOTE = ("color only — Reblend materials use procedural "
                        "textures, not image files")
 
@@ -226,7 +234,12 @@ def convert_model(asset_path, assets_dir, scale, le, used):
               "objects": [], "triangles": 0, "warnings": [], "error": None}
     try:
         objects, report = le.meshio.import_mesh(asset_path, scale=scale)
-    except (OSError, ValueError) as exc:
+    except Exception as exc:
+        # Any importer failure is a recorded failure, never an
+        # exception (review #20): a malformed .glb can raise
+        # struct.error, KeyError, or IndexError from the parse, not
+        # just OSError/ValueError — and build_pack calls this with no
+        # try of its own, so an escape would kill the whole pack.
         result["error"] = str(exc)
         return result
     result["triangles"] = report.get("triangles", 0)
@@ -351,7 +364,8 @@ def build_pack(host=None, group=None, group_name=None, reblend=None,
     seen_hashes = set()
     used_names = set()  # .mesh.json names claimed in this pack, so two
     # models can never land on the same asset file
-    counts = {"image": 0, "model": 0, "audio": 0, "font": 0, "other": 0}
+    counts = {"image": 0, "model": 0, "audio": 0, "font": 0,
+              "video": 0, "texture": 0, "other": 0}
     for entry in entries:
         digest = entry.get("sha256")
         if digest in seen_hashes:
@@ -378,12 +392,15 @@ def build_pack(host=None, group=None, group_name=None, reblend=None,
             if note:
                 mat["note"] = f"{IMAGE_MATERIAL_NOTE} ({note})"
             materials.append(mat)
-        elif kind == "model" and ext == ".gltf":
+        elif kind == "model" and ext in (".gltf", ".fbx", ".dae"):
+            # meshio can't import these — kept as originals with the
+            # Blender route, not a spurious conversion failure.
             dest = os.path.join(originals_out, _unique(originals_out, name))
             shutil.copyfile(src, dest)
+            note = GLTF_NOTE if ext == ".gltf" else FBX_DAE_NOTE
             converted.append({"name": name, "kind": kind, "ok": False,
                               "sha256": digest,
-                              "note": GLTF_NOTE,
+                              "note": note,
                               "original": f"originals/{os.path.basename(dest)}"})
         elif kind == "model":
             dest = os.path.join(originals_out, _unique(originals_out, name))
@@ -417,6 +434,20 @@ def build_pack(host=None, group=None, group_name=None, reblend=None,
             converted.append({"name": name, "kind": kind, "ok": False,
                               "sha256": digest,
                               "note": FONT_NOTE,
+                              "original": f"originals/{os.path.basename(dest)}"})
+        elif kind == "video":
+            dest = os.path.join(originals_out, _unique(originals_out, name))
+            shutil.copyfile(src, dest)
+            converted.append({"name": name, "kind": kind, "ok": False,
+                              "sha256": digest,
+                              "note": VIDEO_NOTE,
+                              "original": f"originals/{os.path.basename(dest)}"})
+        elif kind == "texture":
+            dest = os.path.join(originals_out, _unique(originals_out, name))
+            shutil.copyfile(src, dest)
+            converted.append({"name": name, "kind": kind, "ok": False,
+                              "sha256": digest,
+                              "note": TEXTURE_NOTE,
                               "original": f"originals/{os.path.basename(dest)}"})
         else:
             dest = os.path.join(originals_out, _unique(originals_out, name))
@@ -475,8 +506,8 @@ def build_pack(host=None, group=None, group_name=None, reblend=None,
                                 base=base)
         presets_mod.record_pattern_pack(pattern_presets_applied,
                                         scale=scale, base=base)
-    except Exception:
-        pass
+    except Exception as e:
+        log.log_error("reblend record_pack", e)
 
     return {
         "pack_dir": pack_dir,
@@ -530,7 +561,52 @@ def list_packs(base=None):
     return out
 
 
+def find_packs(name, base=None):
+    """[(pack_dir, pack.json dict)] whose dir name, app, or host
+    matches `name` — one app can have several packs (one per build)."""
+    out = []
+    for pdir, pack in list_packs(base):
+        if (os.path.basename(pdir) == name
+                or pack.get("app") == name
+                or pack.get("host") == name):
+            out.append((pdir, pack))
+    return out
+
+
+def delete_pack(pdir, base=None):
+    """Delete one built pack directory. Returns {"deleted": path or
+    None, "bytes_freed": n}; None when it doesn't exist or isn't inside
+    packs/. The source asset group is untouched — only the pack goes."""
+    base = base or store.data_dir()
+    pdir_root = os.path.abspath(packs_dir(base))
+    target = os.path.abspath(pdir)
+    if os.path.commonpath([target, pdir_root]) != pdir_root:
+        return {"deleted": None, "bytes_freed": 0}
+    if target == pdir_root or not os.path.isdir(target):
+        return {"deleted": None, "bytes_freed": 0}
+    freed = store.dir_size(target)
+    try:
+        shutil.rmtree(target)
+    except OSError:
+        return {"deleted": None, "bytes_freed": 0}
+    return {"deleted": target, "bytes_freed": freed}
+
+
 # ---- opening a pack in Reblend ---------------------------------------------------
+
+def _reblend_python(reblend_path):
+    """Reblend's own interpreter when it has one, else MIMIK's Python.
+
+    Reblend's install.sh builds a private .venv with PySide6 in it;
+    MIMIK's Python may lack Reblend's dependencies, so a launch under
+    it can die instantly on ModuleNotFoundError (review #14).
+    """
+    for cand in (os.path.join(reblend_path, ".venv", "bin", "python"),
+                 os.path.join(reblend_path, "venv", "bin", "python")):
+        if os.path.isfile(cand) and os.access(cand, os.X_OK):
+            return cand
+    return sys.executable
+
 
 def reblend_launch_args(reblend_path, scene_path):
     """argv to open a scene in Reblend, or None when it cannot launch.
@@ -544,19 +620,27 @@ def reblend_launch_args(reblend_path, scene_path):
     main_py = os.path.join(reblend_path, "main.py")
     if not os.path.isfile(main_py):
         return None
-    return [sys.executable, main_py, "--scene", scene_path]
+    return [_reblend_python(reblend_path), main_py,
+            "--scene", scene_path]
 
 
-def open_in_reblend(reblend_path, scene_path):
-    """Launch Reblend on a pack scene. Returns (ok, message)."""
+def open_in_reblend(reblend_path, scene_path,
+                    settle=launch.LAUNCH_SETTLE_SECONDS):
+    """Launch Reblend on a pack scene. Returns (ok, message).
+
+    The child is checked after `settle` seconds: a Reblend that dies
+    instantly comes back as a failure carrying its first stderr lines,
+    never as "opening the pack in Reblend".
+    """
     args = reblend_launch_args(reblend_path, scene_path)
     if args is None:
         return False, (
             "Reblend cannot be launched from here — open the pack folder "
             "and open the scene from Reblend's File menu instead")
     try:
-        subprocess.Popen(args, stdout=subprocess.DEVNULL,
-                         stderr=subprocess.DEVNULL, start_new_session=True)
+        launch.launch_checked(args, settle=settle, label="Reblend")
+    except launch.LaunchError as exc:
+        return False, str(exc)
     except OSError as exc:
         return False, f"could not launch Reblend: {exc}"
     return True, "opening the pack in Reblend"

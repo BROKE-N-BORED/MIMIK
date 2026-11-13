@@ -49,7 +49,7 @@ import re
 from datetime import datetime
 from urllib.parse import urlparse
 
-from . import assets, codegen, fingerprints, store
+from . import assets, codegen, extract, fingerprints, paths, store
 
 MAX_ENDPOINTS = 200
 MAX_ASSET_PATTERNS = 50
@@ -92,6 +92,36 @@ def preset_path(name, scope, base=None):
     return os.path.join(presets_dir(base), f"{scope}_{_safe_name(name)}.json")
 
 
+# The preset file format version (item 32f). Every preset saved by
+# this build stamps it; loads validate it (see _read_preset_file).
+PRESET_VERSION = 1
+
+
+def _read_preset_file(path):
+    """A preset file's dict, version-validated — or None.
+
+    Missing "version" migrates to 1 in memory (v0.1/v0.2 files
+    predate the field; their shape is v1). A version other than 1
+    reads as None — a newer MIMIK wrote it, and this one must not
+    misread it. Unreadable, unparsable, or non-dict files are None
+    too. The migration is in-memory only: a read never rewrites a
+    user's file — the next learn stamps the version on save."""
+    try:
+        with open(path) as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    version = data.get("version")
+    if version is None:
+        data["version"] = PRESET_VERSION
+        return data
+    if version != PRESET_VERSION:
+        return None
+    return data
+
+
 # ---- store / load ------------------------------------------------------------
 
 def load_preset(name, scope=None, base=None):
@@ -105,12 +135,8 @@ def load_preset(name, scope=None, base=None):
         path = preset_path(name, sc, base)
         if not os.path.isfile(path):
             continue
-        try:
-            with open(path) as fh:
-                data = json.load(fh)
-        except (OSError, ValueError):
-            continue
-        if isinstance(data, dict) and data.get("name") == name:
+        data = _read_preset_file(path)
+        if data is not None and data.get("name") == name:
             return data
     return None
 
@@ -119,7 +145,7 @@ def _save_preset(preset, base=None):
     base = base or store.data_dir()
     os.makedirs(presets_dir(base), exist_ok=True)
     path = preset_path(preset["name"], preset["scope"], base)
-    with open(path, "w") as fh:
+    with store.open_private(path, "w") as fh:
         json.dump(preset, fh, indent=2)
     return path
 
@@ -134,12 +160,8 @@ def list_presets(base=None):
     for name in sorted(os.listdir(pdir)):
         if not name.endswith(".json"):
             continue
-        try:
-            with open(os.path.join(pdir, name)) as fh:
-                data = json.load(fh)
-        except (OSError, ValueError):
-            continue
-        if isinstance(data, dict) and data.get("name") and data.get("scope"):
+        data = _read_preset_file(os.path.join(pdir, name))
+        if data is not None and data.get("name") and data.get("scope"):
             out.append(data)
     out.sort(key=lambda p: (p["name"].lower(), p["scope"]))
     return out
@@ -191,12 +213,8 @@ def load_pattern_preset(fid, base=None):
     path = pattern_preset_path(fid, base)
     if not os.path.isfile(path):
         return None
-    try:
-        with open(path) as fh:
-            data = json.load(fh)
-    except (OSError, ValueError):
-        return None
-    if isinstance(data, dict) and data.get("scope") == "pattern":
+    data = _read_preset_file(path)
+    if data is not None and data.get("scope") == "pattern":
         return data
     return None
 
@@ -205,7 +223,7 @@ def _save_pattern_preset(preset, base=None):
     base = base or store.data_dir()
     os.makedirs(patterns_dir(base), exist_ok=True)
     path = pattern_preset_path(preset["name"], base)
-    with open(path, "w") as fh:
+    with store.open_private(path, "w") as fh:
         json.dump(preset, fh, indent=2)
     return path
 
@@ -220,12 +238,8 @@ def list_pattern_presets(base=None):
     for name in sorted(os.listdir(pdir)):
         if not name.endswith(".json"):
             continue
-        try:
-            with open(os.path.join(pdir, name)) as fh:
-                data = json.load(fh)
-        except (OSError, ValueError):
-            continue
-        if isinstance(data, dict) and data.get("scope") == "pattern":
+        data = _read_preset_file(os.path.join(pdir, name))
+        if data is not None and data.get("scope") == "pattern":
             out.append(data)
     out.sort(key=lambda p: p["name"])
     return out
@@ -277,15 +291,6 @@ def _set_cookie_name(value):
     return [name] if _COOKIE_NAME_RE.match(name) else []
 
 
-def _header_pairs(flow, side):
-    part = flow.get(side) or {}
-    out = []
-    for pair in part.get("headers") or []:
-        if isinstance(pair, (list, tuple)) and len(pair) == 2:
-            out.append((str(pair[0]), pair[1] or ""))
-    return out
-
-
 def _auth_from_flows(flows):
     """Auth rules from request/response headers — NAMES ONLY."""
     headers = {}  # lower name -> original-case name
@@ -293,7 +298,7 @@ def _auth_from_flows(flows):
     token_eps = {}
     for f in flows:
         req = f.get("request") or {}
-        for name, value in _header_pairs(f, "request"):
+        for name, value in extract.flow_header_pairs(f, "request"):
             lname = name.lower()
             if lname == "cookie":
                 cookies.update(_cookie_names(str(value)))
@@ -303,11 +308,11 @@ def _auth_from_flows(flows):
                     scheme = _scheme_of(str(value))
                     if scheme:
                         schemes.add(scheme)
-        for name, value in _header_pairs(f, "response"):
+        for name, value in extract.flow_header_pairs(f, "response"):
             if name.lower() == "set-cookie":
                 cookies.update(_set_cookie_name(str(value)))
         method = (req.get("method") or "").upper()
-        path = codegen.generalize_path(req.get("path") or "")
+        path = paths.generalize_path(req.get("path") or "")
         if any(w in path.lower() for w in _AUTH_PATH_WORDS):
             key = f"{method} {path}"
             token_eps[key] = token_eps.get(key, 0) + 1
@@ -330,7 +335,7 @@ def _endpoints_from_flows(flows, now):
         method = (req.get("method") or "").upper()
         if not method:
             continue
-        path = codegen.generalize_path(req.get("path") or "")
+        path = paths.generalize_path(req.get("path") or "")
         key = (method, path)
         counts[key] = counts.get(key, 0) + 1
     out = [{"method": m, "path": p, "seen": n,
@@ -465,62 +470,30 @@ def _auth_is_empty(auth):
 
 # ---- learning ------------------------------------------------------------------
 
-def learn(name, base=None, packs=None):
-    """Learn (or refresh) the preset for a host or program group.
-
-    Reads saved flows + captured asset groups + the newest built pack,
-    merges the new rules into the existing preset if there is one, and
-    saves it. Returns (preset, path, created) or None when there is
-    nothing to learn from (no flows, no assets, no pack).
-    """
-    base = base or store.data_dir()
-    scope = assets.resolve_scope(name, base)
-    if "group_name" in scope:
-        scope_type, preset_name = "group", name
-        flows = []
-        entries = assets.list_assets(base, group_name=name)
-    elif "group" in scope:
-        scope_type = "group"
-        preset_name = name
-        for gdir, manifest in assets.list_asset_groups(base):
-            if os.path.basename(gdir) == name:
-                preset_name = manifest.get("group") or name
-                break
-        flows = []
-        entries = assets.list_assets(base, group=name)
-    else:
-        scope_type, preset_name = "host", name
-        flows = store.load_host(name, base)
-        entries = assets.list_assets(base, host=name)
-    if packs is None:
-        try:
-            from . import reblend_bridge
-
-            packs = reblend_bridge.list_packs(base)
-        except Exception:
-            packs = []
-    pack_block = _pack_block_for(preset_name, scope_type, packs)
+def _learn_from(scope_type, scope_name, flows, entries, packs, base):
+    """The body of learn() for already-resolved scope data."""
+    pack_block = _pack_block_for(scope_name, scope_type, packs)
     if not flows and not entries and not pack_block:
         return None
     now = _now_iso()
     new = {
-        "version": 1,
+        "version": PRESET_VERSION,
         "scope": scope_type,
-        "name": preset_name,
+        "name": scope_name,
         "learned_at": now,
         "auth": _auth_from_flows(flows),
         "endpoints": _endpoints_from_flows(flows, now),
         "asset_mapping": _asset_mapping_from_entries(entries),
         "pack": pack_block or {},
     }
-    existing = load_preset(preset_name, scope=scope_type, base=base)
+    existing = load_preset(scope_name, scope=scope_type, base=base)
     if existing is None:
         path = _save_preset(new, base)
         return new, path, True
     merged = {
-        "version": 1,
+        "version": PRESET_VERSION,
         "scope": scope_type,
-        "name": preset_name,
+        "name": scope_name,
         "learned_at": now,
         "auth": _merge_auth(existing.get("auth") or {}, new["auth"]),
         "endpoints": _merge_endpoints(existing.get("endpoints") or [],
@@ -531,6 +504,21 @@ def learn(name, base=None, packs=None):
     }
     path = _save_preset(merged, base)
     return merged, path, False
+
+
+def learn(name, base=None, packs=None):
+    """Learn (or refresh) the preset for a host or program group.
+
+    Reads saved flows + captured asset groups + the newest built pack,
+    merges the new rules into the existing preset if there is one, and
+    saves it. Returns (preset, path, created) or None when there is
+    nothing to learn from (no flows, no assets, no pack).
+    """
+    base = base or store.data_dir()
+    scope_type, scope_name, flows, entries = _scope_inputs(name, base)
+    if packs is None:
+        packs = _packs_for(base)
+    return _learn_from(scope_type, scope_name, flows, entries, packs, base)
 
 
 def _scope_inputs(name, base):
@@ -562,27 +550,22 @@ def _packs_for(base):
         return []
 
 
-def learn_patterns(name, base=None, packs=None):
-    """Learn (or refresh) the pattern presets an app's captures exhibit.
+def _scope_fingerprint(name, base):
+    """(scope_type, scope_name, flows, entries, found) for a host/group
+    name — one scope resolution, one flow load, one fingerprint pass,
+    shared by learn, learn_patterns, and match (review #21)."""
+    scope_type, scope_name, flows, entries = _scope_inputs(name, base)
+    found = fingerprints.fingerprint_loaded(
+        scope_type, scope_name, flows, entries, base)
+    return scope_type, scope_name, flows, entries, found
 
-    Fingerprints the scope's traffic + assets; for each matched
-    fingerprint, builds or merges a pattern preset from the same
-    captures the app preset learns from — but only the rules the
-    fingerprint evidences: the fingerprint-relevant auth, the
-    endpoint shapes that evidenced it, the CDN asset patterns (for
-    cdn-assets), and the pack scale. Plus provenance: which apps it
-    was learned from, which signals define it, and which code signals
-    were seen with it. Returns [(preset, created)] in fingerprint
-    order, or [] when nothing matched.
-    """
-    base = base or store.data_dir()
-    found = fingerprints.fingerprint_scope(name, base)
+
+def _learn_patterns_from(scope_type, scope_name, flows, entries, found,
+                         packs, base):
+    """The body of learn_patterns() for already-fingerprinted data."""
     matches = found["fingerprints"]
     if not matches:
         return []
-    scope_type, scope_name, flows, entries = _scope_inputs(name, base)
-    if packs is None:
-        packs = _packs_for(base)
     pack_block = _pack_block_for(scope_name, scope_type, packs)
     now = _now_iso()
     all_endpoints = {(e["method"], e["path"]): e
@@ -605,7 +588,7 @@ def learn_patterns(name, base=None, packs=None):
                     if fingerprints.is_cdn_pattern(x["pattern"])]
                    if fid == "cdn-assets" else [])
         new = {
-            "version": 1,
+            "version": PRESET_VERSION,
             "scope": "pattern",
             "name": fid,
             "display_name": m["name"],
@@ -628,7 +611,7 @@ def learn_patterns(name, base=None, packs=None):
         old_signals = ((existing.get("fingerprint") or {})
                        .get("signals") or [])
         merged = {
-            "version": 1,
+            "version": PRESET_VERSION,
             "scope": "pattern",
             "name": fid,
             "display_name": m["name"],
@@ -653,6 +636,48 @@ def learn_patterns(name, base=None, packs=None):
         _save_pattern_preset(merged, base)
         out.append((merged, False))
     return out
+
+
+def learn_patterns(name, base=None, packs=None):
+    """Learn (or refresh) the pattern presets an app's captures exhibit.
+
+    Fingerprints the scope's traffic + assets; for each matched
+    fingerprint, builds or merges a pattern preset from the same
+    captures the app preset learns from — but only the rules the
+    fingerprint evidences: the fingerprint-relevant auth, the
+    endpoint shapes that evidenced it, the CDN asset patterns (for
+    cdn-assets), and the pack scale. Plus provenance: which apps it
+    was learned from, which signals define it, and which code signals
+    were seen with it. Returns [(preset, created)] in fingerprint
+    order, or [] when nothing matched.
+    """
+    base = base or store.data_dir()
+    (scope_type, scope_name, flows, entries,
+     found) = _scope_fingerprint(name, base)
+    if packs is None:
+        packs = _packs_for(base)
+    return _learn_patterns_from(scope_type, scope_name, flows, entries,
+                                found, packs, base)
+
+
+def learn_all(name, base=None):
+    """Learn the app preset AND the pattern presets for a host/group,
+    and say which pattern presets match it — one scope resolution,
+    one flow load, one fingerprint pass (review #21). Returns
+    (app_result, pattern_results, matched_ids) where app_result is
+    learn()'s return and pattern_results is learn_patterns()'s.
+    matched_ids are the fingerprint ids with a saved pattern preset
+    after the learn (so newly learned patterns count)."""
+    base = base or store.data_dir()
+    (scope_type, scope_name, flows, entries,
+     found) = _scope_fingerprint(name, base)
+    packs = _packs_for(base)
+    app = _learn_from(scope_type, scope_name, flows, entries, packs, base)
+    patterns = _learn_patterns_from(scope_type, scope_name, flows, entries,
+                                    found, packs, base)
+    matched = [m["id"] for m in found["fingerprints"]
+               if load_pattern_preset(m["id"], base=base) is not None]
+    return app, patterns, matched
 
 
 def match(name, base=None):
@@ -780,7 +805,7 @@ def resolve_for_gen(host, flows=None, base=None):
             applied.append(f"pattern {p['name']}")
             pattern_ids.append(p["name"])
     effective = {
-        "version": 1,
+        "version": PRESET_VERSION,
         "scope": "host" if app is not None else "pattern",
         "name": host,
         "learned_at": (app or {}).get("learned_at", ""),
@@ -888,33 +913,106 @@ def set_auto_learn(enabled, base=None):
     return bool(enabled)
 
 
+def sample_offered(base=None):
+    """Whether the first-run sample offer has been shown (accepted or
+    declined). Default False — a fresh data dir hasn't seen it."""
+    return bool(_read_settings(base).get("sample_offered", False))
+
+
+def set_sample_offered(base=None):
+    """Mark the first-run sample offer as shown, so it never pops
+    again."""
+    base = base or store.data_dir()
+    settings = _read_settings(base)
+    settings["sample_offered"] = True
+    os.makedirs(base, exist_ok=True)
+    with open(_settings_path(base), "w") as fh:
+        json.dump(settings, fh, indent=2)
+    return True
+
+
+# ---- the capture-exclusion settings (item 26) -------------------------------
+
+def excluded_hosts(base=None):
+    """The capture-exclusion list. Defaults to
+    filters.DEFAULT_EXCLUDED until the user edits it (an explicitly
+    emptied list stays empty — only a missing key means defaults)."""
+    from . import filters
+
+    stored = _read_settings(base).get("excluded_hosts")
+    if stored is None:
+        return list(filters.DEFAULT_EXCLUDED)
+    return [str(h).strip().lower() for h in stored if str(h).strip()]
+
+
+def set_excluded_hosts(hosts, base=None):
+    """Replace the capture-exclusion list (normalized, deduped)."""
+    base = base or store.data_dir()
+    settings = _read_settings(base)
+    seen = []
+    for h in hosts:
+        h = str(h).strip().lower()
+        if h and h not in seen:
+            seen.append(h)
+    settings["excluded_hosts"] = seen
+    os.makedirs(base, exist_ok=True)
+    with open(_settings_path(base), "w") as fh:
+        json.dump(settings, fh, indent=2)
+    return seen
+
+
+def filtering_enabled(base=None):
+    """The "exclude telemetry + analytics hosts" toggle. Default ON."""
+    return bool(_read_settings(base).get("filtering_enabled", True))
+
+
+def set_filtering_enabled(enabled, base=None):
+    """Turn capture filtering on or off."""
+    base = base or store.data_dir()
+    settings = _read_settings(base)
+    settings["filtering_enabled"] = bool(enabled)
+    os.makedirs(base, exist_ok=True)
+    with open(_settings_path(base), "w") as fh:
+        json.dump(settings, fh, indent=2)
+    return bool(enabled)
+
+
 def after_record(hosts, base=None):
     """Record-stop preset handling for the hosts just captured.
 
     When auto-learn is on, refreshes each host's preset (app AND
-    pattern presets) from the saved captures. Returns
-    [(host, refreshed, has_preset)]. Never raises — preset learning
-    must never break a capture.
+    pattern presets) from the saved captures — one fingerprint pass
+    per host, shared by the learn and the match report (review #21).
+    When auto-learn is off, no learning happens, but the match report
+    still fingerprints once per host. Returns
+    [(host, refreshed, has_preset, matched_ids)]. Never raises —
+    preset learning must never break a capture.
     """
     out = []
     auto = auto_learn_enabled(base)
     for host in hosts:
         refreshed = False
+        matched = []
         if auto:
             try:
-                refreshed = learn(host, base=base) is not None
+                app, patterns, matched = learn_all(host, base=base)
+                refreshed = app is not None or bool(patterns)
             except Exception:
                 refreshed = False
+                matched = []
+        else:
             try:
-                patterns = learn_patterns(host, base=base)
-                refreshed = refreshed or bool(patterns)
+                _t, _n, _f, _e, found = _scope_fingerprint(host, base)
+                matched = [m["id"] for m in found["fingerprints"]
+                           if load_pattern_preset(m["id"], base=base)
+                           is not None]
             except Exception:
-                pass
+                matched = []
         try:
             has = load_preset(host, scope="host", base=base) is not None
         except Exception:
             has = False
-        out.append((host, refreshed, has))
+        out.append((host, refreshed, has, matched))
     return out
 
 

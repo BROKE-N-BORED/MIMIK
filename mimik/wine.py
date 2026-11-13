@@ -186,6 +186,13 @@ def load_proxy_state(path=None):
         return None
 
 
+def has_saved_state(path=None):
+    """True if a pre-capture proxy state is saved — i.e. a capture ended
+    without restoring the prefix (a crash, or the window closed
+    mid-record before v0.3)."""
+    return load_proxy_state(path) is not None
+
+
 # ---- applying ---------------------------------------------------------------
 
 def regedit_command(reg_path, prefix=None):
@@ -251,11 +258,16 @@ def install_ca(ca_path=None, prefix=None, runner=None):
 def apply_proxy(prefix=None, runner=None):
     """Save current proxy state, then point the prefix at MIMIK's proxy.
 
+    The saved state is the ORIGINAL pre-capture state: if a state is
+    already saved (a previous capture never restored it), it is NOT
+    overwritten — saving again would record the proxy-on settings as
+    "original", and the prefix could never be restored to what it was.
+
     Returns the list of argv commands that were (or will be) run, for display.
     """
     prefix = prefix or wine_prefix()
-    state = read_proxy_state(prefix)
-    save_proxy_state(state)
+    if load_proxy_state() is None:
+        save_proxy_state(read_proxy_state(prefix))
     cmds = [regedit_command("<proxy.reg>", prefix)]
     apply_reg_text(build_proxy_reg(), prefix, runner=runner)
     return cmds

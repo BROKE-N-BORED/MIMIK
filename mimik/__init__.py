@@ -12,4 +12,4 @@ MIMIK replays YOUR session, for YOUR apps and YOUR accounts.
 from .session import App, Session
 
 __all__ = ["Session", "App"]
-__version__ = "0.2.0"
+__version__ = "0.3.0"

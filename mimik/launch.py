@@ -19,9 +19,26 @@ import shutil
 import subprocess
 import sys
 import tarfile
+import tempfile
+import time
 import zipfile
 
+from . import log
+
 PROXY_URL = "http://127.0.0.1:8080"
+
+# How long a launched program gets to prove it stays up. An instant
+# failure (missing library, bad interpreter, missing dependency)
+# exits in milliseconds; a real program is still running at 1 s.
+LAUNCH_SETTLE_SECONDS = 1.0
+
+# How many of the child's first stderr lines a launch failure shows.
+_STDERR_HEAD_LINES = 5
+
+# Extraction guards (review #19): a hostile or corrupt archive must not
+# expand until the disk fills.
+MAX_EXTRACT_BYTES = 2 * 1024 * 1024 * 1024   # 2 GiB total, all members
+MAX_EXTRACT_FILES = 50000                    # file members, dirs excluded
 
 WINLINX_MESSAGE = (
     "Windows programs are WinLinx's job — run it there.\n"
@@ -124,18 +141,90 @@ def _safe_members(names):
             raise LaunchError(f"unsafe path inside archive: {name!r}")
 
 
-def extract_archive(path, dest):
-    """Extract a zip/tar archive to dest (path-traversal safe). Returns dest."""
+def _check_extract_caps(n_files, total_bytes, max_bytes, max_files):
+    """Refuse an archive over the extraction caps (review #19)."""
+    if n_files > max_files:
+        raise LaunchError(
+            f"archive holds {n_files} files — over the "
+            f"{max_files}-file extraction cap, refused")
+    if total_bytes > max_bytes:
+        raise LaunchError(
+            f"archive expands to {total_bytes // (1024 * 1024)} MB — "
+            f"over the {max_bytes // (1024 * 1024)} MB extraction cap, "
+            "refused")
+
+
+def _extract_zip(path, dest, max_bytes, max_files):
+    with zipfile.ZipFile(path) as zf:
+        _safe_members(zf.namelist())
+        members = [i for i in zf.infolist() if not i.is_dir()]
+        _check_extract_caps(
+            len(members), sum(i.file_size for i in members),
+            max_bytes, max_files)
+        written = 0
+        for info in members:
+            zf.extract(info, dest)
+            # Measure what actually landed — headers can lie, so the
+            # running total comes from the disk, not the header.
+            try:
+                written += os.path.getsize(
+                    os.path.join(dest, info.filename))
+            except OSError:
+                written += info.file_size
+            if written > max_bytes:
+                raise LaunchError(
+                    f"archive expands past the "
+                    f"{max_bytes // (1024 * 1024)} MB extraction cap — "
+                    "refused, nothing extracted")
+
+
+def _extract_tar(path, dest, max_bytes, max_files):
+    with tarfile.open(path) as tf:
+        _safe_members(tf.getnames())
+        members = tf.getmembers()
+        files = [m for m in members if m.isfile()]
+        _check_extract_caps(
+            len(files), sum(m.size for m in files),
+            max_bytes, max_files)
+        written = 0
+        for member in members:
+            tf.extract(member, dest, filter="data")
+            if member.isfile():
+                try:
+                    written += os.path.getsize(
+                        os.path.join(dest, member.name))
+                except OSError:
+                    written += member.size
+                if written > max_bytes:
+                    raise LaunchError(
+                        f"archive expands past the "
+                        f"{max_bytes // (1024 * 1024)} MB extraction cap "
+                        "— refused, nothing extracted")
+
+
+def extract_archive(path, dest, max_bytes=MAX_EXTRACT_BYTES,
+                    max_files=MAX_EXTRACT_FILES):
+    """Extract a zip/tar archive to dest (path-traversal safe). Returns dest.
+
+    Size-guarded (review #19): the total uncompressed size and file
+    count are checked against the caps before anything is written, and
+    the bytes are measured again as each member lands (headers can
+    lie). Over the cap, nothing is left behind — a partial extraction
+    into a fresh dest is removed — and a LaunchError says which cap
+    tripped. A dest that already existed is never removed.
+    """
+    created = not os.path.exists(dest)
     os.makedirs(dest, exist_ok=True)
     lower = path.lower()
-    if lower.endswith(".zip"):
-        with zipfile.ZipFile(path) as zf:
-            _safe_members(zf.namelist())
-            zf.extractall(dest)
-    else:
-        with tarfile.open(path) as tf:
-            _safe_members(tf.getnames())
-            tf.extractall(dest, filter="data")
+    try:
+        if lower.endswith(".zip"):
+            _extract_zip(path, dest, max_bytes, max_files)
+        else:
+            _extract_tar(path, dest, max_bytes, max_files)
+    except BaseException:
+        if created:
+            shutil.rmtree(dest, ignore_errors=True)
+        raise
     return dest
 
 
@@ -248,6 +337,15 @@ class Mount:
             )
             m = re.search(r"at\s+(\S+)", r.stdout or "")
             if not m:
+                # The loop device is already set up — release it before
+                # raising, or it leaks (nothing else knows about it).
+                try:
+                    self.runner(
+                        ["udisksctl", "loop-delete", "-b", self.loopdev],
+                        capture_output=True, text=True)
+                except Exception as e:
+                    log.log_error("launch loop-delete", e)
+                self.loopdev = None
                 raise LaunchError(
                     "udisksctl mount failed: "
                     f"{(r.stdout or '') + (r.stderr or '')}"
@@ -288,8 +386,8 @@ class Mount:
             elif self.method == "gio":
                 self.runner(["gio", "mount", "-u", f"archive://{self.image}"],
                             capture_output=True, text=True)
-        except Exception:
-            pass
+        except Exception as e:
+            log.log_error("launch unmount", e)
         self.mountpoint = None
         self.loopdev = None
 
@@ -320,6 +418,17 @@ class LaunchPlan:
             return " ".join(_shell_quote(a) for a in self.command)
         return "(pick a program first)"
 
+    @property
+    def is_stale(self):
+        """True when the plan's files are gone — the image was unmounted
+        after a previous record, or the extraction dir was deleted — so
+        prepare_file must run again before launching."""
+        if self.mount is not None and self.mount.mountpoint is None:
+            return True
+        if self.work_dir and not os.path.isdir(self.work_dir):
+            return True
+        return False
+
 
 def _shell_quote(arg):
     return arg if re.fullmatch(r"[A-Za-z0-9_@%+=:,./-]+", arg) else f"'{arg}'"
@@ -341,7 +450,9 @@ def prepare_file(path, pick=None, deb_install=False):
     pick: for archives/ISOs with several candidates, the chosen executable
     (full path or 1-based index into the candidate list). Returns a
     LaunchPlan; when needs_pick is True the caller must ask the user and
-    call prepare_file again with pick=..., or set plan.command via pick_candidate.
+    pick from the plan's candidates with pick_candidate(plan, pick) —
+    never call prepare_file again for the same file (that would
+    re-extract the archive or re-mount the ISO and leak the first mount).
     """
     if not os.path.exists(path):
         raise LaunchError(f"no such file: {path}")
@@ -426,19 +537,103 @@ def _resolve_pick(cands, pick):
     raise LaunchError(f"{pick!r} is not one of the programs found")
 
 
-def launch_process(plan, proxy=PROXY_URL):
-    """Start the planned program with proxy env. Returns the Popen object."""
+def pick_candidate(plan, pick):
+    """Pick a program from an ALREADY-PREPARED plan's candidates — no
+    re-extraction, no re-mount. Sets plan.command, clears needs_pick.
+    Returns the plan."""
+    exe = _resolve_pick(plan.candidates, pick)
+    plan.command = build_launch_command(exe)
+    plan.needs_pick = False
+    return plan
+
+
+def _stderr_head(path, lines=_STDERR_HEAD_LINES):
+    """First `lines` lines of a stderr file, or "" when unreadable."""
+    try:
+        with open(path, errors="replace") as fh:
+            out = []
+            for _ in range(lines):
+                line = fh.readline()
+                if not line:
+                    break
+                out.append(line.rstrip("\n"))
+            return "\n".join(out)
+    except OSError:
+        return ""
+
+
+def launch_checked(argv, *, env=None, cwd=None,
+                   settle=LAUNCH_SETTLE_SECONDS, label="the program"):
+    """Start a child process and check it stays up. Returns the Popen object.
+
+    stderr goes to a temp file — never a pipe, which nobody reads and
+    would block the child once it fills. After `settle` seconds the
+    child is polled: if it exited with an error, LaunchError names the
+    exit code and carries its first stderr lines, so a failure is never
+    reported as a launch (review #14). An exit code of 0 counts as
+    launched — some launchers fork and exit 0 once the real program is
+    running. If it is still running (or exited 0), the temp file is
+    unlinked (the child's own fd stays valid) and the Popen object is
+    returned.
+    """
+    fd, path = tempfile.mkstemp(prefix="mimik-launch-", suffix=".log")
+    try:
+        proc = subprocess.Popen(argv, env=env, cwd=cwd,
+                                stdout=subprocess.DEVNULL,
+                                stderr=fd, start_new_session=True)
+    except BaseException:
+        os.close(fd)
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+        raise
+    os.close(fd)  # our copy; the child's dup stays open
+    try:
+        time.sleep(settle)
+        rc = proc.poll()
+    except BaseException:
+        # Interrupted during the settle window — don't orphan the child.
+        stop_process(proc)
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+        raise
+    if rc:
+        head = _stderr_head(path)
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+        detail = f" (exit code {rc})"
+        if head:
+            detail += f":\n{head}"
+        else:
+            detail += " with no error output"
+        raise LaunchError(f"{label} exited right away{detail}")
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+    return proc
+
+
+def launch_process(plan, proxy=PROXY_URL, settle=LAUNCH_SETTLE_SECONDS):
+    """Start the planned program with proxy env. Returns the Popen object.
+
+    Raises LaunchError when the program exits with an error within
+    `settle` seconds, with its first stderr lines — a program that
+    dies instantly is reported as failed, never as launched.
+    """
     if plan.install_command:
         subprocess.run(plan.install_command, check=True)
     if not plan.command:
         raise LaunchError("no program chosen yet — pick one first")
     env = dict(os.environ)
     env.update(proxy_env(proxy))
-    return subprocess.Popen(plan.command, env=env,
-                            cwd=plan.work_dir or None,
-                            stdout=subprocess.DEVNULL,
-                            stderr=subprocess.DEVNULL,
-                            start_new_session=True)
+    return launch_checked(plan.command, env=env, cwd=plan.work_dir or None,
+                          settle=settle, label=plan.command_display)
 
 
 def stop_process(proc):
@@ -452,8 +647,8 @@ def stop_process(proc):
                 proc.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 proc.kill()
-    except Exception:
-        pass
+    except Exception as e:
+        log.log_error("launch stop_process", e)
 
 
 def clear_runs():

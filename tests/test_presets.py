@@ -3,6 +3,7 @@ import argparse
 import io
 import json
 import os
+import stat
 import sys
 import tempfile
 import unittest
@@ -12,7 +13,7 @@ from unittest import mock
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, os.path.dirname(__file__))  # for test_assets helpers
 
-from mimik import assets, cli, codegen, presets, reblend_bridge, store
+from mimik import assets, cli, codegen, paths, presets, reblend_bridge, store
 from mimik.sources import mitm as mitm_mod
 from test_assets import read_t9, saved_flow
 from test_reblend_bridge import seed_game_assets
@@ -23,9 +24,9 @@ REBLEND_T9 = os.environ.get(
                  "reblend-v02-t9-build", "reblend"))
 HAS_REBLEND = reblend_bridge._is_reblend_dir(REBLEND_T9)
 
-TOKEN = "SECRET-BEARER-TOKEN-abc123"
-COOKIE_VALUE = "session-secret-xyz"
-API_KEY = "sk-live-987654321"
+TOKEN = "fake-bearer-token-for-tests"
+COOKIE_VALUE = "fake-session-cookie-for-tests"
+API_KEY = "fake-api-key-for-tests"
 DEVICE_VALUE = "dev-999"
 
 HOST = "game.example.com"
@@ -79,33 +80,33 @@ class _NoMitm:
 
 class GeneralizeTests(unittest.TestCase):
     def test_numeric_segments_generalize(self):
-        self.assertEqual(codegen.generalize_path("/api/users/123"),
+        self.assertEqual(paths.generalize_path("/api/users/123"),
                          "/api/users/{id}")
-        self.assertEqual(codegen.generalize_path("/api/users/456"),
+        self.assertEqual(paths.generalize_path("/api/users/456"),
                          "/api/users/{id}")
 
     def test_uuid_and_long_hex_generalize(self):
         self.assertEqual(
-            codegen.generalize_path(
+            paths.generalize_path(
                 "/v1/posts/550e8400-e29b-41d4-a716-446655440000"),
             "/v1/posts/{id}")
         self.assertEqual(
-            codegen.generalize_path("/dl/9f2c4e77a1b8c3d4e5f6a7b8"),
+            paths.generalize_path("/dl/9f2c4e77a1b8c3d4e5f6a7b8"),
             "/dl/{id}")
 
     def test_literals_stay(self):
-        self.assertEqual(codegen.generalize_path("/api/users/profile"),
+        self.assertEqual(paths.generalize_path("/api/users/profile"),
                          "/api/users/profile")
-        self.assertEqual(codegen.generalize_path("/v1/rec"),
+        self.assertEqual(paths.generalize_path("/v1/rec"),
                          "/v1/rec")
 
     def test_braced_segments_stay(self):
         self.assertEqual(
-            codegen.generalize_path("/v1/users/{user_id}"),
+            paths.generalize_path("/v1/users/{user_id}"),
             "/v1/users/{user_id}")
 
     def test_query_is_dropped(self):
-        self.assertEqual(codegen.generalize_path("/api/users/123?x=1"),
+        self.assertEqual(paths.generalize_path("/api/users/123?x=1"),
                          "/api/users/{id}")
 
 
@@ -311,9 +312,12 @@ class CodegenPresetTests(unittest.TestCase):
         self.assertEqual(plain, explicit_none)
         self.assertNotIn("preset", plain.lower())
         self.assertNotIn("AUTH_HEADERS", plain)
-        # Without a preset the two concrete ids stay two methods.
-        self.assertIn("def get_users_by_user_id(", plain)
-        self.assertIn("def get_users_by_user_id_2(", plain)
+        # Generalization is the default now, preset or not: the two
+        # concrete ids collapse to ONE generalized method, exactly as
+        # they do with a preset — the preset only adds the auth block.
+        self.assertEqual(plain.count("def get_users_by_id("), 1)
+        self.assertNotIn("get_users_by_id_2", plain)
+        self.assertIn('"/api/users/{id}"', plain)
 
     def test_preset_without_auth_adds_no_auth_block(self):
         preset = self._preset()
@@ -587,7 +591,7 @@ class AfterRecordTests(unittest.TestCase):
         store.save_flows([auth_flow("f2", HOST, "/api/new-thing")],
                          base=self.tmp)
         rows = presets.after_record([HOST], base=self.tmp)
-        self.assertEqual(rows, [(HOST, False, True)])
+        self.assertEqual(rows, [(HOST, False, True, [])])
         preset = presets.load_preset(HOST, scope="host")
         paths = {e["path"] for e in preset["endpoints"]}
         self.assertNotIn("/api/new-thing", paths)
@@ -597,7 +601,7 @@ class AfterRecordTests(unittest.TestCase):
         store.save_flows([auth_flow("f1", HOST, "/api/users/123")],
                          base=self.tmp)
         rows = presets.after_record([HOST], base=self.tmp)
-        self.assertEqual(rows, [(HOST, True, True)])
+        self.assertEqual(rows, [(HOST, True, True, [])])
         preset = presets.load_preset(HOST, scope="host")
         paths = {e["path"] for e in preset["endpoints"]}
         self.assertIn("/api/users/{id}", paths)
@@ -614,6 +618,78 @@ class AfterRecordTests(unittest.TestCase):
         out, code = run_cmd(cli._record_stop_summary, [(HOST, 3)])
         self.assertIn(f"Preset refreshed for {HOST}.", out)
         self.assertIn(f"Used the saved preset for {HOST}.", out)
+
+
+class PrivatePermsTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+
+    def test_preset_files_written_0600(self):
+        # Review #13: preset files hold auth shapes — owner only.
+        path = presets._save_preset(
+            {"name": "api.example.com", "scope": "host", "auth": {}},
+            base=self.tmp)
+        self.assertEqual(stat.S_IMODE(os.stat(path).st_mode), 0o600)
+        path = presets._save_pattern_preset(
+            {"name": "sign-in", "scope": "pattern"}, base=self.tmp)
+        self.assertEqual(stat.S_IMODE(os.stat(path).st_mode), 0o600)
+
+
+class PresetVersionTests(unittest.TestCase):
+    """Item 32f: preset files carry a version — loads validate it."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        os.environ["MIMIK_DATA_DIR"] = self.tmp
+        self.orig_dir = os.getcwd()
+        os.chdir(self.tmp)
+
+    def tearDown(self):
+        os.chdir(self.orig_dir)
+        del os.environ["MIMIK_DATA_DIR"]
+
+    def _write_preset(self, name, data, scope="host"):
+        path = presets.preset_path(name, scope, self.tmp)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as fh:
+            json.dump(data, fh)
+        return path
+
+    def test_missing_version_migrates_to_1(self):
+        # A v0.1/v0.2 file predates the field — it loads as v1.
+        self._write_preset(HOST, {"name": HOST, "scope": "host",
+                                  "endpoints": []})
+        preset = presets.load_preset(HOST, base=self.tmp)
+        self.assertIsNotNone(preset)
+        self.assertEqual(preset["version"], presets.PRESET_VERSION)
+
+    def test_future_version_is_refused(self):
+        self._write_preset(HOST, {"name": HOST, "scope": "host",
+                                  "version": 99, "endpoints": []})
+        self.assertIsNone(presets.load_preset(HOST, base=self.tmp))
+        self.assertEqual(presets.list_presets(base=self.tmp), [])
+
+    def test_bad_files_are_refused(self):
+        path = presets.preset_path(HOST, "host", self.tmp)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as fh:
+            fh.write("not json")
+        self.assertIsNone(presets.load_preset(HOST, base=self.tmp))
+        with open(path, "w") as fh:
+            json.dump(["not", "a", "dict"], fh)
+        self.assertIsNone(presets.load_preset(HOST, base=self.tmp))
+
+    def test_learned_preset_stamps_the_version(self):
+        self._save_auth_flows()
+        preset, _path, _created = presets.learn(HOST, base=self.tmp)
+        self.assertEqual(preset["version"], presets.PRESET_VERSION)
+
+    def _save_auth_flows(self):
+        store.save_flows([
+            auth_flow("f1", HOST, "/api/users/123"),
+            auth_flow("f2", HOST, "/api/auth/login", method="POST",
+                      status=200),
+        ], base=self.tmp)
 
 
 if __name__ == "__main__":

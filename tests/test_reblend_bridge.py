@@ -9,6 +9,7 @@ when no Reblend fixture is present.
 import base64
 import json
 import os
+import struct
 import sys
 import tempfile
 import types
@@ -193,6 +194,36 @@ class ConvertTests(unittest.TestCase):
         self.assertTrue(any("heavy" in w for w in result["warnings"]))
 
 
+class ConvertFailureTests(unittest.TestCase):
+    """convert_model with a fake light_engine — no Reblend fixture."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        os.environ["MIMIK_DATA_DIR"] = self.tmp
+
+    def tearDown(self):
+        del os.environ["MIMIK_DATA_DIR"]
+
+    def test_unexpected_import_error_is_a_recorded_failure(self):
+        # Review #20: a malformed .glb can raise struct.error /
+        # KeyError / IndexError from the importer — the contract is
+        # "a failed import is a recorded failure, never an exception".
+        for exc in (struct.error("bad chunk"),
+                    KeyError("chunk"), IndexError("chunk")):
+            fake_meshio = types.SimpleNamespace(
+                import_mesh=mock.Mock(side_effect=exc))
+            fake_le = types.SimpleNamespace(meshio=fake_meshio,
+                                            meshfile=None)
+            out = os.path.join(self.tmp, "assets")
+            os.makedirs(out, exist_ok=True)
+            result = reblend_bridge.convert_model(
+                os.path.join(self.tmp, "bad.glb"), out, 100.0, fake_le,
+                set())
+            self.assertFalse(result["ok"])
+            self.assertIsNotNone(result["error"])
+            self.assertEqual(result["objects"], [])
+
+
 class ColorTests(unittest.TestCase):
     def test_svg_falls_back_to_gray(self):
         color, note = reblend_bridge.average_color("x.svg")
@@ -280,6 +311,57 @@ class PackTests(unittest.TestCase):
         self.assertTrue(os.path.isfile(
             os.path.join(pack_dir, by_name["char.gltf"]["original"])))
 
+    def test_pack_with_malformed_model_completes(self):
+        # Review #20: an importer raising struct.error (not OSError /
+        # ValueError) must not escape build_pack — the model lands as
+        # a recorded failure and the pack still completes.
+        group = assets.AssetGroup("badgame", "traffic",
+                                  host="bad.example.com")
+        group.add_bytes(b"not a glb at all", "bad.glb", "model")
+        group.finish()
+        fake_meshio = types.SimpleNamespace(
+            import_mesh=mock.Mock(
+                side_effect=struct.error("bad chunk")))
+        fake_le = types.SimpleNamespace(meshio=fake_meshio,
+                                        meshfile=None,
+                                        version="fake-0.0")
+        with mock.patch.object(reblend_bridge, "load_light_engine",
+                               return_value=fake_le):
+            result = reblend_bridge.build_pack(host="bad.example.com",
+                                               reblend=REBLEND_T9)
+        self.assertEqual(result["models_converted"], 0)
+        by_name = {a["name"]: a for a in result["pack"]["assets"]}
+        self.assertFalse(by_name["bad.glb"]["ok"])
+        self.assertIsNotNone(by_name["bad.glb"]["error"])
+        self.assertTrue(os.path.isfile(
+            os.path.join(result["pack_dir"], "pack.json")))
+
+    def test_pack_keeps_new_kinds_as_originals(self):
+        # Item 24: video + texture + fbx/dae land in the pack as kept
+        # originals with honest notes — the pack still completes.
+        group = assets.AssetGroup("newkinds", "traffic",
+                                  host="newkinds.example.com")
+        group.add_bytes(b"ftyp-fake", "intro.mp4", "video")
+        group.add_bytes(b"DDS-fake", "diffuse.dds", "texture")
+        group.add_bytes(b"Kaydara-fake", "char.fbx", "model")
+        group.add_bytes(b"<?xml-fake", "level.dae", "model")
+        group.finish()
+        result = reblend_bridge.build_pack(host="newkinds.example.com",
+                                           reblend=REBLEND_T9)
+        self.assertEqual(result["counts"]["video"], 1)
+        self.assertEqual(result["counts"]["texture"], 1)
+        self.assertEqual(result["counts"]["model"], 2)
+        by_name = {a["name"]: a for a in result["pack"]["assets"]}
+        self.assertIn("no video support", by_name["intro.mp4"]["note"])
+        self.assertIn("convert to PNG", by_name["diffuse.dds"]["note"])
+        self.assertIn("needs .glb", by_name["char.fbx"]["note"])
+        self.assertIn("needs .glb", by_name["level.dae"]["note"])
+        for name in ("intro.mp4", "diffuse.dds", "char.fbx", "level.dae"):
+            self.assertTrue(os.path.isfile(
+                os.path.join(result["pack_dir"],
+                             by_name[name]["original"])),
+                name)
+
     def test_pack_without_reblend_keeps_originals(self):
         with mock.patch.object(reblend_bridge, "_AUTO_GLOBS", []):
             result = reblend_bridge.build_pack(host="game.example.com")
@@ -343,17 +425,93 @@ class LaunchArgsTests(unittest.TestCase):
         if not HAS_REBLEND:
             self.skipTest("no Reblend fixture")
         with mock.patch("subprocess.Popen") as popen:
+            popen.return_value.poll.return_value = None  # still running
             ok, msg = reblend_bridge.open_in_reblend(
-                REBLEND_T9, "/tmp/pack/game.json")
+                REBLEND_T9, "/tmp/pack/game.json", settle=0)
         self.assertTrue(ok)
         popen.assert_called_once()
         called = popen.call_args[0][0]
         self.assertEqual(called[-2:], ["--scene", "/tmp/pack/game.json"])
 
+    def test_args_prefers_reblend_venv_python(self):
+        # Review #14: Reblend's own .venv has its dependencies;
+        # MIMIK's Python may not.
+        tmp = tempfile.mkdtemp()
+        with open(os.path.join(tmp, "main.py"), "w") as fh:
+            fh.write("pass")
+        venv_py = os.path.join(tmp, ".venv", "bin", "python")
+        os.makedirs(os.path.dirname(venv_py))
+        with open(venv_py, "w") as fh:
+            fh.write("#!/bin/sh\n")
+        os.chmod(venv_py, 0o755)
+        args = reblend_bridge.reblend_launch_args(tmp, "/tmp/pack/x.json")
+        self.assertEqual(args[0], venv_py)
+
+    def test_open_in_reblend_reports_instant_failure(self):
+        tmp = tempfile.mkdtemp()
+        with open(os.path.join(tmp, "main.py"), "w") as fh:
+            fh.write("import sys; print('no PySide6 here', file=sys.stderr); "
+                     "sys.exit(1)")
+        ok, msg = reblend_bridge.open_in_reblend(
+            tmp, "/tmp/pack/x.json", settle=0.3)
+        self.assertFalse(ok)
+        self.assertIn("exit code 1", msg)
+        self.assertIn("no PySide6 here", msg)
+        self.assertNotIn("opening the pack", msg)
+
     def test_open_without_reblend_is_plain(self):
         ok, msg = reblend_bridge.open_in_reblend(None, "/tmp/x.json")
         self.assertFalse(ok)
         self.assertIn("File menu", msg)
+
+
+class DeletePackTests(unittest.TestCase):
+    """Item 5: find/delete packs."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        os.environ["MIMIK_DATA_DIR"] = self.tmp
+
+    def tearDown(self):
+        del os.environ["MIMIK_DATA_DIR"]
+
+    def _make_pack(self, name="game", host="game.example.com"):
+        pdir = os.path.join(reblend_bridge.packs_dir(),
+                            f"{name}_20260101-000000")
+        os.makedirs(pdir)
+        with open(os.path.join(pdir, "pack.json"), "w") as fh:
+            json.dump({"app": name, "host": host, "group": name,
+                       "built_at": "2026-01-01T00:00:00"}, fh)
+        with open(os.path.join(pdir, "scene.json"), "w") as fh:
+            fh.write("{}")
+        return pdir
+
+    def test_find_packs_by_app_host_and_dir(self):
+        pdir = self._make_pack()
+        self.assertEqual([p for p, _d in
+                          reblend_bridge.find_packs("game")], [pdir])
+        self.assertEqual([p for p, _d in reblend_bridge.find_packs(
+            "game.example.com")], [pdir])
+        self.assertEqual([p for p, _d in reblend_bridge.find_packs(
+            os.path.basename(pdir))], [pdir])
+        self.assertEqual(reblend_bridge.find_packs("nobody"), [])
+
+    def test_delete_pack_removes_dir(self):
+        pdir = self._make_pack()
+        result = reblend_bridge.delete_pack(pdir)
+        self.assertEqual(result["deleted"], pdir)
+        self.assertGreater(result["bytes_freed"], 0)
+        self.assertFalse(os.path.exists(pdir))
+        self.assertEqual(reblend_bridge.list_packs(), [])
+        again = reblend_bridge.delete_pack(pdir)
+        self.assertIsNone(again["deleted"])
+
+    def test_delete_pack_refuses_outside_paths(self):
+        self.assertIsNone(
+            reblend_bridge.delete_pack("/tmp")["deleted"])
+        self.assertIsNone(
+            reblend_bridge.delete_pack(
+                reblend_bridge.packs_dir())["deleted"])
 
 
 if __name__ == "__main__":

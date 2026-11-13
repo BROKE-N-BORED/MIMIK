@@ -166,6 +166,53 @@ class CommandTests(unittest.TestCase):
         reg_text = apply_mock.call_args[0][0]
         self.assertIn('"ProxyEnable"=dword:00000000', reg_text)
 
+    def test_double_apply_preserves_original_state(self):
+        # Review #3: a second apply must NOT overwrite the saved
+        # ORIGINAL state with the proxy-on settings — otherwise the
+        # prefix could never be restored to what it was.
+        prefix = tempfile.mkdtemp()
+        state_file = os.path.join(prefix, "state.json")
+        user_reg = os.path.join(prefix, "user.reg")
+        bs = chr(92)  # user.reg doubles every backslash
+        section = ("[Software" + bs * 2 + "Microsoft" + bs * 2 +
+                   "Windows" + bs * 2 + "CurrentVersion" + bs * 2 +
+                   "Internet Settings]" + chr(10))
+        original = ("10.0.0.1:3128", "<local>")
+        with open(user_reg, "w") as f:
+            f.write(section +
+                    '"ProxyEnable"=dword:00000001\n'
+                    f'"ProxyServer"="{original[0]}"\n'
+                    f'"ProxyOverride"="{original[1]}"\n')
+        with mock.patch.object(wine, "state_path",
+                               return_value=state_file), \
+             mock.patch.object(wine, "apply_reg_text"):
+            wine.apply_proxy(prefix, runner=mock.Mock())
+            # The first apply pointed the prefix at the proxy — the
+            # second apply now reads the proxy-on state.
+            with open(user_reg, "w") as f:
+                f.write(section +
+                        '"ProxyEnable"=dword:00000001\n'
+                        '"ProxyServer"="127.0.0.1:8080"\n'
+                        '"ProxyOverride"="localhost;127.0.0.1;<local>"\n')
+            wine.apply_proxy(prefix, runner=mock.Mock())
+        with open(state_file) as f:
+            saved = json.load(f)
+        self.assertEqual(saved["ProxyServer"], original[0])
+        self.assertEqual(saved["ProxyOverride"], original[1])
+        self.assertEqual(saved["ProxyEnable"], 1)
+
+    def test_has_saved_state(self):
+        prefix = tempfile.mkdtemp()
+        state_file = os.path.join(prefix, "state.json")
+        with mock.patch.object(wine, "state_path",
+                               return_value=state_file):
+            self.assertFalse(wine.has_saved_state())
+            wine.save_proxy_state({"ProxyEnable": None,
+                                   "ProxyServer": None,
+                                   "ProxyOverride": None},
+                                  path=state_file)
+            self.assertTrue(wine.has_saved_state())
+
 
 class ReadyTests(unittest.TestCase):
     def test_check_ready_no_wine(self):

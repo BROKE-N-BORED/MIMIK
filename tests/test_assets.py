@@ -7,6 +7,7 @@ import sys
 import tempfile
 import unittest
 import wave
+from unittest import mock
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
@@ -81,6 +82,24 @@ class DetectTests(unittest.TestCase):
             "audio")
         self.assertEqual(
             assets.detect_kind("https://x.com/f", "font/woff2"), "font")
+        self.assertEqual(
+            assets.detect_kind("https://x.com/v", "video/mp4"), "video")
+        self.assertEqual(
+            assets.detect_kind("https://x.com/t", "image/ktx2"),
+            "texture")
+
+    def test_new_kinds(self):
+        # Item 24: video, game textures, and extra model formats.
+        for url, kind in [
+                ("https://x.com/intro.mp4", "video"),
+                ("https://x.com/clip.webm", "video"),
+                ("https://x.com/diffuse.dds", "texture"),
+                ("https://x.com/normal.ktx2", "texture"),
+                ("https://x.com/char.fbx", "model"),
+                ("https://x.com/level.dae", "model")]:
+            self.assertEqual(assets.detect_kind(url), kind, url)
+        self.assertEqual(assets.KIND_LABELS["video"], "Video")
+        self.assertEqual(assets.KIND_LABELS["texture"], "Texture")
 
     def test_generic_octet_stream_is_not_an_asset(self):
         self.assertIsNone(
@@ -358,6 +377,31 @@ class ScanTests(unittest.TestCase):
         self.assertIsNone(gdir)
         self.assertIsNone(manifest)
 
+    def test_scan_keeps_new_kinds(self):
+        # Item 24: a file of each new kind is detected and kept.
+        files = {"intro.mp4": b"ftyp-fake",
+                 "clip.webm": b"\x1a\x45\xdf\xa3-fake",
+                 "diffuse.dds": b"DDS-fake",
+                 "normal.ktx2": b"\xabKTX 20-fake",
+                 "char.fbx": b"Kaydara-fake",
+                 "level.dae": b"<?xml-fake"}
+        for name, data in files.items():
+            with open(os.path.join(self.root, "data", name), "wb") as fh:
+                fh.write(data)
+        gdir, manifest = assets.scan_program_tree(self.root, "game")
+        by_name = {e["name"]: e for e in manifest["assets"]}
+        self.assertEqual(by_name["intro.mp4"]["kind"], "video")
+        self.assertEqual(by_name["clip.webm"]["kind"], "video")
+        self.assertEqual(by_name["diffuse.dds"]["kind"], "texture")
+        self.assertEqual(by_name["normal.ktx2"]["kind"], "texture")
+        self.assertEqual(by_name["char.fbx"]["kind"], "model")
+        self.assertEqual(by_name["level.dae"]["kind"], "model")
+        # Kept: the bytes are on disk in the group dir.
+        for name, data in files.items():
+            with open(os.path.join(gdir, by_name[name]["file"]),
+                      "rb") as fh:
+                self.assertEqual(fh.read(), data, name)
+
     def test_scan_skips_symlinks(self):
         outside = os.path.join(self.tmp, "outside.png")
         with open(outside, "wb") as fh:
@@ -366,6 +410,76 @@ class ScanTests(unittest.TestCase):
         gdir, manifest = assets.scan_program_tree(self.root, "game")
         names = {e["name"] for e in manifest["assets"]}
         self.assertNotIn("link.png", names)
+
+    def test_scan_respects_depth_cap(self):
+        deep = self.root
+        for i in range(5):
+            deep = os.path.join(deep, f"level{i}")
+        os.makedirs(deep)
+        with open(os.path.join(deep, "deep.png"), "wb") as fh:
+            fh.write(b"\x89PNG-deep")
+        gdir, manifest = assets.scan_program_tree(
+            self.root, "game", max_depth=2)
+        names = {e["name"] for e in manifest["assets"]}
+        self.assertNotIn("deep.png", names)
+        # The shallow assets (data/img/wall.png, data/models/tree.glb)
+        # still land — only the descent stops.
+        self.assertIn("wall.png", names)
+        self.assertIn("tree.glb", names)
+        self.assertIn("levels", manifest.get("scan_note", ""))
+
+    def test_scan_respects_file_count_cap(self):
+        flat = os.path.join(self.tmp, "flat")
+        os.makedirs(flat)
+        for i in range(10):
+            with open(os.path.join(flat, f"img{i:02d}.png"), "wb") as fh:
+                fh.write(b"\x89PNG-%d" % i)
+        gdir, manifest = assets.scan_program_tree(
+            flat, "flat", max_files=3)
+        self.assertEqual(len(manifest["assets"]), 3)
+        self.assertIn("3-file cap", manifest.get("scan_note", ""))
+
+    def test_scan_cancel_stops_early(self):
+        flat = os.path.join(self.tmp, "flat-cancel")
+        os.makedirs(flat)
+        for i in range(10):
+            with open(os.path.join(flat, f"img{i:02d}.png"), "wb") as fh:
+                fh.write(b"\x89PNG-%d" % i)
+        calls = []
+
+        def cancelled():
+            calls.append(1)
+            return len(calls) > 5
+
+        gdir, manifest = assets.scan_program_tree(
+            flat, "flat", cancelled=cancelled)
+        # The dirpath check is call 1; four files land before the
+        # sixth call trips the cancel.
+        self.assertEqual(len(manifest["assets"]), 4)
+        self.assertIn("cancelled", manifest.get("scan_note", ""))
+
+    def test_scan_skips_over_group_cap_without_reading(self):
+        big = os.path.join(self.root, "data", "img", "big.png")
+        with open(big, "wb") as fh:
+            fh.write(b"x" * 100)
+        real_open = open
+
+        def guarded_open(path, *args, **kwargs):
+            mode = args[0] if args else kwargs.get("mode", "")
+            if str(path) == big and "r" in mode:
+                raise AssertionError(
+                    "read a file the group cap should have skipped")
+            return real_open(path, *args, **kwargs)
+
+        with mock.patch("builtins.open", guarded_open):
+            gdir, manifest = assets.scan_program_tree(
+                self.root, "game", max_group_bytes=20)
+        skipped = {e["name"]: e for e in manifest["skipped"]}
+        self.assertIn("big.png", skipped)
+        self.assertIn("group would pass", skipped["big.png"]["reason"])
+        # Exactly one of the two 15-byte assets fits in the 20-byte
+        # group; the other is skipped the same way, also unread.
+        self.assertEqual(len(manifest["assets"]), 1)
 
 
 class RecorderHookTests(unittest.TestCase):
@@ -470,6 +584,93 @@ class ListingTests(unittest.TestCase):
     def test_list_empty_when_no_assets(self):
         self.assertEqual(assets.list_asset_groups(), [])
         self.assertEqual(assets.list_assets(), [])
+
+
+class DeleteGroupTests(unittest.TestCase):
+    """Item 5: find/delete asset groups."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        os.environ["MIMIK_DATA_DIR"] = self.tmp
+
+    def tearDown(self):
+        del os.environ["MIMIK_DATA_DIR"]
+
+    def _make_group(self, name="game.example.com"):
+        group = assets.AssetGroup(name, "traffic", host=name)
+        group.add_bytes(b"\x89PNG fake", "icon.png", "image")
+        return group.finish()
+
+    def test_find_groups_by_name(self):
+        gdir1, _m1 = self._make_group()
+        gdir2, _m2 = self._make_group()
+        found = assets.find_groups("game.example.com")
+        self.assertEqual({g for g, _m in found}, {gdir1, gdir2})
+        self.assertEqual(assets.find_groups("nobody"), [])
+
+    def test_delete_group_removes_dir(self):
+        gdir, _m = self._make_group()
+        result = assets.delete_group(gdir)
+        self.assertEqual(result["deleted"], gdir)
+        self.assertGreater(result["bytes_freed"], 0)
+        self.assertFalse(os.path.exists(gdir))
+        self.assertEqual(assets.list_asset_groups(), [])
+        again = assets.delete_group(gdir)
+        self.assertIsNone(again["deleted"])
+
+    def test_delete_group_refuses_outside_paths(self):
+        self.assertIsNone(
+            assets.delete_group("/tmp")["deleted"])
+        self.assertIsNone(
+            assets.delete_group(assets.assets_dir())["deleted"])
+
+
+class ModelInfoTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+
+    def test_obj_counts(self):
+        path = os.path.join(self.tmp, "cube.obj")
+        with open(path, "w") as fh:
+            fh.write("".join(f"v {i} 0 0\n" for i in range(8)))
+            fh.write("".join(f"f {i} {i + 1} {i + 2}\n" for i in range(6)))
+            fh.write("vn 0 1 0\n")  # normals must not count as vertices
+        info = assets.model_info(path)
+        self.assertIn("format: OBJ", info)
+        self.assertIn("vertices: 8", info)
+        self.assertIn("faces: 6", info)
+
+    def test_glb_meshes(self):
+        path = os.path.join(self.tmp, "crate.glb")
+        doc = json.dumps({
+            "asset": {"version": "2.0"},
+            "meshes": [{"primitives": [{}]},
+                       {"primitives": [{}, {}]}],
+        }).encode()
+        # Pad the JSON chunk to a 4-byte boundary (glTF requires it).
+        doc += b" " * (-len(doc) % 4)
+        total = 12 + 8 + len(doc)
+        with open(path, "wb") as fh:
+            fh.write(b"glTF" + (2).to_bytes(4, "little")
+                     + total.to_bytes(4, "little"))
+            fh.write(len(doc).to_bytes(4, "little") + b"JSON" + doc)
+        info = assets.model_info(path)
+        self.assertIn("format: GLB", info)
+        self.assertIn("meshes: 2", info)
+        self.assertIn("primitives: 3", info)
+
+    def test_missing_file_is_none(self):
+        self.assertIsNone(assets.model_info(
+            os.path.join(self.tmp, "nope.obj")))
+
+    def test_unknown_format_gets_basics(self):
+        path = os.path.join(self.tmp, "model.fbx")
+        with open(path, "wb") as fh:
+            fh.write(b"Kaydara FBX Binary\x00" + b"x" * 100)
+        info = assets.model_info(path)
+        self.assertIn("format: FBX", info)
+        self.assertIn("size:", info)
+        self.assertNotIn("vertices", info)
 
 
 if __name__ == "__main__":

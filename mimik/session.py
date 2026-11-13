@@ -19,6 +19,12 @@ from .sources.mitm import Mitm, MitmError
 
 _IDEMPOTENT_METHODS = frozenset({"GET", "HEAD", "OPTIONS", "PUT", "DELETE"})
 
+# Every request times out after 30 s unless the caller says otherwise —
+# a hung server must never hang the user's script forever. Override per
+# session (Session(..., timeout=60) / App(timeout=60)) or per call
+# (session.get("/x", timeout=120)); timeout=None disables it.
+DEFAULT_TIMEOUT = 30
+
 
 class Session:
     """Base URL + reusable headers, with helpers that return parsed JSON.
@@ -31,16 +37,22 @@ class Session:
         Session.from_har("session.har")              # load a browser HAR export
     """
 
-    def __init__(self, base_url, headers=None, host=None, mitm=None):
+    def __init__(self, base_url, headers=None, host=None, mitm=None,
+                 timeout=DEFAULT_TIMEOUT):
         self.base_url = base_url.rstrip("/")
         self.headers = headers or {}
         self.host = host
         self._mitm = mitm  # kept for token refresh
+        self.timeout = timeout
         self._http = requests.Session()
 
     # ---- constructors -------------------------------------------------------
     @classmethod
     def from_mitm(cls, host, mitm=None):
+        # No saving here: the recorder already saves every flow it
+        # pulls, so a client that re-saved on construction would
+        # rewrite captures on every Hinge() (review #23). Construction
+        # is cheap and side-effect-free.
         mitm = mitm or Mitm()
         flows = mitm.flows()
         headers = extract.session_headers(flows, host)
@@ -49,11 +61,6 @@ class Session:
                 f"no authenticated request to {host} captured yet — "
                 f"open the app once so mitmweb sees a real call, then retry"
             )
-        # Persist the capture so the session survives the proxy stopping.
-        try:
-            store.save_flows(flows, mitm=mitm)
-        except Exception:
-            pass  # saving must never break a working session
         return cls(extract.base_url(flows, host), headers, host=host, mitm=mitm)
 
     @classmethod
@@ -88,9 +95,10 @@ class Session:
         """
         from .sources import har
 
-        flows = har.load(path)
+        data = har.parse(path)  # parse once, share across load + hosts
+        flows = har.load(data)
         if not host:
-            ranked = har.hosts(path)
+            ranked = har.hosts(data)
             if not ranked:
                 raise RuntimeError("HAR file has no entries")
             host = ranked[0][0]
@@ -106,9 +114,12 @@ class Session:
         Failed responses raise ``requests.HTTPError``. A 401 refreshes captured
         credentials and retries idempotent methods once. Pass ``refresh=True``
         to explicitly allow one retry for a non-idempotent method such as POST.
+        Every call times out after ``self.timeout`` (30 s by default) unless
+        ``timeout=...`` is passed for that call.
         """
         method = method.upper()
         url = path if path.startswith("http") else f"{self.base_url}{path}"
+        kw.setdefault("timeout", self.timeout)
         r = self._http.request(
             method, url, headers=self.headers, json=json, params=params, **kw
         )
@@ -165,14 +176,16 @@ class App(Session):
     HOST = None
 
     def __init__(self, **kw):
+        timeout = kw.pop("timeout", DEFAULT_TIMEOUT)
         if not kw and self.HOST:
             try:
                 got = Session.from_mitm(self.HOST)
             except (MitmError, RuntimeError, requests.RequestException):
                 got = Session.from_saved(self.HOST)
-            super().__init__(got.base_url, got.headers, host=got.host, mitm=got._mitm)
+            super().__init__(got.base_url, got.headers, host=got.host,
+                             mitm=got._mitm, timeout=timeout)
         else:
-            super().__init__(**kw)
+            super().__init__(timeout=timeout, **kw)
 
 
 def _parse(r):
