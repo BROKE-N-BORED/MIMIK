@@ -382,6 +382,12 @@ What a preset changes (nothing changes where no preset exists):
 | `mimik presets match <host\|group>` | Show which pattern presets would apply (dry run) |
 | `mimik presets delete <name> [--yes]` | Delete a preset |
 | `mimik unpin <target> [--android\|--linux] [--ca PATH] [--proxy-host HOST] [--workdir DIR]` | Defeat cert pinning via Frida so a pinned app can be captured |
+| `mimik analyze <file> [--ghidra] [--json]` | Analyze a program file (stdlib pass; `--ghidra` adds the Ghidra pass) |
+| `mimik binaries [--json]` | List analyzed binaries |
+| `mimik binary-show <id> [--json]` | Show a binary's summary (sha256, sha prefix, or file name) |
+| `mimik binary-link <host> <id>` | Link a binary to a captured host |
+| `mimik binary-unlink <host>` | Remove a binary link from a host |
+| `mimik ghidra-setup` | Check the Ghidra install and print setup steps if it's missing |
 
 ## Pinned apps — `mimik unpin` (v0.4)
 
@@ -406,6 +412,35 @@ cover OpenSSL/BoringSSL; Flutter apps and apps on another TLS stack
 still show no traffic (see Honest limits). Your own apps on your own
 devices only.
 
+## Binary analysis — Ghidra (v0.5)
+
+MIMIK can analyze a program file without running it. The analyzed
+file is data — it is never executed, only read. Two passes:
+
+- **Standard analysis (built in, always available):** format
+  (ELF/PE/Mach-O), sections with entropy (a packed section flags at
+  7.5+), imports/exports, strings (ASCII + UTF-16). Stored under
+  `~/.local/share/mimik/binaries/<sha256>/`.
+- **Ghidra pass (needs Ghidra installed):** functions, decompiled C,
+  disassembly, call graph, and string cross-references — which
+  function uses which string. Run it from the Binary tab (Analyze a
+  binary…, then Run Ghidra pass) or `mimik analyze --ghidra`.
+
+Ghidra is NOT bundled (about 2 GB with its JDK). MIMIK finds it via
+`GHIDRA_HOME`, your PATH, `~/opt/ghidra*`, or `/opt/ghidra*`, and
+tells you exactly what's missing: `mimik ghidra-setup` prints the
+steps, or File → Ghidra setup steps… in the GUI. Current release:
+Ghidra 12.2, needs a full 64-bit JDK 25. The heap Ghidra gets is
+sized from your RAM automatically (2 GB on an 8 GB PC) — no setting
+to fiddle with. `mimik doctor` reports the Ghidra install as an
+optional check.
+
+Link a binary to a captured host (Hosts tab → Link binary…, or
+`mimik binary-link <host> <id>`) and the Hosts tab shows which
+program the traffic came from; the Binary tab shows the host's
+captures. MIMIK also auto-matches a capture to a binary it launched
+or to a uniquely-named file.
+
 ## Honest limits
 
 - **Certificate pinning**: pinned apps show no traffic unless unpinned
@@ -426,6 +461,14 @@ devices only.
 - **Asset packs**: images become color-only materials (Reblend has no
   image textures), audio/fonts are kept but not wired into scenes,
   `.gltf` needs a `.glb` conversion in Blender. See the Assets section.
+- **Ghidra**: not bundled — about 2 GB with its JDK, install it
+  yourself (`mimik ghidra-setup` prints the steps). Mach-O binaries
+  are identified but their sections/imports need the Ghidra pass (the
+  stdlib parser covers ELF + PE). A live Ghidra run hasn't been
+  verified headless — it needs your real-PC verdict.
+- **Binary analysis**: the analyzed file is data, never executed.
+  Packed or obfuscated binaries still show their strings and
+  sections, but the function list needs Ghidra.
 
 ## Files
 
@@ -434,6 +477,7 @@ devices only.
 - `~/.local/share/mimik/assets/` — captured assets (per host/program + timestamp)
 - `~/.local/share/mimik/packs/` — built Reblend asset packs
 - `~/.local/share/mimik/presets/` — learned presets (one JSON file per host/program; pattern presets under `patterns/`)
+- `~/.local/share/mimik/binaries/` — analyzed binaries (one dir per SHA-256: analysis JSON + Ghidra output; links in `links.json`)
 - `~/.local/share/mimik/settings.json` — settings (auto-learn presets: off by default)
 - `~/.local/share/mimik/reblend.json` — remembered Reblend folder
 - `~/.cache/mimik/runs/` — temp extractions from archives / .debs
@@ -444,3 +488,7 @@ devices only.
 MIMIK is released under the MIT License — see LICENSE. Linux port of
 [littledivy/mimic](https://github.com/littledivy/mimic) (MIT, Copyright
 (c) 2026 Divy Srivastava); see LICENSE-NOTICE for the full attribution.
+
+Ghidra (https://ghidra-sre.org) is a separate tool by the National
+Security Agency, Apache License 2.0 — MIMIK drives its headless
+analyzer when you install it; it is not bundled with MIMIK.

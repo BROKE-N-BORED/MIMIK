@@ -933,7 +933,7 @@ class PatternGuiTests(unittest.TestCase):
 
         win = MainWindow()
         win.show()
-        win.tabs.setCurrentIndex(6)  # Presets tab loads on first show
+        win.tabs.setCurrentIndex(7)  # Presets tab loads on first show
         self.app.processEvents()
         self.assertGreaterEqual(win.pattern_presets_list.count(), 1)
         texts = [win.pattern_presets_list.item(i).text()

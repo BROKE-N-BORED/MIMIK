@@ -1,5 +1,124 @@
 # MIMIK Changelog
 
+## v0.5 — 2026-11-15
+
+Binary analysis with Ghidra (optional, never bundled) + a UI redesign
+against Joshua's design rules. Items in build order:
+
+- Binary store + identification (Ghidra #1): `mimik/binary.py`
+  identifies a file by magic bytes (ELF / PE / Mach-O / unknown),
+  SHA-256s it, and stores the analysis under
+  `~/.local/share/mimik/binaries/<sha256>/` (0700 dirs, 0600 atomic
+  meta). Files over 500 MB are refused with a plain error. The binary
+  itself is NOT copied into the store; the record keeps the source
+  path. The analyzed file is data — it is never executed.
+- Stdlib-only static analysis (Ghidra #2): pure-stdlib ELF + PE
+  parsers (headers, sections, imports/exports) + strings (ASCII +
+  UTF-16, with offsets) + per-section entropy (packed flag at 7.5+).
+  No new dependencies; no Ghidra needed. Mach-O is identified only —
+  its sections/imports need the Ghidra pass. Test fixtures are
+  code-generated in tests/test_binary.py (build_tiny_elf /
+  build_tiny_pe), not checked-in binary files — the snapshot push is
+  UTF-8 only and cannot carry binaries.
+- Ghidra detection + Doctor (Ghidra #3): MIMIK finds
+  `analyzeHeadless` via GHIDRA_HOME, PATH, `~/opt/ghidra*`, the data
+  dir, or `/opt/ghidra*`, reads the Ghidra version from
+  application.properties, checks the JDK (25 for 12.2+, 21 older),
+  and reports it as Doctor's 9th optional check with a version/JDK/
+  heap detail line — or the exact missing piece and fix text.
+- Ghidra headless driver (Ghidra #4): `ghidra.run_analysis` runs
+  `analyzeHeadless` in a temp project under the data dir (cleaned up
+  after), 600 s timeout, cancel callback, log file, heap auto-sized
+  from measured RAM (2G on an 8 GB PC — never a visible setting),
+  progress lines, and read-back of functions/callgraph/xrefs. Verified
+  against a stub analyzeHeadless; a live Ghidra run needs his real PC.
+- Decompile + disassembly export (Ghidra #5): MimikExport.py (Jython
+  2.7, Python 2/3 compatible syntax) exports per-function decompiled
+  C + a disassembly listing (5000-function cap, per-function
+  try/except) for the GUI to show one function at a time.
+- Call graph (Ghidra #6): MimikExport writes callgraph.json (caller
+  → callee edges + names); the driver reads it back, the GUI renders
+  a callers/callees tree, the CLI prints a plain-text edge list.
+- Strings + cross-references (Ghidra #7): searchable strings table
+  (Offset/Text/Referenced by, first 1000 shown); with Ghidra each
+  string names the functions referencing it (xrefs matched by stdlib
+  offset to Ghidra address via section mapping); without Ghidra every
+  cell says "needs Ghidra" honestly.
+- GUI Binary tab, 8th tab (Ghidra #8): pick a binary → Analyze
+  (worker thread, progress + cancel) → Summary/Functions/Decompiled/
+  Disassembly/Strings/Call graph views. Fully usable on stdlib
+  analysis when Ghidra is absent: the Ghidra sections show the honest
+  "install Ghidra for this" state with a button to the setup helper.
+  View menu + F5 refresh wired.
+- CLI (Ghidra #9): `mimik analyze <binary>` (stdlib pass, `--ghidra`
+  for the full pass), `mimik binaries` (list), `mimik binary-show
+  <id>` (summary, sections, imports/exports, first 100 strings,
+  functions, first 50 call edges; honest "ghidra: not run" state),
+  plus `binary-link` / `binary-unlink`. `--json` for scripting.
+- Link binary analysis to captures (Ghidra #10): Hosts tab "Link
+  binary…" + dialog, linked-binary label + "View in Binary tab"
+  jump; Binary summary shows linked captures. Matching: manual
+  links.json wins, then the launch path recorded at capture time,
+  then a unique basename.
+- Ghidra setup helper (Ghidra #11): `mimik ghidra-setup` + a Doctor
+  button print the exact steps for his Mint PC (release URL, zip
+  name, sha256sum check against the release page — MIMIK never states
+  a hash it has not verified — `~/opt` extract, apt openjdk-25-jdk
+  with Temurin/manual fallback). Prints steps; downloads nothing.
+- Tests + docs (Ghidra #12): tiny ELF + PE fixtures (code-generated,
+  see #2), Ghidra-dependent tests skip cleanly when Ghidra is absent,
+  README + CHANGELOG credit Ghidra (Apache-2.0, NSA).
+- How to Use index (U22): Help → How to Use… opens its own window —
+  a plain-language index of every tab and flow (Start here + all 8
+  tabs + Ghidra), topic list left, text right. No manual needed.
+- Single instance (U27): re-clicking the menu icon focuses the
+  running app; it never starts a second copy (QLockFile/QLocalServer
+  guard; a second launch raises the first; a stale lock after a crash
+  is taken over). Live two-process proof: second launch exits 0 in
+  3.7 s, first stays alive.
+- Debug log layer alignment (U12): the log layer now carries a
+  last-200 ring buffer, a scrubbed debug report (version, platform,
+  measured specs, scrubbed ring — tokens become `<redacted>`), and
+  the Doctor tab's "Copy debug report" button. Rotation is size-based
+  (1 MB cap), documented as the equivalent of the date-based standard.
+- Toy-rule simplification (U34) + progressive disclosure: the Record
+  tab is the toy surface — pick a target, Start, Stop, nothing else
+  visible by default. Advanced options live behind one collapsible
+  "More options" section (auto-expands when the target needs it,
+  never auto-collapses). Every remaining field explains itself in
+  plain words directly underneath it (U20). The tab scrolls with
+  Start/Stop pinned outside it, so the file box is never crushed.
+- Backend configures itself (U35): new mimik/machine.py measures the
+  PC silently at startup (RAM, CPU count, disk free) and sets the
+  under-the-hood values — Ghidra heap, capture cap, worker counts —
+  with no visible UI. Values are logged in the debug log; Doctor
+  reports the specs in plain words ("this PC:").
+- Settings that don't change don't appear (U36): full audit of every
+  visible control — hidden: none. Every visible control is one the
+  user would change for a real reason; ports, timeouts, worker counts,
+  the flows cap, the Ghidra heap, data paths, and window geometry are
+  already backend-only.
+- Live measurements strip (U37) + calm quiet status: while recording,
+  the Record tab shows a live strip — flows captured, hosts seen,
+  bytes, elapsed time — real numbers from the capture store, never
+  invented. Recording state is a small live indicator + status text;
+  no modals for routine state.
+- Micro-interactions: Start/Stop buttons dip on press (scale 0.97
+  over 150 ms); a quiet completion state in the status bar when a
+  capture finishes and its client is generated; the live count ticks
+  as flows land. All animation under 300 ms, transform/opacity only.
+- Real Windows-style menus (U38): five complete drop-down menus —
+  File (import, scan, compare, unpin, analyze, Ghidra setup, sample,
+  Quit), Record (start/stop + the two toggles), Generate (client,
+  pack, preset), View (all 8 tabs + Refresh + theme), Help (How to
+  Use, About, log, debug report, updates). Every action reachable
+  from a menu; shortcuts Ctrl+1..8, F5, Ctrl+R, Ctrl+Q. Verified by
+  menu screenshots (menu.grab()).
+
+Ghidra (https://ghidra-sre.org) is a separate tool by the National
+Security Agency, Apache License 2.0 — MIMIK drives its headless
+analyzer when you install it; it is not bundled with MIMIK.
+
 ## v0.4 — 2026-11-13
 
 Every fix from the fresh-clone repo audit (see

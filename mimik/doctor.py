@@ -18,7 +18,7 @@ import shutil
 import socket
 import sys
 
-from . import codegen, reblend_bridge, store, wine
+from . import codegen, ghidra, machine, reblend_bridge, store, wine
 from .recorder import mitmweb_cmd
 from .sources import mitm as mitm_mod
 
@@ -85,6 +85,7 @@ def doctor():
     ca = os.path.join(os.path.expanduser("~"), ".mitmproxy",
                       "mitmproxy-ca-cert.pem")
     rb = reblend_bridge.find_reblend()
+    gd = ghidra.detect()
     optional = [
         {
             "name": "Ollama (optional polish)",
@@ -132,6 +133,14 @@ def doctor():
             "fix": ("pipx install objection to unpin a stock Android "
                     "phone (APK path only)"),
         },
+        {
+            "name": "Ghidra (binary analysis)",
+            "ok": gd["found"] and gd["java_ok"],
+            "fix": gd["fix"] or "install Ghidra to decompile binaries",
+            "detail": (f"Ghidra {gd['version']}, JDK {gd['java_major']}, "
+                       f"heap {gd['heap']}"
+                       if gd["found"] and gd["java_ok"] else None),
+        },
     ]
 
     saved = store.list_captures()
@@ -147,6 +156,9 @@ def doctor():
         f"{store.format_size(usage['presets'])}",
         f"LAN IP for the phone proxy: {lan_ip()}:8080",
     ]
+    # Measured specs (v0.5 item 17/U35): facts about this PC, no
+    # settings shown — the backend adjusts, the user just watches.
+    info.extend(machine.describe())
 
     return {
         "ok": all(c["ok"] for c in required),

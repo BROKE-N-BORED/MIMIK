@@ -450,8 +450,14 @@ class LaunchArgsTests(unittest.TestCase):
         with open(os.path.join(tmp, "main.py"), "w") as fh:
             fh.write("import sys; print('no PySide6 here', file=sys.stderr); "
                      "sys.exit(1)")
+        # Generous settle: the child is a Python interpreter, and its
+        # startup alone can outlast a 0.3 s window under load — the
+        # poll then misses the exit and the failure reports as a
+        # launch (flaked twice at load 11). The /bin/sh-child fix
+        # from test_launch.py can't apply here: Reblend launches
+        # via main.py, so the child is Python by definition.
         ok, msg = reblend_bridge.open_in_reblend(
-            tmp, "/tmp/pack/x.json", settle=0.3)
+            tmp, "/tmp/pack/x.json", settle=3.0)
         self.assertFalse(ok)
         self.assertIn("exit code 1", msg)
         self.assertIn("no PySide6 here", msg)

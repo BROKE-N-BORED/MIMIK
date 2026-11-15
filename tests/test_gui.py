@@ -144,7 +144,7 @@ class GuiTests(unittest.TestCase):
         self.app.processEvents()
         gc.collect()
 
-    def test_window_shows_with_seven_tabs(self):
+    def test_window_shows_with_eight_tabs(self):
         from mimik.gui import MainWindow
 
         win = MainWindow()
@@ -152,10 +152,11 @@ class GuiTests(unittest.TestCase):
         self.app.processEvents()
         self.assertTrue(win.isVisible())
         tabs = win.tabs
-        self.assertEqual(tabs.count(), 7)
+        self.assertEqual(tabs.count(), 8)
         titles = [tabs.tabText(i) for i in range(tabs.count())]
         self.assertEqual(titles, ["Record", "Hosts and Learn", "Generate",
-                                  "Assets", "Clients", "Doctor", "Presets"])
+                                  "Assets", "Clients", "Binary", "Doctor",
+                                  "Presets"])
         # Qt eats a bare & in visible widget text (mnemonic marker — it
         # rendered as "_" in the tab bar while tabText() still returned the
         # raw string, so the old assertion stayed green on a wrong label).
@@ -266,6 +267,80 @@ class GuiTests(unittest.TestCase):
         self.assertIn("view-log-marker-123", text)
         win.close()
 
+    def test_copy_debug_report_button(self):
+        # v0.5 item 15 (U12/T21): the Doctor tab's Copy debug report
+        # button puts the scrubbed report on the clipboard.
+        from PySide6.QtWidgets import QApplication, QPushButton
+        from mimik import __version__
+        from mimik import log as mimik_log
+        from mimik.gui import MainWindow
+
+        mimik_log.log_info("test", "debug-report-marker-321")
+        win = MainWindow()
+        btns = [b for b in win.findChildren(QPushButton)
+                if b.text() == "Copy debug report"]
+        self.assertEqual(len(btns), 1)
+        btns[0].click()
+        text = QApplication.clipboard().text()
+        self.assertIn(f"MIMIK {__version__}", text)
+        self.assertIn("debug-report-marker-321", text)
+        self.assertIn("copied to the clipboard",
+                      win.doctor_text.toPlainText())
+        win.close()
+
+    def test_howto_menu_opens_index(self):
+        # v0.5 item 13 (U22): Help menu "How to Use…" opens its own
+        # window with a topic list; picking a topic shows its text.
+        from PySide6.QtWidgets import QDialog
+        from mimik.gui import MainWindow
+
+        win = MainWindow()
+        menus = {a.text(): a.menu()
+                 for a in win.menuBar().actions()}
+        help_items = [a.text() for a in menus["Help"].actions()]
+        self.assertIn("How to Use…", help_items)
+        with mock.patch.object(QDialog, "exec", return_value=1):
+            win._howto_action.trigger()
+        dlg = win._howto_dialog
+        self.assertEqual(dlg.windowTitle(), "How to Use MIMIK")
+        self.assertEqual(win._howto_list.count(), 10)
+        titles = [win._howto_list.item(i).text()
+                  for i in range(win._howto_list.count())]
+        self.assertIn("Binary tab", titles)
+        # The first topic (Start here) shows on open.
+        self.assertIn("Record the app", win._howto_text.toPlainText())
+        for i, title in enumerate(titles):
+            if title == "Binary tab":
+                win._howto_list.setCurrentRow(i)
+                break
+        self.app.processEvents()
+        self.assertIn("never runs it",
+                      win._howto_text.toPlainText())
+        win.close()
+
+    def test_ghidra_setup_button_shows_steps(self):
+        # v0.5 item 11: the Doctor tab's Ghidra button shows the
+        # setup steps in a dialog.
+        from PySide6.QtWidgets import QDialog, QPushButton, QTextEdit
+        from mimik import ghidra as ghidra_mod
+        from mimik.gui import MainWindow
+
+        win = MainWindow()
+        # Scoped to the Doctor tab: the Binary tab has three more
+        # buttons with the same text (one per Ghidra view).
+        doctor_tab = win.tabs.widget(6)
+        btns = [b for b in doctor_tab.findChildren(QPushButton)
+                if b.text() == "Ghidra setup steps…"]
+        self.assertEqual(len(btns), 1)
+        with mock.patch.object(QDialog, "exec", return_value=1):
+            btns[0].click()
+        dlg = win._ghidra_setup_dialog
+        self.assertEqual(dlg.windowTitle(), "Ghidra setup steps")
+        text = dlg.findChild(QTextEdit).toPlainText()
+        self.assertIn(ghidra_mod.GHIDRA_RELEASE_URL, text)
+        self.assertIn("JDK 25", text)
+        win.close()
+
     def test_filter_checkbox_toggles_setting(self):
         # Item 26: the Record tab's filter checkbox is the per-record
         # control — it reflects and persists the setting.
@@ -285,6 +360,256 @@ class GuiTests(unittest.TestCase):
         finally:
             presets.set_filtering_enabled(True)
             win.close()
+
+    def test_record_tab_toy_surface(self):
+        # v0.5 item 16 (U34): pick a target, Start, Stop — nothing
+        # else visible by default. Advanced options live behind one
+        # collapsible "More options" section.
+        from PySide6.QtCore import Qt
+        from mimik.gui import MainWindow
+
+        win = MainWindow()
+        win.show()
+        self.app.processEvents()
+        self.assertFalse(win.more_btn.isChecked())
+        self.assertTrue(win.more_box.isHidden())
+        self.assertEqual(win.more_btn.arrowType(), Qt.RightArrow)
+        # The toy surface is all there: target, Start, Stop.
+        self.assertFalse(win.target_combo.isHidden())
+        self.assertFalse(win.start_btn.isHidden())
+        self.assertFalse(win.stop_btn.isHidden())
+        self.assertFalse(win.steps.isHidden())
+        # One tap opens it; the options are all still there (U1:
+        # reorganize only, nothing removed).
+        win.more_btn.click()
+        self.app.processEvents()
+        self.assertTrue(win.more_btn.isChecked())
+        self.assertFalse(win.more_box.isHidden())
+        self.assertEqual(win.more_btn.arrowType(), Qt.DownArrow)
+        self.assertFalse(win.filter_check.isHidden())
+        self.assertFalse(win.screenshot_check.isHidden())
+        self.assertFalse(win.lan_label.isHidden())
+        win.more_btn.click()
+        self.app.processEvents()
+        self.assertTrue(win.more_box.isHidden())
+        win.close()
+
+    def test_record_tab_more_options_auto_expands(self):
+        # v0.5 item 16: the file picker and the launch box live
+        # inside "More options", so picking those targets expands
+        # it automatically — never a dead end. It never
+        # auto-collapses.
+        from mimik.gui import MainWindow
+
+        win = MainWindow()
+        win.show()
+        file_idx = win.target_combo.findData("file")
+        win.target_combo.setCurrentIndex(file_idx)
+        self.app.processEvents()
+        self.assertTrue(win.more_btn.isChecked())
+        self.assertFalse(win.more_box.isHidden())
+        self.assertFalse(win.file_box.isHidden())
+        app_idx = win.target_combo.findData("linux-app")
+        win.target_combo.setCurrentIndex(app_idx)
+        self.app.processEvents()
+        self.assertFalse(win.app_box.isHidden())
+        self.assertTrue(win.file_box.isHidden())
+        android_idx = win.target_combo.findData("android")
+        win.target_combo.setCurrentIndex(android_idx)
+        self.app.processEvents()
+        self.assertTrue(win.more_btn.isChecked())
+        self.assertTrue(win.file_box.isHidden())
+        self.assertTrue(win.app_box.isHidden())
+        win.close()
+
+    def test_record_and_generate_fields_explain_themselves(self):
+        # v0.5 item 16 (U20): every field explains itself in plain
+        # words directly underneath it.
+        from PySide6.QtWidgets import QLabel
+        from mimik.gui import MainWindow
+
+        win = MainWindow()
+        record_tab = win.tabs.widget(0)
+        explains = [w for w in record_tab.findChildren(QLabel)
+                    if w.objectName() == "explain"]
+        self.assertGreaterEqual(len(explains), 4)
+        self.assertTrue(any("What you want to capture" in w.text()
+                            for w in explains))
+        generate_tab = win.tabs.widget(2)
+        gen_explains = [w for w in generate_tab.findChildren(QLabel)
+                        if w.objectName() == "explain"]
+        self.assertEqual(len(gen_explains), 1)
+        self.assertIn("Usually the one with JSON",
+                      gen_explains[0].text())
+        win.close()
+
+    def test_live_strip_hidden_when_idle(self):
+        # v0.5 item 19 (U37): the live strip shows only while
+        # recording; idle, the Record tab looks as it did.
+        from mimik.gui import MainWindow
+
+        win = MainWindow()
+        win.show()
+        self.app.processEvents()
+        self.assertTrue(win.live_strip.isHidden())
+        self.assertEqual(win.live_text.text(), "")
+        win.close()
+
+    def test_live_strip_shows_recording_numbers(self):
+        # v0.5 item 19: flows, hosts, bytes, elapsed — real numbers,
+        # updated by the status tick. Simulated recording state (no
+        # real proxy): the worker + start time are what the updater
+        # keys on.
+        import time
+
+        from mimik import store
+        from mimik.gui import MainWindow, _dir_size
+
+        win = MainWindow()
+        win.show()
+        win.worker = object()
+        win._record_started = time.monotonic()
+        win._flow_count = 3
+        win._host_count = 2
+        win._record_bytes_start = _dir_size(store.captures_dir())
+        win._update_status_bar()
+        self.app.processEvents()
+        self.assertFalse(win.live_strip.isHidden())
+        self.assertEqual(win.live_dot.text(), "●")
+        self.assertIn("3 flows", win.live_text.text())
+        self.assertIn("2 hosts", win.live_text.text())
+        self.assertIn("0 B", win.live_text.text())
+        self.assertIn("00:00", win.live_text.text())
+        # Back to idle: the strip hides again.
+        win.worker = None
+        win._record_started = None
+        win._update_status_bar()
+        self.app.processEvents()
+        self.assertTrue(win.live_strip.isHidden())
+        win.close()
+
+    def test_fmt_bytes_and_dir_size(self):
+        # v0.5 item 19 helpers.
+        import os
+        import tempfile
+
+        from mimik.gui import _dir_size, _fmt_bytes
+
+        self.assertEqual(_fmt_bytes(0), "0 B")
+        self.assertEqual(_fmt_bytes(512), "512 B")
+        self.assertEqual(_fmt_bytes(1024), "1 KB")
+        self.assertEqual(_fmt_bytes(1536), "1.5 KB")
+        self.assertEqual(_fmt_bytes(1048576), "1 MB")
+        self.assertEqual(_fmt_bytes(2621440), "2.5 MB")
+        self.assertEqual(_fmt_bytes(-5), "0 B")
+        with tempfile.TemporaryDirectory() as tmp:
+            with open(os.path.join(tmp, "a.bin"), "wb") as fh:
+                fh.write(b"x" * 100)
+            os.mkdir(os.path.join(tmp, "sub"))
+            with open(os.path.join(tmp, "sub", "b.bin"), "wb") as fh:
+                fh.write(b"y" * 50)
+            self.assertEqual(_dir_size(tmp), 150)
+        self.assertEqual(_dir_size("/no/such/dir/at/all"), 0)
+
+    def test_start_stop_buttons_dip_on_press(self):
+        # v0.5 item 20: Start/Stop dip to 97% over 150 ms on press,
+        # then settle back to their exact rect.
+        from PySide6.QtCore import QAbstractAnimation
+        from PySide6.QtTest import QTest
+        from mimik.gui import MainWindow
+
+        win = MainWindow()
+        win.show()
+        self.app.processEvents()
+        for button in (win.start_btn, win.stop_btn):
+            original = button.geometry()
+            button.pressed.emit()
+            anim = win._dip_anims.get(button)
+            self.assertIsNotNone(anim)
+            self.assertEqual(anim.duration(), 150)
+            self.assertEqual(anim.state(), QAbstractAnimation.Running)
+            QTest.qWait(250)
+            self.assertEqual(anim.state(), QAbstractAnimation.Stopped)
+            self.assertEqual(button.geometry(), original)
+        win.close()
+
+    def test_recording_finish_shows_completion_status(self):
+        # v0.5 item 20: a quiet settled status when a capture
+        # finishes — no modal, just the line, until the next
+        # recording starts.
+        from mimik.gui import MainWindow
+
+        win = MainWindow()
+        win.show()
+        win._flow_count = 17
+        win._host_count = 3
+        win._recording_finished()
+        self.assertEqual(win.status_proxy.text(),
+                         "✓ Recorded 17 flows from 3 hosts")
+        win._update_status_bar()
+        self.assertEqual(win.status_proxy.text(),
+                         "✓ Recorded 17 flows from 3 hosts")
+        win._done_text = None
+        win._update_status_bar()
+        self.assertEqual(win.status_proxy.text(), "Proxy stopped")
+        win.close()
+
+    def test_generate_finish_shows_completion_status(self):
+        # v0.5 item 20: the settled status names the client that
+        # was written.
+        from mimik import store
+        from mimik.gui import MainWindow
+
+        store.save_flows([{
+            "id": "g1",
+            "request": {"host": "game.example.com", "method": "GET",
+                        "path": "/api/users/123", "scheme": "https",
+                        "port": 443, "headers": []},
+            "response": {"status_code": 200, "headers": []},
+        }])
+        tmp = tempfile.mkdtemp()
+        old_cwd = os.getcwd()
+        os.chdir(tmp)
+        try:
+            win = MainWindow()
+            win.show()
+            win.tabs.setCurrentIndex(2)  # Generate tab
+            self.assertTrue(_wait_for(
+                self.app,
+                lambda: win.gen_host.findText("game.example.com") >= 0))
+            win.gen_host.setCurrentText("game.example.com")
+            win._generate()
+            self.assertTrue(_wait_for(
+                self.app,
+                lambda: "wrote" in win.gen_log.toPlainText()))
+            self.assertTrue(win.status_proxy.text().startswith(
+                "✓ Client written: "))
+            self.assertIn("game", win.status_proxy.text())
+            win.close()
+        finally:
+            os.chdir(old_cwd)
+
+    def test_live_count_ticks_when_flows_land(self):
+        # v0.5 item 20: the live count ticks as flows land — each
+        # host poll re-renders the strip with the new numbers.
+        import time
+
+        from mimik import store
+        from mimik.gui import MainWindow, _dir_size
+
+        win = MainWindow()
+        win.show()
+        win.worker = object()
+        win._record_started = time.monotonic()
+        win._record_bytes_start = _dir_size(store.captures_dir())
+        win._show_hosts([("a.example.com", 5), ("b.example.com", 2)])
+        self.assertIn("7 flows", win.live_text.text())
+        self.assertIn("2 hosts", win.live_text.text())
+        win._show_hosts([("a.example.com", 9), ("b.example.com", 2)])
+        self.assertIn("11 flows", win.live_text.text())
+        win.worker = None
+        win._record_started = None
+        win.close()
 
     def test_excluded_hosts_dialog_edits_list(self):
         # Item 26: the Manage dialog adds, removes, and restores the
@@ -361,7 +686,7 @@ class GuiTests(unittest.TestCase):
 
         win = MainWindow()
         win.show()
-        win.tabs.setCurrentIndex(6)  # Presets tab loads on first show
+        win.tabs.setCurrentIndex(7)  # Presets tab loads on first show
         self.app.processEvents()
         win.presets_list.setCurrentRow(0)
         self.app.processEvents()
@@ -411,7 +736,7 @@ class GuiTests(unittest.TestCase):
 
         win = MainWindow()
         win.show()
-        win.tabs.setCurrentIndex(6)
+        win.tabs.setCurrentIndex(7)  # Presets tab
         self.app.processEvents()
         with mock.patch.object(QFileDialog, "getOpenFileName",
                                return_value=(dest, "")), \
@@ -551,7 +876,7 @@ class GuiTests(unittest.TestCase):
         with mock.patch.dict(os.environ, {"MIMIK_DATA_DIR": empty}):
             win = MainWindow()
             win.show()
-            win.tabs.setCurrentIndex(5)  # Doctor tab
+            win.tabs.setCurrentIndex(6)  # Doctor tab
             self.app.processEvents()
             btns = [b for b in win.findChildren(QPushButton)
                     if b.text() == "Load sample capture"]
@@ -674,18 +999,42 @@ class GuiTests(unittest.TestCase):
         try:
             menus = {a.text(): a.menu()
                      for a in win.menuBar().actions()}
-            self.assertEqual(set(menus), {"File", "View", "Help"})
+            # v0.5 item 21: five menus — Record + Generate join
+            # File / View / Help.
+            self.assertEqual(
+                set(menus),
+                {"File", "Record", "Generate", "View", "Help"})
             file_items = [a.text() for a in menus["File"].actions()
                           if not a.isSeparator()]
             self.assertIn("Import HAR…", file_items)
             self.assertIn("Import cURL…", file_items)
+            self.assertIn("Scan a program folder…", file_items)
+            self.assertIn("Analyze a binary…", file_items)
+            self.assertIn("Ghidra setup steps…", file_items)
+            self.assertIn("Load sample capture", file_items)
             self.assertIn("Quit", file_items)
             self.assertEqual(win._quit_action.shortcut().toString(),
                              "Ctrl+Q")
+            record_items = [a.text() for a in menus["Record"].actions()
+                            if not a.isSeparator()]
+            self.assertIn("Start recording", record_items)
+            self.assertIn("Stop recording", record_items)
+            self.assertIn("Exclude telemetry + analytics hosts",
+                          record_items)
+            self.assertIn(
+                "Screenshot the desktop when recording stops",
+                record_items)
+            self.assertEqual(win._menu_start_act.shortcut().toString(),
+                             "Ctrl+R")
+            gen_items = [a.text() for a in menus["Generate"].actions()
+                         if not a.isSeparator()]
+            self.assertEqual(gen_items, ["Generate client",
+                                         "Build asset pack",
+                                         "Learn preset"])
             view_items = [a.text() for a in menus["View"].actions()
                           if not a.isSeparator()]
-            self.assertEqual(view_items[:7],
-                             [win.tabs.tabText(i) for i in range(7)])
+            self.assertEqual(view_items[:8],
+                             [win.tabs.tabText(i) for i in range(8)])
             self.assertIn("Refresh", view_items)
             self.assertEqual(win._refresh_action.shortcut().toString(),
                              "F5")
@@ -695,6 +1044,171 @@ class GuiTests(unittest.TestCase):
             help_items = [a.text() for a in menus["Help"].actions()]
             self.assertIn("About MIMIK", help_items)
             self.assertIn("View log", help_items)
+            self.assertIn("Copy debug report", help_items)
+        finally:
+            win.close()
+
+    def test_record_menu_toggles_mirror_checkboxes(self):
+        # v0.5 item 21: the Record menu's two toggles mirror the
+        # Record tab checkboxes, both directions.
+        from mimik.gui import MainWindow
+
+        win = MainWindow()
+        win.show()
+        try:
+            self.assertEqual(win._menu_filter_act.isChecked(),
+                             win.filter_check.isChecked())
+            win.filter_check.setChecked(
+                not win.filter_check.isChecked())
+            self.app.processEvents()
+            self.assertEqual(win._menu_filter_act.isChecked(),
+                             win.filter_check.isChecked())
+            win._menu_filter_act.trigger()
+            self.app.processEvents()
+            self.assertEqual(win._menu_filter_act.isChecked(),
+                             win.filter_check.isChecked())
+            self.assertEqual(win._menu_shot_act.isChecked(),
+                             win.screenshot_check.isChecked())
+            win.screenshot_check.setChecked(
+                not win.screenshot_check.isChecked())
+            self.app.processEvents()
+            self.assertEqual(win._menu_shot_act.isChecked(),
+                             win.screenshot_check.isChecked())
+            win._menu_shot_act.trigger()
+            self.app.processEvents()
+            self.assertEqual(win._menu_shot_act.isChecked(),
+                             win.screenshot_check.isChecked())
+        finally:
+            win.close()
+
+    def test_record_menu_start_stop_mirror_buttons(self):
+        # v0.5 item 21: the Record menu's Start/Stop mirror the
+        # buttons' enabled state.
+        from mimik.gui import MainWindow
+
+        win = MainWindow()
+        win.show()
+        try:
+            self.assertTrue(win.start_btn.isEnabled())
+            self.assertTrue(win._menu_start_act.isEnabled())
+            self.assertFalse(win.stop_btn.isEnabled())
+            self.assertFalse(win._menu_stop_act.isEnabled())
+            win.worker = mock.Mock()
+            win._stop_recording()
+            self.assertFalse(win.stop_btn.isEnabled())
+            self.assertFalse(win._menu_stop_act.isEnabled())
+            win._recording_finished()
+            self.assertTrue(win.start_btn.isEnabled())
+            self.assertTrue(win._menu_start_act.isEnabled())
+            self.assertFalse(win.stop_btn.isEnabled())
+            self.assertFalse(win._menu_stop_act.isEnabled())
+        finally:
+            win.close()
+
+    def test_generate_menu_lands_on_tabs_without_inputs(self):
+        # v0.5 item 21: with nothing picked, the Generate menu
+        # lands on the tab whose guidance says what to pick — it
+        # never warns about an input the tab is still loading.
+        # Runs in its own empty data dir: "nothing picked" is only
+        # true on an empty dir. In the shared class dir the
+        # Presets tab's source combo defaults to its first item
+        # (an asset group from the pack test), so Learn preset
+        # learned a second preset in a worker and broke
+        # test_presets_tab_lists_seeded_preset's count.
+        from mimik.gui import MainWindow
+
+        empty = tempfile.mkdtemp()
+        with mock.patch.dict(os.environ, {"MIMIK_DATA_DIR": empty}):
+            win = MainWindow()
+            win.show()
+            try:
+                win._menu_generate_client()
+                self.app.processEvents()
+                self.assertEqual(win.tabs.currentIndex(), 2)
+                self.assertEqual(win.gen_log.toPlainText(), "")
+                win._menu_build_pack()
+                self.app.processEvents()
+                self.assertEqual(win.tabs.currentIndex(), 3)
+                win._menu_learn_preset()
+                self.app.processEvents()
+                self.assertEqual(win.tabs.currentIndex(), 7)
+            finally:
+                win.close()
+
+    def test_generate_menu_generates_when_host_picked(self):
+        # v0.5 item 21: with a host picked, the Generate menu runs
+        # the generation itself.
+        from mimik import store
+        from mimik.gui import MainWindow
+
+        store.save_flows([{
+            "id": "g1",
+            "request": {"host": "game.example.com", "method": "GET",
+                        "path": "/api/users/123", "scheme": "https",
+                        "port": 443, "headers": []},
+            "response": {"status_code": 200, "headers": []},
+        }])
+        tmp = tempfile.mkdtemp()
+        old_cwd = os.getcwd()
+        os.chdir(tmp)
+        try:
+            win = MainWindow()
+            win.show()
+            win.tabs.setCurrentIndex(2)  # Generate tab
+            self.assertTrue(_wait_for(
+                self.app,
+                lambda: win.gen_host.findText("game.example.com") >= 0))
+            win.gen_host.setCurrentText("game.example.com")
+            win._menu_generate_client()
+            self.assertTrue(_wait_for(
+                self.app,
+                lambda: "wrote" in win.gen_log.toPlainText()))
+            self.assertTrue(os.path.exists(win.gen_out))
+            win.close()
+        finally:
+            os.chdir(old_cwd)
+
+    def test_file_menu_load_sample(self):
+        # v0.5 item 21: File's Load sample capture goes to the
+        # Doctor tab and loads the sample (the guide dialog is
+        # modal, so its exec is stubbed like the other sample
+        # tests do). Runs in its own data dir like the other
+        # sample tests — the sample's preset must not leak into
+        # the shared class dir (it broke
+        # test_presets_tab_lists_seeded_preset's count).
+        from PySide6.QtWidgets import QDialog
+        from mimik import sample, store
+        from mimik.gui import MainWindow
+
+        empty = tempfile.mkdtemp()
+        with mock.patch.dict(os.environ, {"MIMIK_DATA_DIR": empty}):
+            win = MainWindow()
+            win.show()
+            try:
+                with mock.patch.object(QDialog, "exec", return_value=1):
+                    win._menu_load_sample()
+                self.app.processEvents()
+                self.assertEqual(win.tabs.currentIndex(), 6)
+                self.assertEqual(len(store.load_host(sample.SAMPLE_HOST)),
+                                 6)
+            finally:
+                win.close()
+
+    def test_help_menu_copy_debug_report(self):
+        # v0.5 item 21: Help's Copy debug report is the same action
+        # as the Doctor tab's button.
+        from PySide6.QtWidgets import QApplication
+        from mimik import __version__
+        from mimik.gui import MainWindow
+
+        win = MainWindow()
+        win.show()
+        try:
+            win._debug_action.trigger()
+            text = QApplication.clipboard().text()
+            self.assertIn(f"MIMIK {__version__}", text)
+            self.assertIn("copied to the clipboard",
+                          win.doctor_text.toPlainText())
         finally:
             win.close()
 
@@ -889,7 +1403,7 @@ class GuiTests(unittest.TestCase):
 
         win = MainWindow()
         win.show()
-        win.tabs.setCurrentIndex(6)  # Presets tab loads on first show
+        win.tabs.setCurrentIndex(7)  # Presets tab loads on first show
         self.app.processEvents()
         self.assertEqual(win.presets_list.count(), 1)
         item = win.presets_list.item(0)
@@ -975,7 +1489,7 @@ class GuiTests(unittest.TestCase):
 
         win = MainWindow()
         win.show()
-        win.tabs.setCurrentIndex(5)  # Doctor tab loads on first show
+        win.tabs.setCurrentIndex(6)  # Doctor tab loads on first show
         self.assertTrue(_wait_for(
             self.app,
             lambda: "overall:" in win.doctor_text.toPlainText()))
@@ -1964,7 +2478,7 @@ class GuiTests(unittest.TestCase):
             # whatever the machine has installed.
             with mock.patch("mimik.doctor.mitmweb_cmd",
                             return_value=None):
-                win.tabs.setCurrentIndex(5)  # Doctor tab
+                win.tabs.setCurrentIndex(6)  # Doctor tab
                 self.assertTrue(_wait_for(
                     self.app,
                     lambda: "overall:" in win.doctor_text.toPlainText()))
@@ -1997,7 +2511,7 @@ class GuiTests(unittest.TestCase):
         }])
         win = MainWindow()
         win.show()
-        win.tabs.setCurrentIndex(5)  # Doctor tab
+        win.tabs.setCurrentIndex(6)  # Doctor tab
         self.assertTrue(_wait_for(
             self.app, lambda: "overall:" in win.doctor_text.toPlainText()))
         text = win.doctor_text.toPlainText()
@@ -2058,8 +2572,17 @@ class GuiTests(unittest.TestCase):
             self.assertIn("No clients yet",
                           win.clients_list.item(0).text())
 
-            # Doctor: the check still runs (placeholder pre-load).
+            # Binary: empty list + summary placeholder.
             win.tabs.setCurrentIndex(5)
+            self.app.processEvents()
+            self.assertEqual(win.binaries_list.count(), 1)
+            self.assertIn("No binaries analyzed",
+                          win.binaries_list.item(0).text())
+            self.assertIn("Select a binary",
+                          win.binary_summary.placeholderText())
+
+            # Doctor: the check still runs (placeholder pre-load).
+            win.tabs.setCurrentIndex(6)
             self.assertTrue(_wait_for(
                 self.app,
                 lambda: "overall:" in win.doctor_text.toPlainText()))
@@ -2067,7 +2590,7 @@ class GuiTests(unittest.TestCase):
                           win.doctor_text.placeholderText())
 
             # Presets: empty source + both empty lists.
-            win.tabs.setCurrentIndex(6)
+            win.tabs.setCurrentIndex(7)
             self.app.processEvents()
             self.assertEqual(win.preset_source.currentText(),
                              "No captures yet")
@@ -2084,7 +2607,7 @@ class GuiTests(unittest.TestCase):
         from mimik.gui import MainWindow
 
         win = MainWindow()
-        presets_tab = win.tabs.widget(6)
+        presets_tab = win.tabs.widget(7)
         intro = presets_tab.layout().itemAt(0).widget()
         self.assertLess(len(intro.text()), 200)
         self.assertIn("never hold passwords", intro.text())
@@ -2137,7 +2660,8 @@ class GuiTests(unittest.TestCase):
 
     def test_recording_finished_returns_to_idle(self):
         """Item 7: record-stop stops the timer and restores the idle
-        status bar with the new saved total."""
+        status bar with the new saved total. v0.5 item 20: the proxy
+        side settles on the completion state, not "Proxy stopped"."""
         from mimik import store
         from mimik.gui import MainWindow
 
@@ -2149,7 +2673,8 @@ class GuiTests(unittest.TestCase):
         win._recording_finished()
         self.assertIsNone(win.worker)
         self.assertFalse(win._status_timer.isActive())
-        self.assertEqual(win.status_proxy.text(), "Proxy stopped")
+        self.assertEqual(win.status_proxy.text(),
+                         "✓ Recorded 0 flows from 0 hosts")
         saved = sum(n for _h, n, _t in store.list_captures())
         noun = "flow" if saved == 1 else "flows"
         self.assertEqual(win.status_flows.text(), f"{saved} saved {noun}")
@@ -2887,6 +3412,251 @@ class ScreenshotTests(unittest.TestCase):
         worker.request_stop.assert_called_once()
         win.worker = None
         win.close()
+
+
+@unittest.skipUnless(HAS_QT, "PySide6 not installed")
+class BinaryTabTests(unittest.TestCase):
+    """v0.5 items 7, 8, 10: the Binary tab + the Hosts link."""
+
+    @classmethod
+    def setUpClass(cls):
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        cls.app = QApplication.instance() or QApplication(sys.argv)
+
+    def setUp(self):
+        from tests.test_binary import build_tiny_elf
+        from mimik import binary as binary_mod
+
+        self.tmp = tempfile.mkdtemp()
+        os.environ["MIMIK_DATA_DIR"] = self.tmp
+        self.elf_path = os.path.join(self.tmp, "tiny.elf")
+        with open(self.elf_path, "wb") as f:
+            f.write(build_tiny_elf())
+        self.analysis = binary_mod.analyze(self.elf_path)
+        self.sha = self.analysis["sha256"]
+        from mimik.gui import MainWindow
+
+        self.win = MainWindow()
+        self.win.show()
+
+    def tearDown(self):
+        self.win.close()
+        del os.environ["MIMIK_DATA_DIR"]
+        self.app.processEvents()
+        gc.collect()
+
+    def _open_binary_tab(self):
+        self.win.tabs.setCurrentIndex(5)  # Binary tab
+        self.app.processEvents()
+
+    def _select_binary(self):
+        win = self.win
+        for i in range(win.binaries_list.count()):
+            if "tiny.elf" in win.binaries_list.item(i).text():
+                win.binaries_list.setCurrentRow(i)
+                self.app.processEvents()
+                return True
+        return False
+
+    def _attach_fake_ghidra(self):
+        """A fake Ghidra result + per-function files, as if the pass
+        had run. The xref address is Ghidra-padded (0x0040100b) to
+        exercise the address normalization."""
+        from mimik import binary as binary_mod
+
+        result = {
+            "ok": True, "cancelled": False,
+            "functions": [
+                {"address": "0x401000", "name": "main", "size": 42,
+                 "decompiled": True, "disassembly": True},
+                {"address": "0x401020", "name": "helper", "size": 10,
+                 "decompiled": True, "disassembly": True},
+            ],
+            "callgraph": {"edges": [["0x401000", "0x401020"]],
+                          "names": {"0x401000": "main",
+                                    "0x401020": "helper"}},
+            "xrefs": {"strings": [
+                {"address": "0x0040100b", "text": "HelloMIMIK",
+                 "referenced_by": ["0x401000"]}]},
+            "log_path": os.path.join(self.tmp, "x.log"),
+            "heap": "2G", "version": "12.2",
+        }
+        binary_mod.update_ghidra(self.sha, result)
+        funcs = os.path.join(binary_mod.analysis_dir(self.sha),
+                             "functions")
+        os.makedirs(funcs, exist_ok=True)
+        with open(os.path.join(funcs, "401000_main.c"), "w") as f:
+            f.write("int main(void) { return 42; }\n")
+        with open(os.path.join(funcs, "401000_main.asm"), "w") as f:
+            f.write("0x401000: ret\n")
+
+    def _save_capture(self, host, launched=""):
+        from mimik import store
+
+        flows = [{
+            "id": "1",
+            "request": {"host": host, "method": "GET", "path": "/v1/x",
+                        "scheme": "https", "port": 443, "headers": []},
+            "response": {"status_code": 200},
+        }]
+        store.save_flows(flows, meta={"launched_file": launched})
+
+    def _select_host(self, host):
+        from PySide6.QtCore import Qt
+
+        win = self.win
+        win.tabs.setCurrentIndex(1)  # Hosts tab
+        self.assertTrue(_wait_for(
+            self.app, lambda: win._task is None))
+        for i in range(win.hosts_list.count()):
+            item = win.hosts_list.item(i)
+            if item.data(Qt.UserRole) == host:
+                win.hosts_list.setCurrentRow(i)
+                self.app.processEvents()
+                return True
+        return False
+
+    def test_binary_tab_lists_analyzed(self):
+        self._open_binary_tab()
+        texts = [self.win.binaries_list.item(i).text()
+                 for i in range(self.win.binaries_list.count())]
+        self.assertTrue(any("tiny.elf" in t for t in texts), texts)
+        self.assertTrue(any("ghidra: no" in t for t in texts), texts)
+
+    def test_binary_tab_shows_summary_and_strings(self):
+        self._open_binary_tab()
+        self.assertTrue(self._select_binary())
+        summary = self.win.binary_summary.toPlainText()
+        self.assertIn("ELF", summary)
+        self.assertIn("printf", summary)
+        self.assertIn("myfunc", summary)
+        table = self.win.binary_str_table
+        found = False
+        for row in range(table.rowCount()):
+            if table.item(row, 1).text() == "HelloMIMIK":
+                found = True
+                self.assertEqual(table.item(row, 0).text(), "0x100b")
+                # Item 7: without Ghidra the column says so honestly.
+                self.assertEqual(table.item(row, 2).text(),
+                                 "needs Ghidra")
+        self.assertTrue(found, "HelloMIMIK string not in the table")
+
+    def test_binary_tab_ghidra_honest_state(self):
+        self._open_binary_tab()
+        self.assertTrue(self._select_binary())
+        self.assertIn("Ghidra",
+                      self.win.binary_decomp_state.text())
+        # isHidden, not isVisible: the Decompiled page is not the
+        # current inner tab, so isVisible() is False either way.
+        self.assertFalse(self.win.binary_decomp_btn.isHidden())
+        self.assertFalse(self.win.binary_decomp_state.isHidden())
+        self.assertTrue(self.win.binary_decomp_text.isHidden())
+        funcs = [self.win.binary_func_list.item(i).text()
+                 for i in range(self.win.binary_func_list.count())]
+        self.assertTrue(any("Ghidra pass" in t for t in funcs), funcs)
+
+    def test_binary_tab_with_ghidra_data(self):
+        self._attach_fake_ghidra()
+        self._open_binary_tab()
+        self.assertTrue(self._select_binary())
+        # Functions list, decompiled C, disassembly.
+        funcs = [self.win.binary_func_list.item(i).text()
+                 for i in range(self.win.binary_func_list.count())]
+        self.assertTrue(any("main" in t for t in funcs), funcs)
+        for i in range(self.win.binary_func_list.count()):
+            if "main" in self.win.binary_func_list.item(i).text():
+                self.win.binary_func_list.setCurrentRow(i)
+                break
+        self.app.processEvents()
+        self.assertIn("return 42",
+                      self.win.binary_decomp_text.toPlainText())
+        self.assertIn("ret", self.win.binary_asm_text.toPlainText())
+        # Call graph: main calls helper.
+        tree = self.win.binary_call_tree
+        root = tree.topLevelItem(0)
+        self.assertEqual(root.text(0), "main")
+        self.assertEqual(root.child(0).text(0), "Calls (1)")
+        self.assertEqual(root.child(0).child(0).text(0), "helper")
+        self.assertEqual(root.child(1).text(0), "Called by (0)")
+        # Strings: the xref now names the referencing function.
+        table = self.win.binary_str_table
+        for row in range(table.rowCount()):
+            if table.item(row, 1).text() == "HelloMIMIK":
+                self.assertEqual(table.item(row, 2).text(), "main")
+                break
+        else:
+            self.fail("HelloMIMIK string not in the table")
+
+    def test_hosts_link_binary_dialog(self):
+        from PySide6.QtWidgets import QDialog, QPushButton
+
+        self._save_capture("app.example.com")
+        self.assertTrue(self._select_host("app.example.com"))
+        self.assertIn("none linked",
+                      self.win.host_binary_label.text())
+        btns = [b for b in self.win.findChildren(QPushButton)
+                if b.text() == "Link binary…"]
+        self.assertEqual(len(btns), 1)
+        with mock.patch.object(QDialog, "exec", return_value=1):
+            btns[0].click()
+        dlg = self.win._link_dialog
+        self.assertEqual(self.win._link_list.count(), 1)
+        self.assertIn("tiny.elf",
+                      self.win._link_list.item(0).text())
+        self.win._link_list.setCurrentRow(0)
+        link = [b for b in dlg.findChildren(QPushButton)
+                if b.text() == "Link"]
+        self.assertEqual(len(link), 1)
+        link[0].click()
+        self.assertIn("tiny.elf",
+                      self.win.host_binary_label.text())
+        self.assertTrue(self.win.host_binary_jump.isEnabled())
+
+    def test_hosts_linked_label_auto_match_and_jump(self):
+        self._save_capture("app.example.com",
+                           launched=self.elf_path)
+        self.assertTrue(self._select_host("app.example.com"))
+        self.assertIn("tiny.elf",
+                      self.win.host_binary_label.text())
+        self.assertTrue(self.win.host_binary_jump.isEnabled())
+        self.win.host_binary_jump.click()
+        self.app.processEvents()
+        self.assertEqual(self.win.tabs.currentIndex(), 5)
+        current = self.win.binaries_list.currentItem()
+        self.assertIsNotNone(current)
+        self.assertIn("tiny.elf", current.text())
+
+    def test_binary_delete(self):
+        from PySide6.QtWidgets import QMessageBox
+
+        self._open_binary_tab()
+        self.assertTrue(self._select_binary())
+        with mock.patch.object(QMessageBox, "question",
+                               return_value=QMessageBox.Yes):
+            self.win.binary_delete_btn.click()
+        self.app.processEvents()
+        texts = [self.win.binaries_list.item(i).text()
+                 for i in range(self.win.binaries_list.count())]
+        self.assertEqual(len(texts), 1)
+        self.assertIn("No binaries analyzed", texts[0])
+        # The source file is untouched.
+        self.assertTrue(os.path.isfile(self.elf_path))
+
+    def test_analyze_file_button(self):
+        from PySide6.QtWidgets import QFileDialog
+        from mimik import binary as binary_mod
+
+        binary_mod.delete_binary(self.sha)
+        self._open_binary_tab()
+        with mock.patch.object(
+                QFileDialog, "getOpenFileName",
+                return_value=(self.elf_path, "")):
+            self.win.binary_analyze_btn.click()
+        self.assertTrue(_wait_for(
+            self.app, lambda: self.win._task is None))
+        texts = [self.win.binaries_list.item(i).text()
+                 for i in range(self.win.binaries_list.count())]
+        self.assertTrue(any("tiny.elf" in t for t in texts), texts)
 
 
 if __name__ == "__main__":

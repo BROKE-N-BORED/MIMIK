@@ -211,7 +211,8 @@ class IncrementalStoreTests(unittest.TestCase):
 
     def test_truncation_visible(self):
         flows = [flow(str(i), "api.example.com") for i in range(5)]
-        with mock.patch.object(store, "MAX_FLOWS_PER_HOST", 3):
+        with mock.patch.object(store, "effective_flows_cap",
+                               lambda: 3):
             store.save_flows(flows, base=self.tmp)
             self.assertEqual(len(store.load_host("api.example.com",
                                                  base=self.tmp)), 3)

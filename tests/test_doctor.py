@@ -32,8 +32,8 @@ class DoctorTests(unittest.TestCase):
                          {"ok", "required", "mitmweb_running",
                           "optional", "info"})
         self.assertEqual(len(result["required"]), 4)
-        self.assertEqual(len(result["optional"]), 8)
-        self.assertEqual(len(result["info"]), 3)
+        self.assertEqual(len(result["optional"]), 9)
+        self.assertEqual(len(result["info"]), 4)
         for c in result["required"] + result["optional"]:
             self.assertIn("name", c)
             self.assertIn("ok", c)
@@ -49,9 +49,14 @@ class DoctorTests(unittest.TestCase):
         self.assertIn("frida (defeat pinning in the app)", opt_names)
         self.assertIn("objection (patch APKs for the Frida gadget)",
                       opt_names)
+        # v0.5 item 3: Ghidra is an optional check.
+        self.assertIn("Ghidra (binary analysis)", opt_names)
         self.assertFalse(result["mitmweb_running"])
         self.assertIn("disk usage:", result["info"][1])
         self.assertIn("LAN IP", result["info"][2])
+        # v0.5 item 17: the measured specs line.
+        self.assertIn("this PC:", result["info"][3])
+        self.assertIn("RAM", result["info"][3])
 
     def test_qt_check_actually_imports(self):
         # Fake PySide6 present -> the check passes.
@@ -94,6 +99,33 @@ class DoctorTests(unittest.TestCase):
               if c["name"] == "Reblend (asset packs)"][0]
         self.assertTrue(rb["ok"])
         self.assertEqual(rb["detail"], "Reblend folder: /home/u/reblend")
+
+    def test_ghidra_detail_when_found(self):
+        det = {"found": True, "exe": "/home/u/opt/ghidra/support/x",
+               "home": "/home/u/opt/ghidra", "version": "12.2",
+               "java_major": 25, "required_jdk": 25, "java_ok": True,
+               "heap": "2G", "fix": None}
+        with mock.patch("mimik.doctor.ghidra.detect",
+                        return_value=det):
+            result = self._run()
+        gh = [c for c in result["optional"]
+              if c["name"] == "Ghidra (binary analysis)"][0]
+        self.assertTrue(gh["ok"])
+        self.assertEqual(gh["detail"], "Ghidra 12.2, JDK 25, heap 2G")
+
+    def test_ghidra_fix_when_missing(self):
+        det = {"found": False, "exe": None, "home": None,
+               "version": None, "java_major": None,
+               "required_jdk": 25, "java_ok": False, "heap": "2G",
+               "fix": "install Ghidra (see ghidra-setup)"}
+        with mock.patch("mimik.doctor.ghidra.detect",
+                        return_value=det):
+            result = self._run()
+        gh = [c for c in result["optional"]
+              if c["name"] == "Ghidra (binary analysis)"][0]
+        self.assertFalse(gh["ok"])
+        self.assertIn("ghidra-setup", gh["fix"])
+        self.assertIsNone(gh["detail"])
 
     def test_lan_ip_returns_something(self):
         ip = doctor.lan_ip()

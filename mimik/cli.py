@@ -17,6 +17,12 @@
     mimik presets match <host>        which pattern presets would apply
     mimik presets delete <name>       delete a preset
     mimik doctor                      check your setup
+    mimik ghidra-setup                steps to install Ghidra (binary analysis)
+    mimik analyze <file>              analyze a binary (headers, strings, ...)
+    mimik binaries                    list analyzed binaries
+    mimik binary-show <id>            show a binary's analysis
+    mimik binary-link <host> <id>     link a host's captures to a binary
+    mimik binary-unlink <host>        remove a host's binary link
 
 Own accounts only: MIMIK replays YOUR session, for YOUR apps and accounts.
 """
@@ -29,7 +35,7 @@ import shutil
 import subprocess
 import sys
 
-from . import assets, codegen, diff, doctor, export, filters, launch, presets, reblend_bridge, sample, screenshot, store, unpin, update, wine
+from . import assets, binary, codegen, diff, doctor, export, filters, ghidra, launch, presets, reblend_bridge, sample, screenshot, store, unpin, update, wine
 from . import __version__
 from .flows import fetch_flows
 from .recorder import ProxySession
@@ -339,6 +345,160 @@ def cmd_doctor(args):
     for line in result["info"]:
         print(line)
     sys.exit(0 if result["ok"] else 1)
+
+
+def cmd_ghidra_setup(args):
+    """Print the Ghidra setup steps for this PC (v0.5 item 11).
+    Prints steps; downloads nothing. Exit 0 when Ghidra is already
+    installed and usable, 1 when something is still missing."""
+    det = ghidra.detect()
+    if det["found"] and det["java_ok"]:
+        print(f"Ghidra {det['version']} is installed and ready "
+              f"(JDK {det['java_major']}, heap {det['heap']}).")
+        sys.exit(0)
+    for line in ghidra.setup_steps():
+        print(line)
+    if det["found"] and not det["java_ok"]:
+        print()
+        print("Ghidra is installed, but: " + det["fix"])
+    sys.exit(1)
+
+
+# ---- binaries (v0.5 item 9) --------------------------------------------------
+
+def _binary_summary(analysis):
+    """One-line summary of an analysis dict."""
+    gh = analysis.get("ghidra") or {}
+    gh_note = ""
+    if gh.get("functions") is not None:
+        gh_note = f", ghidra: {len(gh['functions'])} functions"
+    packed = [s["name"] for s in analysis["sections"] if s["packed"]]
+    packed_note = (f", packed: {', '.join(packed)}" if packed else "")
+    return (f"{analysis['source_name']} ({analysis['format'].upper()}, "
+            f"{store.format_size(analysis['size'])}, "
+            f"{len(analysis['sections'])} sections, "
+            f"{len(analysis['imports'])} imports, "
+            f"{len(analysis['exports'])} exports, "
+            f"{analysis['strings_total']} strings"
+            f"{packed_note}{gh_note})")
+
+
+def cmd_analyze(args):
+    """`mimik analyze <file>` — stdlib pass, plus --ghidra for the
+    full pass. --json prints the whole analysis for scripting."""
+    try:
+        analysis = binary.analyze(args.binary)
+    except binary.BinaryError as e:
+        sys.exit(str(e))
+    if args.ghidra:
+        try:
+            result = ghidra.run_analysis(
+                args.binary, binary.analysis_dir(analysis["sha256"]))
+        except ghidra.GhidraError as e:
+            sys.exit(str(e))
+        analysis = binary.update_ghidra(analysis["sha256"], result)
+    if args.json:
+        print(json.dumps(analysis, indent=2))
+        return
+    print("analyzed " + _binary_summary(analysis))
+    if args.ghidra:
+        gh = analysis["ghidra"] or {}
+        print(f"  ghidra: {len(gh.get('functions') or [])} functions, "
+              f"{len((gh.get('callgraph') or {}).get('edges') or [])} "
+              "call edges, "
+              f"{len((gh.get('xrefs') or {}).get('strings') or [])} "
+              "strings with xrefs")
+
+
+def cmd_binaries(args):
+    """`mimik binaries` — list analyzed binaries."""
+    rows = binary.list_binaries()
+    if not rows:
+        sys.exit("no binaries analyzed yet, "
+                 "run `mimik analyze <file>` first")
+    if args.json:
+        print(json.dumps(rows, indent=2))
+        return
+    print("analyzed binaries:")
+    for row in rows:
+        gh = "yes" if row["has_ghidra"] else "no"
+        print(f"  {row['sha256'][:12]}  {row['source_name']}  "
+              f"{row['format'].upper()}  "
+              f"{store.format_size(row['size'])}  ghidra: {gh}")
+
+
+def cmd_binary_show(args):
+    """`mimik binary-show <id>` — summary + strings + functions.
+    --json prints the whole analysis for scripting."""
+    sha = binary.resolve_binary(args.id)
+    if sha is None:
+        sys.exit(f"no binary matches '{args.id}' "
+                 "(try `mimik binaries` for the list)")
+    analysis = binary.load_analysis(sha)
+    if analysis is None:
+        sys.exit(f"no analysis saved for '{args.id}'")
+    if args.json:
+        print(json.dumps(analysis, indent=2))
+        return
+    print(_binary_summary(analysis))
+    print(f"  sha256: {analysis['sha256']}")
+    print(f"  source: {analysis['source_path']}")
+    print(f"  analyzed: {analysis['analyzed_at']}")
+    if analysis["sections"]:
+        print("\n  sections:")
+        for s in analysis["sections"]:
+            note = " (packed?)" if s["packed"] else ""
+            print(f"    {s['name']:<20} {s['size']:>8} bytes  "
+                  f"entropy {s['entropy']:.2f}{note}")
+    if analysis["imports"]:
+        print(f"\n  imports ({len(analysis['imports'])}): "
+              + ", ".join(analysis["imports"][:20])
+              + (" ..." if len(analysis["imports"]) > 20 else ""))
+    if analysis["exports"]:
+        print(f"  exports ({len(analysis['exports'])}): "
+              + ", ".join(analysis["exports"][:20])
+              + (" ..." if len(analysis["exports"]) > 20 else ""))
+    strings = analysis["strings"]
+    print(f"\n  strings ({analysis['strings_total']}"
+          + (", truncated" if analysis["strings_truncated"] else "")
+          + ", showing first 100):")
+    for s in strings[:100]:
+        print(f"    0x{s['offset']:x}  {s['text']}")
+    gh = analysis.get("ghidra") or {}
+    if gh.get("functions") is None:
+        print("\n  ghidra: not run "
+              "(run `mimik analyze --ghidra <file>` for decompiled "
+              "code and a call graph)")
+        return
+    funcs = gh["functions"]
+    print(f"\n  functions ({len(funcs)}, showing first 100):")
+    for fn in funcs[:100]:
+        print(f"    {fn['address']}  {fn['name']}")
+    names = (gh.get("callgraph") or {}).get("names") or {}
+    edges = (gh.get("callgraph") or {}).get("edges") or []
+    print(f"\n  call graph ({len(edges)} edges, showing first 50):")
+    for caller, callee in edges[:50]:
+        print(f"    {names.get(caller, caller)} -> "
+              f"{names.get(callee, callee)}")
+
+
+def cmd_binary_link(args):
+    """`mimik binary-link <host> <id>` — link a host to a binary."""
+    sha = binary.resolve_binary(args.id)
+    if sha is None:
+        sys.exit(f"no binary matches '{args.id}'")
+    binary.link_binary(args.host, sha)
+    meta = binary.load_meta(sha)
+    print(f"linked {args.host} to "
+          f"{meta['source_name'] if meta else args.id}")
+
+
+def cmd_binary_unlink(args):
+    """`mimik binary-unlink <host>` — remove a host's binary link."""
+    if binary.unlink_binary(args.host):
+        print(f"unlinked {args.host}")
+    else:
+        print(f"no binary linked to {args.host}")
 
 
 # ---- hosts / learn / gen / clients -------------------------------------------
@@ -1009,6 +1169,37 @@ def main(argv=None):
     rp.set_defaults(func=cmd_record)
 
     sub.add_parser("doctor", help="check your setup").set_defaults(func=cmd_doctor)
+    sub.add_parser("ghidra-setup",
+                   help="steps to install Ghidra (binary analysis)"
+                   ).set_defaults(func=cmd_ghidra_setup)
+    anp = sub.add_parser("analyze",
+                         help="analyze a binary (stdlib pass)")
+    anp.add_argument("binary", help="the file to analyze")
+    anp.add_argument("--ghidra", action="store_true",
+                     help="also run the Ghidra pass (decompile, "
+                     "call graph)")
+    anp.add_argument("--json", action="store_true",
+                     help="print the whole analysis as JSON")
+    anp.set_defaults(func=cmd_analyze)
+    bnp = sub.add_parser("binaries", help="list analyzed binaries")
+    bnp.add_argument("--json", action="store_true",
+                     help="print the list as JSON")
+    bnp.set_defaults(func=cmd_binaries)
+    bsp = sub.add_parser("binary-show",
+                         help="show a binary's analysis")
+    bsp.add_argument("id", help="sha256, sha prefix, or file name")
+    bsp.add_argument("--json", action="store_true",
+                     help="print the whole analysis as JSON")
+    bsp.set_defaults(func=cmd_binary_show)
+    blp = sub.add_parser("binary-link",
+                         help="link a host's captures to a binary")
+    blp.add_argument("host", help="the captured host")
+    blp.add_argument("id", help="sha256, sha prefix, or file name")
+    blp.set_defaults(func=cmd_binary_link)
+    bup = sub.add_parser("binary-unlink",
+                         help="remove a host's binary link")
+    bup.add_argument("host", help="the captured host")
+    bup.set_defaults(func=cmd_binary_unlink)
 
     hp = sub.add_parser("hosts", help="list captured hosts")
     hp.add_argument("--har", metavar="FILE", help="read from a HAR file")

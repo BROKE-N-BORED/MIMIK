@@ -30,6 +30,19 @@ MAX_FLOWS_PER_HOST = 5000
 DEFAULT_KEEP_SAVES = 20
 
 
+def effective_flows_cap():
+    """The per-host capture cap for this machine (v0.5 item 17/U35):
+    the machine module sizes it from measured RAM (5000 on 4-16 GB,
+    2500 below 4 GB, 10000 above 16 GB). Falls back to
+    MAX_FLOWS_PER_HOST if the measurement fails."""
+    try:
+        from . import machine
+
+        return machine.flows_cap()
+    except Exception:
+        return MAX_FLOWS_PER_HOST
+
+
 def format_size(size):
     """Human-readable byte count ("12 B", "3.4 KB", "2.0 MB", "2.0 GB")."""
     if size >= 1024 * 1024 * 1024:
@@ -340,7 +353,7 @@ def load_host(host, base=None):
                 continue
             seen.add(fid)
             flows.append(f)
-    return flows[-MAX_FLOWS_PER_HOST:]
+    return flows[-effective_flows_cap():]
 
 
 def load_all(base=None):
@@ -374,7 +387,7 @@ def list_captures(base=None):
     """[(host, flow_count, latest_saved_at)] for every captured host.
 
     flow_count is the number of distinct flows load_host() would return
-    for the host (deduped by id, capped at MAX_FLOWS_PER_HOST) — the two
+    for the host (deduped by id, capped at the effective cap) — the two
     agree by construction, so a host saved across many polls counts its
     flows once, not once per save.
     """
@@ -397,8 +410,9 @@ def list_captures(base=None):
         for f in data.get("flows", []):
             entry["ids"].add(f.get("id"))
         entry["latest"] = max(entry["latest"], stamp)
+    cap = effective_flows_cap()
     return sorted(
-        [(h, min(len(v["ids"]), MAX_FLOWS_PER_HOST), v["latest"])
+        [(h, min(len(v["ids"]), cap), v["latest"])
          for h, v in info.items()],
         key=lambda kv: -kv[1],
     )
@@ -409,10 +423,10 @@ def capture_stats(host, base=None):
     one host.
 
     flows: distinct flows saved for the host; kept: what load_host()
-    returns (capped at MAX_FLOWS_PER_HOST); truncated: True when flows
+    returns (capped at the effective cap); truncated: True when flows
     exceed the cap — the oldest flows exist on disk but load_host()
-    only sees the newest MAX_FLOWS_PER_HOST of them. bytes: the host's
-    capture files on disk.
+    only sees the newest ones. bytes: the host's capture files on
+    disk.
     """
     base = base or data_dir()
     ids = _saved_ids(host, base)
@@ -430,10 +444,11 @@ def capture_stats(host, base=None):
         if data is not None and data.get("host") == host:
             latest = max(latest, data.get("saved_at", ""))
     total = len(ids)
+    cap = effective_flows_cap()
     return {
         "flows": total,
-        "kept": min(total, MAX_FLOWS_PER_HOST),
-        "truncated": total > MAX_FLOWS_PER_HOST,
+        "kept": min(total, cap),
+        "truncated": total > cap,
         "files": len(files),
         "latest": latest,
         "bytes": total_bytes,

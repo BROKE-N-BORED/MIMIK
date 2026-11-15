@@ -1,6 +1,7 @@
 """Tests for the mimik CLI — hosts/learn/gen against the fixture HAR."""
 import argparse
 import io
+import json
 import os
 import sys
 import tempfile
@@ -234,6 +235,30 @@ class CliTests(unittest.TestCase):
             mock_mitm.return_value.flows.return_value = []
             out, code = run_cmd(cli.cmd_doctor, argparse.Namespace())
         self.assertEqual(code, 0)
+
+    def test_ghidra_setup_prints_steps_when_missing(self):
+        det = {"found": False, "exe": None, "home": None,
+               "version": None, "java_major": None,
+               "required_jdk": 25, "java_ok": False, "heap": "2G",
+               "fix": "install Ghidra"}
+        with mock.patch("mimik.cli.ghidra.detect", return_value=det):
+            out, code = run_cmd(cli.cmd_ghidra_setup,
+                                argparse.Namespace())
+        self.assertEqual(code, 1)
+        self.assertIn("github.com/NationalSecurityAgency/ghidra", out)
+        self.assertIn("JDK 25", out)
+
+    def test_ghidra_setup_ready_when_installed(self):
+        det = {"found": True, "exe": "/x/support/analyzeHeadless",
+               "home": "/x", "version": "12.2", "java_major": 25,
+               "required_jdk": 25, "java_ok": True, "heap": "2G",
+               "fix": None}
+        with mock.patch("mimik.cli.ghidra.detect", return_value=det):
+            out, code = run_cmd(cli.cmd_ghidra_setup,
+                                argparse.Namespace())
+        self.assertEqual(code, 0)
+        self.assertIn("12.2", out)
+        self.assertIn("ready", out)
 
     def test_record_web_prints_steps_and_exits(self):
         args = argparse.Namespace(target="web", file=None, pick=None,
@@ -579,6 +604,176 @@ class ImportCliTests(unittest.TestCase):
                                                curl="curl -H 'x: y'"))
         self.assertNotEqual(code, 0)
         self.assertIn("no URL found", str(code))
+
+
+class BinaryCliTests(unittest.TestCase):
+    """v0.5 item 9: analyze / binaries / binary-show / link."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        os.environ["MIMIK_DATA_DIR"] = self.tmp
+        self.orig_dir = os.getcwd()
+        os.chdir(self.tmp)
+        from tests.test_binary import build_tiny_elf
+
+        self.elf_path = os.path.join(self.tmp, "tiny.elf")
+        with open(self.elf_path, "wb") as f:
+            f.write(build_tiny_elf())
+
+    def tearDown(self):
+        os.chdir(self.orig_dir)
+        del os.environ["MIMIK_DATA_DIR"]
+
+    def _analyze(self):
+        args = argparse.Namespace(binary=self.elf_path, ghidra=False,
+                                  json=False)
+        return run_cmd(cli.cmd_analyze, args)
+
+    def test_analyze_stdlib(self):
+        out, code = self._analyze()
+        self.assertEqual(code, 0)
+        self.assertIn("analyzed tiny.elf", out)
+        self.assertIn("ELF", out)
+        self.assertIn("2 imports", out)
+        self.assertIn("1 exports", out)
+
+    def test_analyze_json(self):
+        args = argparse.Namespace(binary=self.elf_path, ghidra=False,
+                                  json=True)
+        out, code = run_cmd(cli.cmd_analyze, args)
+        self.assertEqual(code, 0)
+        data = json.loads(out)
+        self.assertEqual(data["format"], "elf")
+        self.assertEqual(data["imports"], ["printf", "puts"])
+
+    def test_analyze_missing_file(self):
+        args = argparse.Namespace(binary=os.path.join(self.tmp, "nope"),
+                                  ghidra=False, json=False)
+        _out, code = run_cmd(cli.cmd_analyze, args)
+        self.assertIn("no such file", str(code))
+
+    def test_analyze_ghidra_pass(self):
+        from mimik import binary as binary_mod
+
+        result = {"ok": True, "cancelled": False,
+                  "functions": [{"address": "0x401000", "name": "main",
+                                 "size": 42, "decompiled": True,
+                                 "disassembly": True}],
+                  "callgraph": {"edges": [["0x401000", "0x401020"]],
+                                "names": {"0x401000": "main",
+                                          "0x401020": "helper"}},
+                  "xrefs": {"strings": []}, "log_path": "/tmp/x.log",
+                  "heap": "2G", "version": "12.2"}
+        args = argparse.Namespace(binary=self.elf_path, ghidra=True,
+                                  json=False)
+        with mock.patch("mimik.cli.ghidra.run_analysis",
+                        return_value=result) as run:
+            out, code = run_cmd(cli.cmd_analyze, args)
+        self.assertEqual(code, 0)
+        self.assertIn("ghidra: 1 functions", out)
+        self.assertIn("1 call edges", out)
+        run.assert_called_once()
+        sha = binary_mod.resolve_binary("tiny.elf")
+        analysis = binary_mod.load_analysis(sha)
+        self.assertEqual(analysis["ghidra"]["version"], "12.2")
+
+    def test_analyze_ghidra_error(self):
+        from mimik import ghidra as ghidra_mod
+
+        args = argparse.Namespace(binary=self.elf_path, ghidra=True,
+                                  json=False)
+        with mock.patch("mimik.cli.ghidra.run_analysis",
+                        side_effect=ghidra_mod.GhidraError(
+                            "Ghidra is not installed")):
+            _out, code = run_cmd(cli.cmd_analyze, args)
+        self.assertIn("not installed", str(code))
+
+    def test_binaries_empty(self):
+        args = argparse.Namespace(json=False)
+        _out, code = run_cmd(cli.cmd_binaries, args)
+        self.assertIn("no binaries analyzed", str(code))
+
+    def test_binaries_lists(self):
+        self._analyze()
+        out, code = run_cmd(cli.cmd_binaries,
+                            argparse.Namespace(json=False))
+        self.assertEqual(code, 0)
+        self.assertIn("tiny.elf", out)
+        self.assertIn("ghidra: no", out)
+        out, code = run_cmd(cli.cmd_binaries,
+                            argparse.Namespace(json=True))
+        self.assertEqual(code, 0)
+        rows = json.loads(out)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["source_name"], "tiny.elf")
+
+    def test_binary_show(self):
+        self._analyze()
+        out, code = run_cmd(cli.cmd_binary_show,
+                            argparse.Namespace(id="tiny.elf",
+                                               json=False))
+        self.assertEqual(code, 0)
+        self.assertIn("HelloMIMIK", out)
+        self.assertIn("printf", out)
+        self.assertIn("myfunc", out)
+        self.assertIn("ghidra: not run", out)
+        out, code = run_cmd(cli.cmd_binary_show,
+                            argparse.Namespace(id="tiny.elf",
+                                               json=True))
+        self.assertEqual(json.loads(out)["format"], "elf")
+
+    def test_binary_show_with_ghidra(self):
+        result = {"ok": True, "cancelled": False,
+                  "functions": [{"address": "0x401000", "name": "main",
+                                 "size": 42, "decompiled": True,
+                                 "disassembly": True}],
+                  "callgraph": {"edges": [["0x401000", "0x401020"]],
+                                "names": {"0x401000": "main",
+                                          "0x401020": "helper"}},
+                  "xrefs": {"strings": []}, "log_path": "/tmp/x.log",
+                  "heap": "2G", "version": "12.2"}
+        args = argparse.Namespace(binary=self.elf_path, ghidra=True,
+                                  json=False)
+        with mock.patch("mimik.cli.ghidra.run_analysis",
+                        return_value=result):
+            run_cmd(cli.cmd_analyze, args)
+        out, code = run_cmd(cli.cmd_binary_show,
+                            argparse.Namespace(id="tiny.elf",
+                                               json=False))
+        self.assertEqual(code, 0)
+        self.assertIn("main", out)
+        self.assertIn("call graph (1 edges", out)
+        self.assertIn("main -> helper", out)
+
+    def test_binary_show_unknown(self):
+        _out, code = run_cmd(cli.cmd_binary_show,
+                             argparse.Namespace(id="nosuch",
+                                                json=False))
+        self.assertIn("no binary matches", str(code))
+
+    def test_binary_link_unlink(self):
+        from mimik import binary as binary_mod
+
+        self._analyze()
+        out, code = run_cmd(cli.cmd_binary_link, argparse.Namespace(
+            host="app.example.com", id="tiny.elf"))
+        self.assertEqual(code, 0)
+        self.assertIn("linked app.example.com", out)
+        sha = binary_mod.resolve_binary("tiny.elf")
+        self.assertEqual(binary_mod.binary_for_host("app.example.com"),
+                         sha)
+        out, code = run_cmd(cli.cmd_binary_unlink, argparse.Namespace(
+            host="app.example.com"))
+        self.assertEqual(code, 0)
+        self.assertIn("unlinked app.example.com", out)
+        out, code = run_cmd(cli.cmd_binary_unlink, argparse.Namespace(
+            host="app.example.com"))
+        self.assertIn("no binary linked", out)
+
+    def test_binary_link_unknown(self):
+        _out, code = run_cmd(cli.cmd_binary_link, argparse.Namespace(
+            host="app.example.com", id="nosuch"))
+        self.assertIn("no binary matches", str(code))
 
 
 class VersionTests(unittest.TestCase):

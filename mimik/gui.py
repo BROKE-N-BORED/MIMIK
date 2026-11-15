@@ -1,8 +1,8 @@
 """MIMIK desktop GUI — a native Qt window, never a web page.
 
-One window, seven tabs: Record | Hosts and Learn | Generate | Assets |
-Clients | Doctor | Presets. Dark, plain, big readable text. Accent
-violet #b48fdd only where needed.
+One window, eight tabs: Record | Hosts and Learn | Generate | Assets |
+Clients | Binary | Doctor | Presets. Dark, plain, big readable text.
+Accent violet #b48fdd only where needed.
 """
 import base64
 import html
@@ -12,16 +12,20 @@ import sys
 import threading
 import time
 
-from PySide6.QtCore import QSettings, QSize, Qt, QThread, QTimer, QUrl, Signal
+from PySide6.QtCore import (
+    QAbstractAnimation, QEasingCurve, QPropertyAnimation, QRect,
+    QSettings, QSize, Qt, QThread, QTimer, QUrl, Signal,
+)
 from PySide6.QtGui import QAction, QDesktopServices, QIcon, QPixmap
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDialog, QFileDialog, QGroupBox,
     QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem,
-    QMainWindow, QMessageBox, QPushButton, QSpinBox, QTabWidget,
-    QTableWidget, QTableWidgetItem, QTextEdit, QVBoxLayout, QWidget,
+    QMainWindow, QMessageBox, QPushButton, QScrollArea, QSpinBox,
+    QTabWidget, QTableWidget, QTableWidgetItem, QTextEdit, QToolButton,
+    QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
 )
 
-from . import assets, codegen, diff, doctor, export, filters, launch, log, presets, reblend_bridge, replay, sample, screenshot, store, unpin, update, websocket, wine
+from . import assets, binary, codegen, diff, doctor, export, filters, ghidra, howto, launch, log, presets, reblend_bridge, replay, sample, screenshot, store, unpin, update, websocket, wine
 from . import __version__
 from .flows import fetch_flows
 from .recorder import ProxySession
@@ -55,6 +59,11 @@ QListWidget, QTableWidget, QTextEdit, QComboBox {
 QComboBox { padding: 6px; }
 QGroupBox { border: 1px solid #33333a; margin-top: 12px; padding-top: 8px; }
 QGroupBox::title { color: #b48fdd; }
+QLabel#banner { background: #3a2f4a; padding: 8px 12px; font-weight: bold; }
+QLabel#explain { color: #9a9aa2; font-size: 12px; }
+QWidget#livestrip { background: #222228; }
+QLabel#livedot { color: #e06c6c; font-size: 16px; }
+QToolButton { background: #2c2c33; border: 1px solid #44444c; padding: 8px 12px; text-align: left; }
 """
 
 LIGHT_STYLESHEET = """
@@ -71,6 +80,11 @@ QListWidget, QTableWidget, QTextEdit, QComboBox {
 QComboBox { padding: 6px; }
 QGroupBox { border: 1px solid #c9c9cf; margin-top: 12px; padding-top: 8px; }
 QGroupBox::title { color: #6b3fa0; }
+QLabel#banner { background: #e8ddf2; padding: 8px 12px; font-weight: bold; }
+QLabel#explain { color: #66666e; font-size: 12px; }
+QWidget#livestrip { background: #e2e2e8; }
+QLabel#livedot { color: #c0392b; font-size: 16px; }
+QToolButton { background: #ffffff; border: 1px solid #b9b9c0; padding: 8px 12px; text-align: left; }
 """
 
 THEMES = ("dark", "light")
@@ -168,6 +182,38 @@ def _fmt_elapsed(seconds):
     return f"{seconds // 3600}:{seconds // 60 % 60:02d}:{seconds % 60:02d}"
 
 
+def _fmt_bytes(nbytes):
+    """512 B, 1.5 KB, 3.4 MB — one decimal, no trailing .0."""
+    nbytes = max(0, int(nbytes))
+    if nbytes < 1024:
+        return f"{nbytes} B"
+    if nbytes < 1024 * 1024:
+        value = nbytes / 1024
+        unit = "KB"
+    else:
+        value = nbytes / (1024 * 1024)
+        unit = "MB"
+    text = f"{value:.1f}".rstrip("0").rstrip(".")
+    return f"{text} {unit}"
+
+
+def _dir_size(path):
+    """Total bytes under a directory. Never raises (0 on error) —
+    the live strip must not die on a missing or unreadable dir."""
+    total = 0
+    try:
+        for _root, _dirs, files in os.walk(path):
+            for name in files:
+                try:
+                    total += os.path.getsize(
+                        os.path.join(_root, name))
+                except OSError:
+                    pass
+    except OSError:
+        return 0
+    return total
+
+
 def _empty_item(text):
     """A non-selectable placeholder row for an empty QListWidget —
     guidance instead of a blank black box. NoItemFlags means it can
@@ -187,6 +233,34 @@ def _empty_table_row(table, text):
     item = QTableWidgetItem(text)
     item.setFlags(Qt.NoItemFlags)
     table.setItem(0, 0, item)
+
+
+def _explain_label(text):
+    """A small plain-words explanation under a field (U20)."""
+    label = QLabel(text)
+    label.setWordWrap(True)
+    label.setObjectName("explain")
+    return label
+
+
+def _addr_int(text):
+    """A Ghidra address string ("0x00401000", leading zeros and all)
+    as an int, or None when it does not parse. Ghidra pads addresses;
+    the stdlib side does not — comparing ints is the only honest
+    match."""
+    try:
+        return int(text, 16)
+    except (TypeError, ValueError):
+        return None
+
+
+def _string_vaddr(offset, sections):
+    """A stdlib string's file offset as a virtual address, via the
+    section containing it. None when no section covers the offset."""
+    for s in sections:
+        if s["offset"] <= offset < s["offset"] + s["size"]:
+            return s["address"] + (offset - s["offset"])
+    return None
 
 
 def _ws_message_line(message):
@@ -515,6 +589,17 @@ class MainWindow(QMainWindow):
         self._gen_jump_host = None
         # The latest asset preview dialog (item 10).
         self._preview_dialog = None
+        # Live strip (item 19): built by _record_tab below; None
+        # until then, so _update_status_bar can run before the tab
+        # exists. MUST init here, not in the status-bar block —
+        # that runs after the tabs and would overwrite the strip.
+        self.live_strip = None
+        self._record_bytes_start = 0
+        # Micro-interactions (item 20): the settled completion text
+        # the status bar shows after a record/generate finishes, and
+        # one press-dip animation per button, reused across presses.
+        self._done_text = None
+        self._dip_anims = {}
 
         tabs = QTabWidget()
         tabs.addTab(self._record_tab(), "Record")
@@ -522,6 +607,7 @@ class MainWindow(QMainWindow):
         tabs.addTab(self._generate_tab(), "Generate")
         tabs.addTab(self._assets_tab(), "Assets")
         tabs.addTab(self._clients_tab(), "Clients")
+        tabs.addTab(self._binary_tab(), "Binary")
         tabs.addTab(self._doctor_tab(), "Doctor")
         tabs.addTab(self._presets_tab(), "Presets")
         self.tabs = tabs
@@ -586,11 +672,29 @@ class MainWindow(QMainWindow):
             hosts = "host" if self._host_count == 1 else "hosts"
             self.status_flows.setText(
                 f"{self._flow_count} {flows} · {self._host_count} {hosts}")
+            if self.live_strip is not None:
+                # Bytes are the captures-dir size delta since record
+                # start — real numbers from the store, never invented.
+                captured = max(
+                    0, _dir_size(store.captures_dir())
+                    - self._record_bytes_start)
+                self.live_text.setText(
+                    f"{self._flow_count} {flows} · "
+                    f"{self._host_count} {hosts} · "
+                    f"{_fmt_bytes(captured)} · "
+                    f"{_fmt_elapsed(elapsed)}")
+                self.live_strip.setVisible(True)
         else:
-            self.status_proxy.setText("Proxy stopped")
+            # Quiet completion state (item 20): after a record or a
+            # generate finishes, the status bar settles on what was
+            # done until the next recording starts. No modal, no
+            # popup — just the line.
+            self.status_proxy.setText(self._done_text or "Proxy stopped")
             flows = "flow" if self._saved_flows == 1 else "flows"
             self.status_flows.setText(
                 f"{self._saved_flows} saved {flows}")
+            if self.live_strip is not None:
+                self.live_strip.setVisible(False)
 
     # ---- close + startup safety ---------------------------------------------
 
@@ -694,7 +798,7 @@ class MainWindow(QMainWindow):
     # ---- background tasks + lazy tabs ----------------------------------------
 
     _TAB_KEYS = ("record", "hosts", "generate", "assets", "clients",
-                 "doctor", "presets")
+                 "binary", "doctor", "presets")
 
     def _run_task(self, label, fn, on_done, disable=()):
         """Run fn(worker) off the UI thread; on_done(ok, value) runs back
@@ -770,16 +874,25 @@ class MainWindow(QMainWindow):
     # ---- menu bar + shortcuts (item 30) ---------------------------------------
 
     def _build_menus(self):
-        """File / View / Help menus + shortcuts. All actions connect
-        to bound methods — no lambdas on signals (heap rule)."""
+        """File / Record / Generate / View / Help menus + shortcuts
+        (item 21, U38). All actions connect to bound methods — no
+        lambdas on signals (heap rule). Every app-level action is
+        reachable from a menu; per-selection contextual actions
+        (delete a host, replay a flow, link a binary, preview an
+        asset) stay on their tabs — they need a selection to act
+        on, so a menu item for them could do nothing useful."""
         menubar = self.menuBar()
         file_menu = menubar.addMenu("File")
+        self._file_menu = file_menu
         import_har = QAction("Import HAR…", self)
         import_har.triggered.connect(self._import_har)
         file_menu.addAction(import_har)
         import_curl = QAction("Import cURL…", self)
         import_curl.triggered.connect(self._import_curl)
         file_menu.addAction(import_curl)
+        scan_act = QAction("Scan a program folder…", self)
+        scan_act.triggered.connect(self._menu_scan_folder)
+        file_menu.addAction(scan_act)
         compare_act = QAction("Compare captures…", self)
         compare_act.triggered.connect(self._compare_captures)
         file_menu.addAction(compare_act)
@@ -789,13 +902,63 @@ class MainWindow(QMainWindow):
         file_menu.addAction(unpin_act)
         self._unpin_action = unpin_act
         file_menu.addSeparator()
+        analyze_act = QAction("Analyze a binary…", self)
+        analyze_act.triggered.connect(self._menu_analyze_binary)
+        file_menu.addAction(analyze_act)
+        ghidra_act = QAction("Ghidra setup steps…", self)
+        ghidra_act.triggered.connect(self._show_ghidra_setup)
+        file_menu.addAction(ghidra_act)
+        sample_act = QAction("Load sample capture", self)
+        sample_act.triggered.connect(self._menu_load_sample)
+        file_menu.addAction(sample_act)
+        file_menu.addSeparator()
         quit_act = QAction("Quit", self)
         quit_act.setShortcut("Ctrl+Q")
         quit_act.triggered.connect(self.close)
         file_menu.addAction(quit_act)
         self._quit_action = quit_act
 
+        record_menu = menubar.addMenu("Record")
+        self._record_menu = record_menu
+        start_act = QAction("Start recording", self)
+        start_act.setShortcut("Ctrl+R")
+        start_act.triggered.connect(self._menu_start_recording)
+        record_menu.addAction(start_act)
+        self._menu_start_act = start_act
+        stop_act = QAction("Stop recording", self)
+        stop_act.setEnabled(False)
+        stop_act.triggered.connect(self._menu_stop_recording)
+        record_menu.addAction(stop_act)
+        self._menu_stop_act = stop_act
+        record_menu.addSeparator()
+        filter_act = QAction("Exclude telemetry + analytics hosts", self)
+        filter_act.setCheckable(True)
+        filter_act.setChecked(self.filter_check.isChecked())
+        filter_act.triggered.connect(self._menu_toggle_filter)
+        record_menu.addAction(filter_act)
+        self._menu_filter_act = filter_act
+        shot_act = QAction(
+            "Screenshot the desktop when recording stops", self)
+        shot_act.setCheckable(True)
+        shot_act.setChecked(self.screenshot_check.isChecked())
+        shot_act.triggered.connect(self._menu_toggle_screenshot)
+        record_menu.addAction(shot_act)
+        self._menu_shot_act = shot_act
+
+        gen_menu = menubar.addMenu("Generate")
+        self._generate_menu = gen_menu
+        gen_act = QAction("Generate client", self)
+        gen_act.triggered.connect(self._menu_generate_client)
+        gen_menu.addAction(gen_act)
+        pack_act = QAction("Build asset pack", self)
+        pack_act.triggered.connect(self._menu_build_pack)
+        gen_menu.addAction(pack_act)
+        learn_act = QAction("Learn preset", self)
+        learn_act.triggered.connect(self._menu_learn_preset)
+        gen_menu.addAction(learn_act)
+
         view_menu = menubar.addMenu("View")
+        self._view_menu = view_menu
         self._tab_actions = []
         for index in range(self.tabs.count()):
             act = QAction(self.tabs.tabText(index), self)
@@ -819,6 +982,11 @@ class MainWindow(QMainWindow):
         self._dark_theme_action = dark_act
 
         help_menu = menubar.addMenu("Help")
+        self._help_menu = help_menu
+        howto_act = QAction("How to Use…", self)
+        howto_act.triggered.connect(self._show_howto)
+        help_menu.addAction(howto_act)
+        self._howto_action = howto_act
         about_act = QAction("About MIMIK", self)
         about_act.triggered.connect(self._show_about)
         help_menu.addAction(about_act)
@@ -826,6 +994,10 @@ class MainWindow(QMainWindow):
         log_act = QAction("View log", self)
         log_act.triggered.connect(self._show_log)
         help_menu.addAction(log_act)
+        debug_act = QAction("Copy debug report", self)
+        debug_act.triggered.connect(self._copy_debug_report)
+        help_menu.addAction(debug_act)
+        self._debug_action = debug_act
         update_act = QAction("Check for updates…", self)
         update_act.triggered.connect(self._check_for_updates)
         help_menu.addAction(update_act)
@@ -836,6 +1008,67 @@ class MainWindow(QMainWindow):
         action = self.sender()
         checked = action.isChecked() if action is not None else True
         self.set_theme("dark" if checked else "light")
+
+    # ---- menu actions (item 21) -------------------------------------------
+    # Each action goes to the tab that owns it, then runs it when its
+    # inputs are already there; otherwise it lands on the tab, whose
+    # guidance says what to pick. No action warns about a missing
+    # input the tab is still loading.
+
+    def _menu_start_recording(self):
+        """Record menu: go to the Record tab and start."""
+        self.tabs.setCurrentIndex(self._TAB_KEYS.index("record"))
+        self._start_recording()
+
+    def _menu_stop_recording(self):
+        """Record menu: go to the Record tab and stop."""
+        self.tabs.setCurrentIndex(self._TAB_KEYS.index("record"))
+        self._stop_recording()
+
+    def _menu_toggle_filter(self, checked=False):
+        """Record menu: the telemetry toggle mirrors the checkbox."""
+        self.filter_check.setChecked(checked)
+
+    def _menu_toggle_screenshot(self, checked=False):
+        """Record menu: the screenshot toggle mirrors the checkbox."""
+        self.screenshot_check.setChecked(checked)
+
+    def _menu_generate_client(self):
+        """Generate menu: go to the Generate tab and generate when a
+        host is already picked."""
+        self.tabs.setCurrentIndex(self._TAB_KEYS.index("generate"))
+        if self.gen_host.currentText().strip():
+            self._generate()
+
+    def _menu_build_pack(self):
+        """Generate menu: go to the Assets tab and build when a
+        group is picked."""
+        self.tabs.setCurrentIndex(self._TAB_KEYS.index("assets"))
+        if self.asset_group.currentData():
+            self._build_pack()
+
+    def _menu_learn_preset(self):
+        """Generate menu: go to the Presets tab and learn when a
+        source is picked."""
+        self.tabs.setCurrentIndex(self._TAB_KEYS.index("presets"))
+        if self.preset_source.currentData():
+            self._learn_preset()
+
+    def _menu_analyze_binary(self):
+        """File menu: go to the Binary tab and pick a file."""
+        self.tabs.setCurrentIndex(self._TAB_KEYS.index("binary"))
+        self._analyze_file_clicked()
+
+    def _menu_scan_folder(self):
+        """File menu: go to the Assets tab and pick a folder."""
+        self.tabs.setCurrentIndex(self._TAB_KEYS.index("assets"))
+        self._scan_assets_folder()
+
+    def _menu_load_sample(self):
+        """File menu: go to the Doctor tab and load the sample — the
+        handler reports into the Doctor text, so the tab must show."""
+        self.tabs.setCurrentIndex(self._TAB_KEYS.index("doctor"))
+        self._load_sample_clicked()
 
     def set_theme(self, name):
         """Switch the theme now + persist it (item 9). The window's own
@@ -849,6 +1082,13 @@ class MainWindow(QMainWindow):
         self.setStyleSheet(sheet)
         if hasattr(self, "_dark_theme_action"):
             self._dark_theme_action.setChecked(name == "dark")
+
+    def bring_to_front(self):
+        """Raise this window (used by the single-instance guard,
+        v0.5 item 14, U27)."""
+        self.show()
+        self.raise_()
+        self.activateWindow()
 
     def _menu_go_to_tab(self):
         """View menu tab jump — the action carries its tab index."""
@@ -872,6 +1112,8 @@ class MainWindow(QMainWindow):
             self._asset_group_selected()
         elif key == "clients":
             self._refresh_clients()
+        elif key == "binary":
+            self._refresh_binaries()
         elif key == "doctor":
             self._run_doctor()
         elif key == "presets":
@@ -905,6 +1147,9 @@ class MainWindow(QMainWindow):
         if key == "clients":
             self._refresh_clients()
             return True
+        if key == "binary":
+            self._refresh_binaries()
+            return True
         if key == "doctor":
             return self._run_doctor()
         if key == "presets":
@@ -915,7 +1160,27 @@ class MainWindow(QMainWindow):
     # ---- Record tab ----------------------------------------------------------
 
     def _record_tab(self):
+        # Toy surface (v0.5 item 16, U34): pick a target, Start, Stop
+        # — nothing else visible by default. Everything else lives
+        # behind one collapsible "More options" section; NOTHING is
+        # removed (U1: reorganize only). Every remaining field
+        # explains itself in plain words directly underneath it (U20).
+        #
+        # The content sits in a scroll area: with the file target +
+        # More options expanded the tab is taller than the window,
+        # and Qt squeezes a shown window's children instead of
+        # growing it (seen as the file box crushed to strips).
+        # Start/Stop stay OUTSIDE the scroll area: the primary
+        # action is always visible, never below the fold.
+        tab = QWidget()
+        outer = QVBoxLayout(tab)
+        outer.setContentsMargins(0, 0, 0, 0)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         w = QWidget()
+        scroll.setWidget(w)
+        outer.addWidget(scroll, 1)
         lay = QVBoxLayout(w)
 
         lay.addWidget(QLabel(
@@ -925,6 +1190,7 @@ class MainWindow(QMainWindow):
             "Start here: 1 Record an app → 2 pick a host on Hosts and "
             "Learn → 3 Generate a client.")
         self.start_here.setWordWrap(True)
+        self.start_here.setObjectName("banner")
         lay.addWidget(self.start_here)
         row = QHBoxLayout()
         row.addWidget(QLabel("Capture target:"))
@@ -934,6 +1200,27 @@ class MainWindow(QMainWindow):
         self.target_combo.currentIndexChanged.connect(self._target_changed)
         row.addWidget(self.target_combo, 1)
         lay.addLayout(row)
+        lay.addWidget(_explain_label(
+            "What you want to capture traffic from. The steps below "
+            "change with the target."))
+
+        # "More options": one collapsible section holding everything
+        # the toy surface does not need. It auto-expands when the
+        # target needs it (file / linux-app), so those flows never
+        # hit a dead end behind a collapsed section.
+        self.more_btn = QToolButton()
+        self.more_btn.setText("More options")
+        self.more_btn.setCheckable(True)
+        self.more_btn.setChecked(False)
+        self.more_btn.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        self.more_btn.setArrowType(Qt.RightArrow)
+        self.more_btn.toggled.connect(self._more_options_toggled)
+        lay.addWidget(self.more_btn)
+        self.more_box = QWidget()
+        more_lay = QVBoxLayout(self.more_box)
+        more_lay.setContentsMargins(0, 0, 0, 0)
+        self.more_box.setVisible(False)
+        lay.addWidget(self.more_box)
 
         # Capture filter (item 26): per-record control over the
         # telemetry/analytics exclusion list.
@@ -946,7 +1233,10 @@ class MainWindow(QMainWindow):
         manage_btn = QPushButton("Manage excluded hosts…")
         manage_btn.clicked.connect(self._show_excluded_hosts)
         frow.addWidget(manage_btn)
-        lay.addLayout(frow)
+        more_lay.addLayout(frow)
+        more_lay.addWidget(_explain_label(
+            "Telemetry and analytics hosts are skipped, so the host "
+            "list stays about the app."))
 
         # Stop-time screenshot (v0.4 item 15): one desktop screenshot
         # when recording stops, saved with the capture.
@@ -955,10 +1245,13 @@ class MainWindow(QMainWindow):
         self.screenshot_check.setChecked(presets.screenshot_enabled())
         self.screenshot_check.stateChanged.connect(
             self._screenshot_toggled)
-        lay.addWidget(self.screenshot_check)
+        more_lay.addWidget(self.screenshot_check)
+        more_lay.addWidget(_explain_label(
+            "A picture of the desktop, saved with the capture, so "
+            "you can see what was open."))
 
         self.lan_label = QLabel(f"LAN IP for the phone proxy: {doctor.lan_ip()}:8080")
-        lay.addWidget(self.lan_label)
+        more_lay.addWidget(self.lan_label)
 
         # File picker (file target only)
         self.file_box = QGroupBox("Program from file")
@@ -985,17 +1278,20 @@ class MainWindow(QMainWindow):
         clear_btn = QPushButton("Clear temp extractions (~/.cache/mimik/runs)")
         clear_btn.clicked.connect(self._clear_runs)
         flay.addWidget(clear_btn)
-        lay.addWidget(self.file_box)
+        more_lay.addWidget(self.file_box)
 
         # Linux-app launch command — a one-line shell command, so a
         # QLineEdit (item 32d), not the QTextEdit it used to be.
         self.app_box = QGroupBox("Linux app to launch (optional)")
-        alay = QHBoxLayout(self.app_box)
+        alay = QVBoxLayout(self.app_box)
         self.launch_edit = QLineEdit()
         self.launch_edit.setPlaceholderText("e.g. firefox   (leave blank to "
                                             "launch it yourself)")
-        alay.addWidget(self.launch_edit, 1)
-        lay.addWidget(self.app_box)
+        alay.addWidget(self.launch_edit)
+        alay.addWidget(_explain_label(
+            "A command MIMIK runs for you. Leave it blank and launch "
+            "the app yourself."))
+        more_lay.addWidget(self.app_box)
 
         self.steps = QTextEdit()
         self.steps.setReadOnly(True)
@@ -1012,21 +1308,82 @@ class MainWindow(QMainWindow):
         self.start_btn = QPushButton("Start proxy")
         self.start_btn.setObjectName("big")
         self.start_btn.clicked.connect(self._start_recording)
+        self.start_btn.pressed.connect(self._dip_start)
         self.stop_btn = QPushButton("Stop")
         self.stop_btn.setObjectName("big")
         self.stop_btn.setEnabled(False)
         self.stop_btn.clicked.connect(self._stop_recording)
+        self.stop_btn.pressed.connect(self._dip_stop)
+        # Live measurements strip (item 19, U37): display only,
+        # shown while recording, hidden when idle. It sits outside
+        # the scroll area with the buttons, so it is always visible
+        # while a recording runs. Calm by design: one small line, a
+        # red dot, no popups for routine state.
+        self.live_strip = QWidget()
+        self.live_strip.setObjectName("livestrip")
+        slay = QHBoxLayout(self.live_strip)
+        slay.setContentsMargins(12, 6, 12, 6)
+        self.live_dot = QLabel("●")
+        self.live_dot.setObjectName("livedot")
+        slay.addWidget(self.live_dot)
+        self.live_text = QLabel("")
+        slay.addWidget(self.live_text, 1)
+        self.live_strip.setVisible(False)
+        outer.addWidget(self.live_strip)
+
         brow.addWidget(self.start_btn, 1)
         brow.addWidget(self.stop_btn, 1)
-        lay.addLayout(brow)
+        outer.addLayout(brow)
 
         self._target_changed()
-        return w
+        return tab
+
+    def _dip_button(self, button):
+        """Press dip (item 20): the button shrinks to 97% and settles
+        back over 150 ms. Geometry only — no layout thrash, no
+        shadow or blur work, cheap on a 2-core PC. One animation per
+        button, reused across presses (a re-press restarts it)."""
+        anim = self._dip_anims.get(button)
+        if anim is None:
+            anim = QPropertyAnimation(button, b"geometry", self)
+            anim.setDuration(150)
+            anim.setEasingCurve(QEasingCurve.OutBack)
+            self._dip_anims[button] = anim
+        anim.stop()
+        start = button.geometry()
+        center = start.center()
+        width = max(1, int(start.width() * 0.97))
+        height = max(1, int(start.height() * 0.97))
+        small = QRect(center.x() - width // 2, center.y() - height // 2,
+                      width, height)
+        anim.setStartValue(start)
+        anim.setKeyValueAt(0.5, small)
+        anim.setEndValue(start)
+        anim.start()
+
+    def _dip_start(self):
+        self._dip_button(self.start_btn)
+
+    def _dip_stop(self):
+        self._dip_button(self.stop_btn)
+
+    def _more_options_toggled(self, checked):
+        """The Record tab's "More options" section (item 16)."""
+        self.more_box.setVisible(checked)
+        self.more_btn.setArrowType(
+            Qt.DownArrow if checked else Qt.RightArrow)
 
     def _target_changed(self):
         key = self.target_combo.currentData()
         self.file_box.setVisible(key == "file")
         self.app_box.setVisible(key == "linux-app")
+        # The file picker and the launch box live inside "More
+        # options": auto-expand it when the target needs one, so
+        # those flows never hit a dead end behind a collapsed
+        # section. Never auto-collapses: the user's state is theirs.
+        if key in ("file", "linux-app") \
+                and not self.more_btn.isChecked():
+            self.more_btn.setChecked(True)
 
         if key == "android":
             self.steps.setText(GUI_ANDROID_STEPS.format(ip=doctor.lan_ip()))
@@ -1065,6 +1422,11 @@ class MainWindow(QMainWindow):
         """The Record tab's filter checkbox — a persistent setting,
         like auto-learn."""
         presets.set_filtering_enabled(self.filter_check.isChecked())
+        # Keep the Record menu toggle in sync. Guarded: this fires
+        # during tab construction, before the menus exist.
+        action = getattr(self, "_menu_filter_act", None)
+        if action is not None:
+            action.setChecked(self.filter_check.isChecked())
 
     def _show_excluded_hosts(self):
         """The exclusion-list editor: the effective list, add/remove,
@@ -1211,11 +1573,15 @@ class MainWindow(QMainWindow):
         self.worker.start()
         self.start_btn.setEnabled(False)
         self.stop_btn.setEnabled(True)
+        self._menu_start_act.setEnabled(False)
+        self._menu_stop_act.setEnabled(True)
         self.target_combo.setEnabled(False)
         self.host_list.clear()
         self._record_started = time.monotonic()
         self._flow_count = 0
         self._host_count = 0
+        self._done_text = None
+        self._record_bytes_start = _dir_size(store.captures_dir())
         self._status_timer.start()
         self._update_status_bar()
 
@@ -1244,11 +1610,17 @@ class MainWindow(QMainWindow):
             self._take_stop_screenshot()
             self.worker.request_stop()
             self.stop_btn.setEnabled(False)
+            self._menu_stop_act.setEnabled(False)
             self.steps.append("stopping…")
 
     def _screenshot_toggled(self):
         presets.set_screenshot_enabled(
             self.screenshot_check.isChecked())
+        # Keep the Record menu toggle in sync. Guarded: this fires
+        # during tab construction, before the menus exist.
+        action = getattr(self, "_menu_shot_act", None)
+        if action is not None:
+            action.setChecked(self.screenshot_check.isChecked())
 
     def _take_stop_screenshot(self):
         """The stop-time screenshot (v0.4 item 15), on the GUI thread
@@ -1272,9 +1644,18 @@ class MainWindow(QMainWindow):
         self._record_started = None
         self._status_timer.stop()
         self._refresh_saved_flows()
+        # Quiet completion state (item 20): the settled status names
+        # what the recording caught. The counts are the session's
+        # (reset only when the next recording starts).
+        flows = "flow" if self._flow_count == 1 else "flows"
+        hosts = "host" if self._host_count == 1 else "hosts"
+        self._done_text = (f"✓ Recorded {self._flow_count} {flows} "
+                           f"from {self._host_count} {hosts}")
         self._update_status_bar()
         self.start_btn.setEnabled(True)
         self.stop_btn.setEnabled(False)
+        self._menu_start_act.setEnabled(True)
+        self._menu_stop_act.setEnabled(False)
         self.target_combo.setEnabled(True)
         self._target_changed()
         self._invalidate_flows()
@@ -1300,6 +1681,9 @@ class MainWindow(QMainWindow):
         gen_btn = QPushButton("Generate client…")
         gen_btn.clicked.connect(self._generate_for_host)
         row.addWidget(gen_btn)
+        link_btn = QPushButton("Link binary…")
+        link_btn.clicked.connect(self._link_binary_clicked)
+        row.addWidget(link_btn)
         row.addStretch(1)
         lay.addLayout(row)
         self.hosts_list = QListWidget()
@@ -1308,6 +1692,14 @@ class MainWindow(QMainWindow):
             "No captures yet. Record an app, or import a HAR on the "
             "Generate tab."))
         lay.addWidget(self.hosts_list, 1)
+        brow = QHBoxLayout()
+        self.host_binary_label = QLabel("Binary: none linked yet.")
+        brow.addWidget(self.host_binary_label, 1)
+        self.host_binary_jump = QPushButton("View in Binary tab")
+        self.host_binary_jump.clicked.connect(self._view_linked_binary)
+        self.host_binary_jump.setEnabled(False)
+        brow.addWidget(self.host_binary_jump)
+        lay.addLayout(brow)
         lay.addWidget(QLabel("Endpoints for the selected host:"))
         frow = QHBoxLayout()
         frow.addWidget(QLabel("Filter:"))
@@ -1390,7 +1782,7 @@ class MainWindow(QMainWindow):
                     text += f"  ({store.format_size(size)})"
                 if truncated:
                     text += ("  (truncated, showing newest %d)"
-                             % store.MAX_FLOWS_PER_HOST)
+                             % store.effective_flows_cap())
                 item = QListWidgetItem(text)
                 item.setData(Qt.UserRole, host)
                 self.hosts_list.addItem(item)
@@ -1446,12 +1838,99 @@ class MainWindow(QMainWindow):
     def _host_selected(self, current, _prev):
         self.ep_table.setRowCount(0)
         if current is None:
+            self._update_host_binary_link(None)
             return
-        self._pending_host = current.data(Qt.UserRole)
+        host = current.data(Qt.UserRole)
+        self._update_host_binary_link(host)
+        self._pending_host = host
         if self._task is None:
             host = self._pending_host
             self._pending_host = None
             self._start_host_task(host)
+
+    def _update_host_binary_link(self, host):
+        """The linked-binary label under the host list (v0.5 item 10):
+        the same app, two views (traffic + code)."""
+        sha = binary.binary_for_host(host) if host else None
+        if sha is None:
+            self.host_binary_label.setText("Binary: none linked yet.")
+            self.host_binary_jump.setEnabled(False)
+            return
+        meta = binary.load_meta(sha)
+        name = meta["source_name"] if meta else sha[:12]
+        self.host_binary_label.setText(
+            f"Binary: {name} (same app, traffic and code)")
+        self.host_binary_jump.setEnabled(True)
+
+    def _link_binary_clicked(self):
+        """Manual 'Link binary…' for a host (v0.5 item 10). No
+        binaries yet is not a dead end — the dialog offers the
+        Binary tab."""
+        item = self.hosts_list.currentItem()
+        if item is None or not item.data(Qt.UserRole):
+            QMessageBox.warning(self, "MIMIK", "select a host first")
+            return
+        host = item.data(Qt.UserRole)
+        rows = binary.list_binaries()
+        if not rows:
+            answer = QMessageBox.question(
+                self, "MIMIK",
+                "No binaries analyzed yet. Open the Binary tab to "
+                "analyze one?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes)
+            if answer == QMessageBox.Yes:
+                self.tabs.setCurrentIndex(5)  # Binary tab
+            return
+        dlg = QDialog(self)
+        dlg.setWindowTitle(f"Link a binary to {host}")
+        dlg.resize(500, 300)
+        lay = QVBoxLayout(dlg)
+        lay.addWidget(QLabel(
+            "Pick the program file this host belongs to:"))
+        lst = QListWidget()
+        for row in rows:
+            entry = QListWidgetItem(
+                f"{row['source_name']}  ({row['format'].upper()})")
+            entry.setData(Qt.UserRole, row["sha256"])
+            lst.addItem(entry)
+        lay.addWidget(lst, 1)
+        brow = QHBoxLayout()
+        link = QPushButton("Link")
+        link.clicked.connect(self._link_dialog_accept)
+        brow.addWidget(link)
+        cancel = QPushButton("Cancel")
+        cancel.clicked.connect(dlg.reject)
+        brow.addWidget(cancel)
+        lay.addLayout(brow)
+        self._link_dialog = dlg
+        self._link_list = lst
+        self._link_host = host
+        dlg.exec()
+
+    def _link_dialog_accept(self):
+        """The Link button in the link dialog."""
+        item = self._link_list.currentItem()
+        if item is None:
+            QMessageBox.warning(self, "MIMIK", "select a binary first")
+            return
+        binary.link_binary(self._link_host,
+                           item.data(Qt.UserRole))
+        self._link_dialog.accept()
+        self._update_host_binary_link(self._link_host)
+
+    def _view_linked_binary(self):
+        """Jump to the Binary tab with the linked binary selected."""
+        item = self.hosts_list.currentItem()
+        if item is None or not item.data(Qt.UserRole):
+            return
+        sha = binary.binary_for_host(item.data(Qt.UserRole))
+        if sha is None:
+            return
+        self.tabs.setCurrentIndex(5)  # Binary tab
+        if "binary" not in self._loaded:
+            self._refresh_binaries()
+            self._loaded.add("binary")
+        self._select_binary(sha)
 
     def _start_host_task(self, host):
         """Endpoints for one host, off the UI thread (building them from
@@ -1877,6 +2356,9 @@ class MainWindow(QMainWindow):
         refresh.clicked.connect(self._refresh_gen_hosts_clicked)
         row.addWidget(refresh)
         lay.addLayout(row)
+        lay.addWidget(_explain_label(
+            "The server the app talks to. Usually the one with JSON, "
+            "not media or CDN."))
 
         row = QHBoxLayout()
         har_btn = QPushButton("Import HAR…")
@@ -2085,6 +2567,11 @@ class MainWindow(QMainWindow):
             self.open_btn.setEnabled(True)
             self.copy_btn.setEnabled(True)
             self._refresh_clients()
+            # Quiet completion state (item 20): the settled status
+            # names the client that was written.
+            self._done_text = (f"✓ Client written: "
+                               f"{os.path.basename(out)}")
+            self._update_status_bar()
 
         # Endpoint building + generation (and up to 300 s of Ollama
         # polish) run off the UI thread — the window stays responsive
@@ -3178,6 +3665,547 @@ class MainWindow(QMainWindow):
         self._run_task("smoke-testing…", work, done,
                        disable=(self.smoke_btn,))
 
+    # ---- Binary tab (v0.5 item 8) --------------------------------------------
+
+    def _binary_tab(self):
+        w = QWidget()
+        lay = QVBoxLayout(w)
+        lay.addWidget(QLabel(
+            "Analyze a program file: what it is, what it calls, what "
+            "words it contains. MIMIK reads the file, it never runs it."))
+        row = QHBoxLayout()
+        self.binary_analyze_btn = QPushButton("Analyze a file…")
+        self.binary_analyze_btn.clicked.connect(self._analyze_file_clicked)
+        row.addWidget(self.binary_analyze_btn)
+        self.binary_ghidra_btn = QPushButton("Run Ghidra pass")
+        self.binary_ghidra_btn.clicked.connect(self._run_ghidra_clicked)
+        self.binary_ghidra_btn.setEnabled(False)
+        row.addWidget(self.binary_ghidra_btn)
+        self.binary_delete_btn = QPushButton("Delete analysis…")
+        self.binary_delete_btn.clicked.connect(self._delete_binary)
+        self.binary_delete_btn.setEnabled(False)
+        row.addWidget(self.binary_delete_btn)
+        refresh = QPushButton("Refresh")
+        refresh.clicked.connect(self._refresh_binaries_clicked)
+        row.addWidget(refresh)
+        row.addStretch(1)
+        lay.addLayout(row)
+        split = QHBoxLayout()
+        self.binaries_list = QListWidget()
+        self.binaries_list.currentItemChanged.connect(
+            self._binary_selected)
+        self.binaries_list.addItem(_empty_item(
+            "No binaries analyzed yet. Analyze a file to see it here."))
+        split.addWidget(self.binaries_list, 1)
+        self.binary_views = QTabWidget()
+        self.binary_summary = QTextEdit()
+        self.binary_summary.setReadOnly(True)
+        self.binary_summary.setPlaceholderText(
+            "Select a binary to see its summary.")
+        self.binary_views.addTab(self.binary_summary, "Summary")
+        func_w = QWidget()
+        func_lay = QVBoxLayout(func_w)
+        self.binary_func_filter = QLineEdit()
+        self.binary_func_filter.setPlaceholderText("filter functions…")
+        self.binary_func_filter.textChanged.connect(
+            self._filter_binary_functions)
+        func_lay.addWidget(self.binary_func_filter)
+        self.binary_func_list = QListWidget()
+        self.binary_func_list.currentItemChanged.connect(
+            self._binary_function_selected)
+        func_lay.addWidget(self.binary_func_list, 1)
+        self.binary_views.addTab(func_w, "Functions")
+        self.binary_decomp_text = QTextEdit()
+        self.binary_decomp_text.setReadOnly(True)
+        (decomp_w, self.binary_decomp_state,
+         self.binary_decomp_btn) = self._ghidra_state_view(
+            self.binary_decomp_text)
+        self.binary_views.addTab(decomp_w, "Decompiled")
+        self.binary_asm_text = QTextEdit()
+        self.binary_asm_text.setReadOnly(True)
+        (asm_w, self.binary_asm_state,
+         self.binary_asm_btn) = self._ghidra_state_view(
+            self.binary_asm_text)
+        self.binary_views.addTab(asm_w, "Disassembly")
+        str_w = QWidget()
+        str_lay = QVBoxLayout(str_w)
+        self.binary_str_info = QLabel("")
+        self.binary_str_info.setWordWrap(True)
+        str_lay.addWidget(self.binary_str_info)
+        self.binary_str_filter = QLineEdit()
+        self.binary_str_filter.setPlaceholderText("filter strings…")
+        self.binary_str_filter.textChanged.connect(
+            self._filter_binary_strings)
+        str_lay.addWidget(self.binary_str_filter)
+        self.binary_str_table = QTableWidget(0, 3)
+        self.binary_str_table.setHorizontalHeaderLabels(
+            ["Offset", "Text", "Referenced by"])
+        self.binary_str_table.horizontalHeader().setStretchLastSection(
+            True)
+        str_lay.addWidget(self.binary_str_table, 1)
+        self.binary_views.addTab(str_w, "Strings")
+        self.binary_call_tree = QTreeWidget()
+        self.binary_call_tree.setHeaderLabel("Call graph")
+        (cg_w, self.binary_cg_state,
+         self.binary_cg_btn) = self._ghidra_state_view(
+            self.binary_call_tree)
+        self.binary_views.addTab(cg_w, "Call graph")
+        split.addWidget(self.binary_views, 2)
+        lay.addLayout(split, 1)
+        self._binary_sha = None
+        self._binary_analysis = None
+        self._binary_func = None
+        self._binary_functions = []
+        self._binary_strings = []
+        # No load here — the tab loads on first show (_tab_shown).
+        return w
+
+    def _ghidra_state_view(self, content):
+        """A view whose content needs the Ghidra pass: a state label +
+        setup button on top, the content below. Returns (widget,
+        state label, setup button)."""
+        w = QWidget()
+        lay = QVBoxLayout(w)
+        state = QLabel("")
+        state.setWordWrap(True)
+        lay.addWidget(state)
+        btn = QPushButton("Ghidra setup steps…")
+        btn.clicked.connect(self._show_ghidra_setup)
+        lay.addWidget(btn)
+        lay.addWidget(content, 1)
+        return w, state, btn
+
+    def _set_ghidra_view(self, state, btn, content, what):
+        """Show the honest state for a Ghidra-dependent view: no
+        binary, no Ghidra install, pass not run yet, or content
+        ready. Never a dead end — the setup button is there when
+        Ghidra is the missing piece."""
+        analysis = self._binary_analysis
+        if analysis is None:
+            state.setText("Select a binary to see its " + what + ".")
+            state.setVisible(True)
+            btn.setVisible(False)
+            content.setVisible(False)
+            return
+        if (analysis.get("ghidra") or {}).get("functions") is None:
+            det = ghidra.detect()
+            if not det["found"] or not det["java_ok"]:
+                state.setText(
+                    "Ghidra is not installed, so this binary has no "
+                    + what + " yet. Install Ghidra, then press "
+                    "'Run Ghidra pass' above.")
+                btn.setVisible(True)
+            else:
+                state.setText(
+                    "The Ghidra pass has not run for this binary yet. "
+                    "Press 'Run Ghidra pass' above.")
+                btn.setVisible(False)
+            state.setVisible(True)
+            content.setVisible(False)
+            return
+        state.setVisible(False)
+        btn.setVisible(False)
+        content.setVisible(True)
+
+    def _refresh_binaries_clicked(self, _checked=False):
+        self._refresh_binaries()
+
+    def _refresh_binaries(self):
+        """Reload the analyzed-binaries list. Returns True (sync — no
+        background task needed, the list is small)."""
+        rows = binary.list_binaries()
+        self.binaries_list.clear()
+        if not rows:
+            self.binaries_list.addItem(_empty_item(
+                "No binaries analyzed yet. Analyze a file to see it "
+                "here."))
+            self._binary_sha = None
+            self._binary_analysis = None
+            self._binary_func = None
+            self.binary_ghidra_btn.setEnabled(False)
+            self.binary_delete_btn.setEnabled(False)
+            self._show_binary_views()
+            return True
+        for row in rows:
+            item = QListWidgetItem(
+                f"{row['source_name']}  ({row['format'].upper()}, "
+                f"ghidra: {'yes' if row['has_ghidra'] else 'no'})")
+            item.setData(Qt.UserRole, row["sha256"])
+            self.binaries_list.addItem(item)
+        if self._binary_sha is not None:
+            self._select_binary(self._binary_sha)
+        return True
+
+    def _select_binary(self, sha):
+        """Select a binary in the list by sha256. Returns True when
+        it was found."""
+        for i in range(self.binaries_list.count()):
+            item = self.binaries_list.item(i)
+            if item.data(Qt.UserRole) == sha:
+                self.binaries_list.setCurrentRow(i)
+                return True
+        return False
+
+    def _binary_selected(self, current, _prev):
+        sha = current.data(Qt.UserRole) if current is not None else None
+        if not sha:
+            self._binary_sha = None
+            self._binary_analysis = None
+            self._binary_func = None
+            self.binary_ghidra_btn.setEnabled(False)
+            self.binary_delete_btn.setEnabled(False)
+            self._show_binary_views()
+            return
+        self._binary_sha = sha
+        self._binary_analysis = binary.load_analysis(sha)
+        self._binary_func = None
+        self.binary_ghidra_btn.setEnabled(True)
+        self.binary_delete_btn.setEnabled(True)
+        self._show_binary_views()
+
+    def _show_binary_views(self):
+        """Fill every inner view from the selected analysis (or clear
+        them when nothing is selected)."""
+        analysis = self._binary_analysis
+        if analysis is None:
+            self.binary_summary.setPlainText("")
+            self._binary_functions = []
+            self._binary_strings = []
+            self._fill_binary_functions()
+            self._fill_binary_strings()
+            self.binary_call_tree.clear()
+            self._set_ghidra_view(self.binary_decomp_state,
+                                  self.binary_decomp_btn,
+                                  self.binary_decomp_text,
+                                  "decompiled code")
+            self._set_ghidra_view(self.binary_asm_state,
+                                  self.binary_asm_btn,
+                                  self.binary_asm_text,
+                                  "disassembly listing")
+            self._set_ghidra_view(self.binary_cg_state,
+                                  self.binary_cg_btn,
+                                  self.binary_call_tree,
+                                  "call graph")
+            return
+        self.binary_summary.setPlainText(
+            self._binary_summary_text(analysis))
+        gh = analysis.get("ghidra") or {}
+        self._binary_functions = gh.get("functions") or []
+        self._binary_strings = analysis["strings"]
+        self.binary_func_filter.setText("")
+        self.binary_str_filter.setText("")
+        self._fill_binary_functions()
+        self._fill_binary_strings()
+        self._fill_binary_callgraph()
+        self._set_ghidra_view(self.binary_decomp_state,
+                              self.binary_decomp_btn,
+                              self.binary_decomp_text,
+                              "decompiled code")
+        self._set_ghidra_view(self.binary_asm_state,
+                              self.binary_asm_btn,
+                              self.binary_asm_text,
+                              "disassembly listing")
+        self._set_ghidra_view(self.binary_cg_state,
+                              self.binary_cg_btn,
+                              self.binary_call_tree,
+                              "call graph")
+        self._show_binary_function()
+
+    def _binary_summary_text(self, analysis):
+        """The Summary view: plain words, real numbers."""
+        lines = [analysis["source_name"],
+                 f"{analysis['format'].upper()}, "
+                 f"{store.format_size(analysis['size'])}, analyzed "
+                 f"{analysis['analyzed_at']}",
+                 f"SHA-256: {analysis['sha256']}",
+                 f"Source: {analysis['source_path']}", ""]
+        if analysis["sections"]:
+            lines.append(f"Sections ({len(analysis['sections'])}):")
+            for s in analysis["sections"]:
+                note = " (packed?)" if s["packed"] else ""
+                lines.append(f"  {s['name']}: {s['size']} bytes, "
+                             f"entropy {s['entropy']:.2f}{note}")
+            lines.append("")
+        if analysis["imports"]:
+            lines.append(f"Imports ({len(analysis['imports'])}): "
+                         + ", ".join(analysis["imports"]))
+        if analysis["exports"]:
+            lines.append(f"Exports ({len(analysis['exports'])}): "
+                         + ", ".join(analysis["exports"]))
+        if analysis["imports"] or analysis["exports"]:
+            lines.append("")
+        lines.append(f"Strings: {analysis['strings_total']}"
+                     + (" (list truncated at 50,000)"
+                        if analysis["strings_truncated"] else ""))
+        gh = analysis.get("ghidra") or {}
+        if gh.get("functions") is None:
+            lines.append("Ghidra: pass not run yet")
+        else:
+            edges = (gh.get("callgraph") or {}).get("edges") or []
+            lines.append(f"Ghidra: {len(gh['functions'])} functions, "
+                         f"{len(edges)} call edges "
+                         f"(Ghidra {gh.get('version') or '?'})")
+        linked = [host for host, sha in binary.get_links().items()
+                  if sha == analysis["sha256"]]
+        if linked:
+            lines.append("Linked captures: " + ", ".join(sorted(linked)))
+        if analysis["parse_notes"]:
+            lines.append("")
+            lines.append("Notes:")
+            for note in analysis["parse_notes"]:
+                lines.append("  " + note)
+        return "\n".join(lines)
+
+    def _fill_binary_functions(self):
+        """The Functions list, filtered by the filter box."""
+        needle = self.binary_func_filter.text().strip().lower()
+        self.binary_func_list.clear()
+        funcs = self._binary_functions
+        if needle:
+            funcs = [f for f in funcs
+                     if needle in f["name"].lower()
+                     or needle in f["address"].lower()]
+        if not self._binary_functions:
+            if self._binary_analysis is None:
+                self.binary_func_list.addItem(_empty_item(
+                    "Select a binary to see its functions."))
+            else:
+                self.binary_func_list.addItem(_empty_item(
+                    "No functions yet. Functions come from the "
+                    "Ghidra pass (press 'Run Ghidra pass' above, "
+                    "or install Ghidra first)."))
+            return
+        if not funcs:
+            self.binary_func_list.addItem(_empty_item(
+                "No functions match that filter."))
+            return
+        for fn in funcs:
+            item = QListWidgetItem(
+                f"{fn['address']}  {fn['name']}")
+            item.setData(Qt.UserRole, fn["address"])
+            self.binary_func_list.addItem(item)
+
+    def _filter_binary_functions(self, _text):
+        self._fill_binary_functions()
+
+    def _binary_function_selected(self, current, _prev):
+        addr = current.data(Qt.UserRole) if current is not None else None
+        self._binary_func = addr
+        self._show_binary_function()
+        self._fill_binary_callgraph()
+
+    def _show_binary_function(self):
+        """Decompiled C + disassembly for the selected function."""
+        analysis = self._binary_analysis
+        if analysis is None:
+            self.binary_decomp_text.setPlainText("")
+            self.binary_asm_text.setPlainText("")
+            return
+        if (analysis.get("ghidra") or {}).get("functions") is None:
+            return  # the honest state label is showing instead
+        if not self._binary_func:
+            self.binary_decomp_text.setPlainText(
+                "Select a function (Functions tab) to see its "
+                "decompiled C.")
+            self.binary_asm_text.setPlainText(
+                "Select a function (Functions tab) to see its "
+                "disassembly.")
+            return
+        name = ""
+        for fn in self._binary_functions:
+            if fn["address"] == self._binary_func:
+                name = fn["name"]
+                break
+        c_path, asm_path = binary.function_files(
+            analysis["sha256"], self._binary_func, name)
+        if c_path is not None:
+            try:
+                with open(c_path, "r", encoding="utf-8",
+                          errors="replace") as f:
+                    self.binary_decomp_text.setPlainText(f.read())
+            except OSError:
+                self.binary_decomp_text.setPlainText(
+                    "Could not read the decompiled C file.")
+        else:
+            self.binary_decomp_text.setPlainText(
+                "Ghidra did not produce decompiled C for this "
+                "function.")
+        if asm_path is not None:
+            try:
+                with open(asm_path, "r", encoding="utf-8",
+                          errors="replace") as f:
+                    self.binary_asm_text.setPlainText(f.read())
+            except OSError:
+                self.binary_asm_text.setPlainText(
+                    "Could not read the disassembly file.")
+        else:
+            self.binary_asm_text.setPlainText(
+                "Ghidra did not produce disassembly for this "
+                "function.")
+
+    def _fill_binary_strings(self):
+        """The Strings table, filtered by the filter box. The
+        'Referenced by' column is honest: without Ghidra it says
+        so (item 7)."""
+        needle = self.binary_str_filter.text().strip().lower()
+        analysis = self._binary_analysis
+        strings = self._binary_strings
+        if needle:
+            strings = [s for s in strings
+                       if needle in s["text"].lower()]
+        gh = (analysis or {}).get("ghidra") or {}
+        xref_map = {}
+        if gh.get("xrefs") is not None:
+            names = (gh.get("callgraph") or {}).get("names") or {}
+            for entry in (gh.get("xrefs") or {}).get("strings") or []:
+                addr = _addr_int(entry.get("address", ""))
+                if addr is None:
+                    continue
+                callers = [names.get(a, a)
+                           for a in entry.get("referenced_by") or []]
+                xref_map[addr] = ", ".join(callers) or "no references"
+        total = analysis["strings_total"] if analysis else 0
+        shown = min(len(strings), 1000)
+        if analysis is None:
+            self.binary_str_info.setText(
+                "Select a binary to see the words inside it.")
+        elif gh.get("xrefs") is None:
+            self.binary_str_info.setText(
+                f"{total} strings (showing {shown}). The "
+                "'Referenced by' column needs the Ghidra pass.")
+        else:
+            self.binary_str_info.setText(
+                f"{total} strings (showing {shown}). 'Referenced by' "
+                "names the functions Ghidra found using each string.")
+        table = self.binary_str_table
+        table.setRowCount(0)
+        table.setRowCount(shown)
+        sections = analysis["sections"] if analysis else []
+        for row, s in enumerate(strings[:shown]):
+            table.setItem(row, 0, QTableWidgetItem(
+                "0x%x" % s["offset"]))
+            table.setItem(row, 1, QTableWidgetItem(s["text"]))
+            if gh.get("xrefs") is None:
+                ref = "needs Ghidra" if analysis else ""
+            else:
+                vaddr = _string_vaddr(s["offset"], sections)
+                ref = xref_map.get(vaddr, "no references")
+            table.setItem(row, 2, QTableWidgetItem(ref))
+
+    def _filter_binary_strings(self, _text):
+        self._fill_binary_strings()
+
+    def _fill_binary_callgraph(self):
+        """Callers/callees tree for the selected function."""
+        tree = self.binary_call_tree
+        tree.clear()
+        analysis = self._binary_analysis
+        if analysis is None:
+            return
+        gh = analysis.get("ghidra") or {}
+        if gh.get("callgraph") is None:
+            return  # the honest state label is showing instead
+        names = gh["callgraph"].get("names") or {}
+        edges = gh["callgraph"].get("edges") or []
+        if not self._binary_func:
+            tree.addTopLevelItem(QTreeWidgetItem([
+                "Select a function (Functions tab) to see what it "
+                "calls and what calls it."]))
+            return
+        addr = self._binary_func
+        callees = [c for (a, c) in edges if a == addr]
+        callers = [a for (a, c) in edges if c == addr]
+        root = QTreeWidgetItem([names.get(addr, addr)])
+        tree.addTopLevelItem(root)
+        calls = QTreeWidgetItem([f"Calls ({len(callees)})"])
+        root.addChild(calls)
+        for callee in sorted(set(callees)):
+            calls.addChild(QTreeWidgetItem(
+                [names.get(callee, callee)]))
+        called_by = QTreeWidgetItem(
+            [f"Called by ({len(callers)})"])
+        root.addChild(called_by)
+        for caller in sorted(set(callers)):
+            called_by.addChild(QTreeWidgetItem(
+                [names.get(caller, caller)]))
+        tree.expandAll()
+
+    def _analyze_file_clicked(self):
+        """Analyze a file: pick it, run the stdlib pass on a worker,
+        select the new binary when it lands."""
+        path, _filter = QFileDialog.getOpenFileName(
+            self, "Analyze a binary", "",
+            "All files (*)")
+        if not path:
+            return
+
+        def work(worker):
+            return binary.analyze(path)
+
+        def done(ok, value):
+            if not ok:
+                QMessageBox.warning(
+                    self, "MIMIK",
+                    f"Could not analyze that file:\n{value}")
+                return
+            self._refresh_binaries()
+            self._select_binary(value["sha256"])
+
+        self._run_task(f"analyzing {os.path.basename(path)}…",
+                       work, done, disable=(self.binary_analyze_btn,))
+
+    def _run_ghidra_clicked(self):
+        """Run the Ghidra pass for the selected binary (worker
+        thread, progress + cancel). Ghidra missing is not a dead
+        end — the setup dialog opens instead."""
+        det = ghidra.detect()
+        if not det["found"] or not det["java_ok"]:
+            self._show_ghidra_setup()
+            return
+        analysis = self._binary_analysis
+        if analysis is None:
+            return
+        sha = analysis["sha256"]
+        source = analysis["source_path"]
+
+        def work(worker):
+            return ghidra.run_analysis(
+                source, binary.analysis_dir(sha),
+                cancelled=lambda: worker.cancelled,
+                on_log=worker.progress.emit)
+
+        def done(ok, value):
+            if not ok:
+                QMessageBox.warning(
+                    self, "MIMIK",
+                    f"The Ghidra pass failed:\n{value}")
+                return
+            if value.get("cancelled"):
+                return
+            self._binary_analysis = binary.update_ghidra(sha, value)
+            self._show_binary_views()
+            self._refresh_binaries()
+            self._select_binary(sha)
+
+        self._run_task("running Ghidra…", work, done,
+                       disable=(self.binary_ghidra_btn,
+                                self.binary_analyze_btn))
+
+    def _delete_binary(self):
+        """Delete the selected binary's analysis (never the file)."""
+        analysis = self._binary_analysis
+        if analysis is None:
+            return
+        answer = QMessageBox.question(
+            self, "MIMIK",
+            f"Delete the analysis for {analysis['source_name']}?\n\n"
+            "The program file itself is not touched.",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if answer != QMessageBox.Yes:
+            return
+        binary.delete_binary(analysis["sha256"])
+        self._refresh_binaries()
+
     # ---- Doctor tab -----------------------------------------------------------
 
     def _doctor_tab(self):
@@ -3194,12 +4222,18 @@ class MainWindow(QMainWindow):
         sample_btn.clicked.connect(self._load_sample_clicked)
         update_btn = QPushButton("Check for updates…")
         update_btn.clicked.connect(self._check_for_updates)
+        ghidra_btn = QPushButton("Ghidra setup steps…")
+        ghidra_btn.clicked.connect(self._show_ghidra_setup)
+        debug_btn = QPushButton("Copy debug report")
+        debug_btn.clicked.connect(self._copy_debug_report)
         row = QHBoxLayout()
         row.addWidget(refresh)
         row.addWidget(about)
         row.addWidget(view_log)
         row.addWidget(sample_btn)
         row.addWidget(update_btn)
+        row.addWidget(ghidra_btn)
+        row.addWidget(debug_btn)
         lay.addLayout(row)
         self.doctor_text = QTextEdit()
         self.doctor_text.setReadOnly(True)
@@ -3241,6 +4275,77 @@ class MainWindow(QMainWindow):
         close.clicked.connect(dlg.accept)
         lay.addWidget(close)
         self._log_dialog = dlg
+        dlg.exec()
+
+    def _copy_debug_report(self):
+        """Copy the scrubbed debug report to the clipboard (v0.5
+        item 15, U12). Tokens are redacted before it leaves the
+        machine."""
+        QApplication.clipboard().setText(log.debug_report())
+        self.doctor_text.append(
+            "Debug report copied to the clipboard (tokens redacted).")
+
+    def _show_howto(self):
+        """How to Use index in its own window (v0.5 item 13, U22):
+        topic list on the left, plain-language text on the right."""
+        dlg = QDialog(self)
+        dlg.setWindowTitle("How to Use MIMIK")
+        dlg.resize(750, 500)
+        lay = QVBoxLayout(dlg)
+        split = QHBoxLayout()
+        lst = QListWidget()
+        for key, title in howto.topics():
+            item = QListWidgetItem(title)
+            item.setData(Qt.UserRole, key)
+            lst.addItem(item)
+        split.addWidget(lst, 1)
+        text = QTextEdit()
+        text.setReadOnly(True)
+        split.addWidget(text, 2)
+        lay.addLayout(split, 1)
+        close = QPushButton("Close")
+        close.clicked.connect(dlg.accept)
+        lay.addWidget(close)
+        self._howto_dialog = dlg
+        self._howto_list = lst
+        self._howto_text = text
+        lst.currentItemChanged.connect(self._howto_topic_selected)
+        if lst.count():
+            lst.setCurrentRow(0)
+        dlg.exec()
+
+    def _howto_topic_selected(self, current, _prev):
+        """Show the selected How to Use topic's text."""
+        if current is None:
+            return
+        text = howto.body(current.data(Qt.UserRole))
+        if text is not None:
+            self._howto_text.setPlainText(text)
+
+    def _show_ghidra_setup(self):
+        """The Ghidra setup steps in a read-only dialog (v0.5 item 11).
+        Prints steps; downloads nothing."""
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Ghidra setup steps")
+        dlg.resize(700, 450)
+        lay = QVBoxLayout(dlg)
+        det = ghidra.detect()
+        if det["found"] and det["java_ok"]:
+            lay.addWidget(QLabel(
+                f"Ghidra {det['version']} is installed and ready "
+                f"(JDK {det['java_major']}, heap {det['heap']})."))
+        else:
+            lay.addWidget(QLabel(
+                "Ghidra is not set up yet. Follow these steps "
+                "(MIMIK downloads nothing on its own):"))
+        text = QTextEdit()
+        text.setReadOnly(True)
+        text.setPlainText("\n".join(ghidra.setup_steps()))
+        lay.addWidget(text, 1)
+        close = QPushButton("Close")
+        close.clicked.connect(dlg.accept)
+        lay.addWidget(close)
+        self._ghidra_setup_dialog = dlg
         dlg.exec()
 
     # ---- first-run onboarding (item 28) --------------------------------------
@@ -3468,10 +4573,34 @@ def _install_crash_handler():
 def main():
     _install_crash_handler()
     app = QApplication(sys.argv)
+    # Single instance (v0.5 item 14, U27): a second launch asks the
+    # running window to come forward and exits, instead of starting
+    # a second copy.
+    from .single import SingleInstance
+
+    guard = SingleInstance()
+    if not guard.try_take():
+        if guard.notify_running():
+            sys.exit(0)
+        # No server answered: the owner may have died between taking
+        # the lock and starting its server. The notify retries gave
+        # the lock file time to age past the stale window, so a
+        # second try takes a stale lock over cleanly.
+        if not guard.try_take():
+            sys.exit(0)
+    # Measure the PC once at startup (v0.5 item 17/U35): the values
+    # land in the debug log, never in front of the user.
+    try:
+        from . import machine
+
+        machine.log_measurements()
+    except Exception:
+        pass
     app.setApplicationName("MIMIK")
     app.setWindowIcon(window_icon())
     app.setStyleSheet(theme_stylesheet(current_theme()))
     win = MainWindow()
+    guard.start_server(win.bring_to_front)
     win.show()
     # After the first event-loop turn: warn if a previous capture left
     # the Wine prefix pointing at the proxy (a saved state with no

@@ -67,6 +67,63 @@ class LogTests(unittest.TestCase):
         self.assertLess(size, log.KEEP_BYTES + 1024)
         self.assertIn("after rotation", self._read_log())
 
+    def test_ring_holds_last_200(self):
+        # v0.5 item 15 (T21): the in-memory ring keeps the newest
+        # 200 entries.
+        log._RING.clear()
+        for i in range(250):
+            log.log_info("test", f"ring line {i}")
+        ring = log.ring_lines()
+        self.assertEqual(len(ring), 200)
+        self.assertIn("ring line 249", ring[-1])
+        self.assertIn("ring line 50", ring[0])
+        self.assertFalse(any("ring line 49" in line for line in ring))
+        log._RING.clear()
+
+    def test_ring_records_errors_too(self):
+        log._RING.clear()
+        try:
+            raise ValueError("ring-boom-456")
+        except ValueError as e:
+            log.log_error("test site", e)
+        ring = log.ring_lines()
+        self.assertEqual(len(ring), 1)
+        self.assertIn("ring-boom-456", ring[0])
+        log._RING.clear()
+
+    def test_scrub_redacts_secrets(self):
+        # v0.5 item 15 (T21): tokens never leave the machine raw.
+        text = log.scrub(
+            "get /x?token=abc123secret "
+            "Authorization: Bearer xyz789token "
+            "api_key=key456secret done")
+        self.assertNotIn("abc123secret", text)
+        self.assertNotIn("xyz789token", text)
+        self.assertNotIn("key456secret", text)
+        self.assertIn("token=<redacted>", text)
+        self.assertIn("Authorization: <redacted>", text)
+        self.assertIn("done", text)
+
+    def test_scrub_leaves_plain_text_alone(self):
+        self.assertEqual(log.scrub("nothing secret here"),
+                         "nothing secret here")
+
+    def test_debug_report_is_scrubbed_and_complete(self):
+        # v0.5 item 15 (T21): version, platform, specs, recent log —
+        # with secrets redacted.
+        from mimik import __version__
+
+        log._RING.clear()
+        log.log_info("test", "report-marker-789 token=leakme123")
+        report = log.debug_report()
+        self.assertIn(f"MIMIK {__version__}", report)
+        self.assertIn("Python", report)
+        self.assertIn("this PC:", report)
+        self.assertIn("report-marker-789", report)
+        self.assertNotIn("leakme123", report)
+        self.assertIn("<redacted>", report)
+        log._RING.clear()
+
     def test_logging_never_raises(self):
         # The data dir is unusable (a file sits where the dir goes) —
         # logging still must not raise.
