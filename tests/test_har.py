@@ -29,6 +29,36 @@ class HarTests(unittest.TestCase):
         self.assertEqual(har.hosts(FIXTURE),
                          [("api.example.com", 3), ("cdn.example.com", 1)])
 
+    def test_entry_carries_started_datetime(self):
+        # v0.6 T14: a HAR entry's startedDateTime becomes the flow's
+        # timestamp_start, so HAR imports scrub on real times.
+        from datetime import datetime, timezone
+
+        data = {"log": {"entries": [{
+            "startedDateTime": "2026-11-16T10:00:00.000Z",
+            "request": {"method": "GET",
+                        "url": "https://api.example.com/v1/x",
+                        "headers": []},
+            "response": {"status": 200},
+        }]}}
+        flows = har.load(data)
+        self.assertEqual(len(flows), 1)
+        expected = datetime(2026, 11, 16, 10, 0,
+                            tzinfo=timezone.utc).timestamp()
+        self.assertEqual(flows[0]["request"]["timestamp_start"], expected)
+
+    def test_entry_without_started_datetime_has_no_timestamp(self):
+        # v0.6 T14: no startedDateTime, no timestamp — save_flows
+        # stamps it with the save time instead.
+        data = {"log": {"entries": [{
+            "request": {"method": "GET",
+                        "url": "https://api.example.com/v1/x",
+                        "headers": []},
+            "response": {"status": 200},
+        }]}}
+        flows = har.load(data)
+        self.assertNotIn("timestamp_start", flows[0]["request"])
+
     def test_endpoints_dedup_latest_wins(self):
         eps = har.endpoints(FIXTURE, "api.example.com")
         self.assertEqual(len(eps), 2)

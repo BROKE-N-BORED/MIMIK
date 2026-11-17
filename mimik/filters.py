@@ -71,12 +71,15 @@ def filter_flows(flows, excluded):
     return kept, dropped
 
 
-def apply_capture_filter(flows, base=None):
+def apply_capture_filter(flows, base=None, *, target=None):
     """The capture filter for live flows: drops excluded hosts when
     filtering is on. Returns (kept, dropped_hosts). A no-op when
-    filtering is off, so callers apply it unconditionally."""
+    filtering is off, so callers apply it unconditionally.
+
+    v0.6 T8: target selects the per-target choice; None uses the
+    global value."""
     from . import presets
 
-    if not presets.filtering_enabled(base):
+    if not presets.filtering_enabled(base, target=target):
         return flows, set()
     return filter_flows(flows, presets.excluded_hosts(base))

@@ -58,6 +58,16 @@ class DoctorTests(unittest.TestCase):
         self.assertIn("this PC:", result["info"][3])
         self.assertIn("RAM", result["info"][3])
 
+    def test_check_names_matches_doctor(self):
+        # v0.6 T4: the pending names the GUI shows while probing
+        # must be exactly the checks doctor() runs.
+        result = self._run()
+        names = doctor.check_names()
+        self.assertEqual(names["required"],
+                         [c["name"] for c in result["required"]])
+        self.assertEqual(names["optional"],
+                         [c["name"] for c in result["optional"]])
+
     def test_qt_check_actually_imports(self):
         # Fake PySide6 present -> the check passes.
         fake = mock.Mock()
@@ -135,3 +145,33 @@ class DoctorTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PolishEnginesTests(unittest.TestCase):
+    """v0.6 T10: the polish picker shows real availability."""
+
+    def test_engines_ready(self):
+        with mock.patch("mimik.codegen.ollama_models",
+                        return_value=["llama3.2:1b", "qwen2.5:3b"]), \
+                mock.patch("shutil.which",
+                           side_effect=lambda c: "/usr/bin/" + c
+                           if c == "claude" else None):
+            engines = doctor.polish_engines()
+        self.assertEqual([e["key"] for e in engines],
+                         ["ollama", "claude", "opencode"])
+        self.assertEqual(engines[0]["label"],
+                         "ollama (running, 2 models)")
+        self.assertTrue(engines[0]["ok"])
+        self.assertEqual(engines[1]["label"], "claude (installed)")
+        self.assertTrue(engines[1]["ok"])
+        self.assertEqual(engines[2]["label"], "opencode (not installed)")
+        self.assertFalse(engines[2]["ok"])
+
+    def test_engines_absent(self):
+        with mock.patch("mimik.codegen.ollama_models", return_value=[]), \
+                mock.patch("shutil.which", return_value=None):
+            engines = doctor.polish_engines()
+        self.assertEqual(engines[0]["label"], "ollama (not running)")
+        self.assertEqual(engines[1]["label"], "claude (not installed)")
+        self.assertEqual(engines[2]["label"], "opencode (not installed)")
+        self.assertTrue(all(not e["ok"] for e in engines))

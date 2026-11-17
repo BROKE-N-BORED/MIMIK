@@ -19,6 +19,7 @@ import json
 import os
 import re
 import tempfile
+import time
 from datetime import datetime
 
 DEFAULT_DATA_DIR = os.path.join(
@@ -265,6 +266,16 @@ def atomic_write(path, data, private=True):
     return path
 
 
+def _stamp_flow(flow, now):
+    """(v0.6 T14) Stamp a flow with its capture time. Live mitmweb
+    flows already carry request.timestamp_start (verified live
+    2026-11-16); anything else (sample, HAR, cURL) gets the save
+    time, so every saved flow has a time to scrub by."""
+    req = flow.get("request")
+    if isinstance(req, dict) and req.get("timestamp_start") is None:
+        req["timestamp_start"] = now
+
+
 def save_flows(flows, mitm=None, base=None, meta=None):
     """Save a pulled flow set, grouped per host. Returns list of file paths.
 
@@ -306,6 +317,12 @@ def save_flows(flows, mitm=None, base=None, meta=None):
             new.append(f)
         if not new:
             continue
+        # v0.6 T14: stamp each new flow at save time (live flows
+        # already carry their own timestamp; the stamp fills the
+        # gap for sample / HAR / cURL flows).
+        now = time.time()
+        for f in new:
+            _stamp_flow(f, now)
         embedded = _embed_bodies(mitm, new)
         wanted = os.path.join(
             captures_dir(base), f"{_safe_host(host)}_{stamp}.json"

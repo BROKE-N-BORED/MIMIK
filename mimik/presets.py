@@ -964,31 +964,57 @@ def set_excluded_hosts(hosts, base=None):
     return seen
 
 
-def filtering_enabled(base=None):
-    """The "exclude telemetry + analytics hosts" toggle. Default ON."""
-    return bool(_read_settings(base).get("filtering_enabled", True))
+def filtering_enabled(base=None, *, target=None):
+    """The "exclude telemetry + analytics hosts" toggle. Default ON.
+
+    v0.6 T8: per target — a target with its own choice uses it,
+    others fall back to the global value."""
+    settings = _read_settings(base)
+    if target is not None:
+        entry = (settings.get("per_target") or {}).get(target) or {}
+        if "filtering_enabled" in entry:
+            return bool(entry["filtering_enabled"])
+    return bool(settings.get("filtering_enabled", True))
 
 
-def set_filtering_enabled(enabled, base=None):
-    """Turn capture filtering on or off."""
+def set_filtering_enabled(enabled, base=None, *, target=None):
+    """Turn capture filtering on or off — globally, or for one
+    target (v0.6 T8)."""
     base = base or store.data_dir()
     settings = _read_settings(base)
-    settings["filtering_enabled"] = bool(enabled)
+    if target is not None:
+        per = settings.setdefault("per_target", {})
+        per.setdefault(target, {})["filtering_enabled"] = bool(enabled)
+    else:
+        settings["filtering_enabled"] = bool(enabled)
     _write_settings(settings, base)
     return bool(enabled)
 
 
-def screenshot_enabled(base=None):
+def screenshot_enabled(base=None, *, target=None):
     """The "screenshot the desktop when recording stops" toggle
-    (v0.4 item 15). Default OFF: a desktop screenshot is opt-in."""
-    return bool(_read_settings(base).get("screenshot_enabled", False))
+    (v0.4 item 15). Default OFF: a desktop screenshot is opt-in.
+
+    v0.6 T8: per target — a target with its own choice uses it,
+    others fall back to the global value."""
+    settings = _read_settings(base)
+    if target is not None:
+        entry = (settings.get("per_target") or {}).get(target) or {}
+        if "screenshot_enabled" in entry:
+            return bool(entry["screenshot_enabled"])
+    return bool(settings.get("screenshot_enabled", False))
 
 
-def set_screenshot_enabled(enabled, base=None):
-    """Turn the stop-time screenshot on or off."""
+def set_screenshot_enabled(enabled, base=None, *, target=None):
+    """Turn the stop-time screenshot on or off — globally, or for
+    one target (v0.6 T8)."""
     base = base or store.data_dir()
     settings = _read_settings(base)
-    settings["screenshot_enabled"] = bool(enabled)
+    if target is not None:
+        per = settings.setdefault("per_target", {})
+        per.setdefault(target, {})["screenshot_enabled"] = bool(enabled)
+    else:
+        settings["screenshot_enabled"] = bool(enabled)
     _write_settings(settings, base)
     return bool(enabled)
 

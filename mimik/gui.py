@@ -16,13 +16,17 @@ from PySide6.QtCore import (
     QAbstractAnimation, QEasingCurve, QPropertyAnimation, QRect,
     QSettings, QSize, Qt, QThread, QTimer, QUrl, Signal,
 )
-from PySide6.QtGui import QAction, QDesktopServices, QIcon, QPixmap
+from PySide6.QtGui import (
+    QAction, QBrush, QColor, QDesktopServices, QIcon, QKeySequence,
+    QPainter, QPixmap, QShortcut,
+)
 from PySide6.QtWidgets import (
-    QApplication, QCheckBox, QComboBox, QDialog, QFileDialog, QGroupBox,
-    QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem,
-    QMainWindow, QMessageBox, QPushButton, QScrollArea, QSpinBox,
-    QTabWidget, QTableWidget, QTableWidgetItem, QTextEdit, QToolButton,
-    QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
+    QApplication, QCheckBox, QComboBox, QDialog, QFileDialog, QFrame,
+    QGridLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit, QListWidget,
+    QListWidgetItem, QMainWindow, QMessageBox, QPushButton, QScrollArea,
+    QSlider, QSpinBox, QSystemTrayIcon, QTabWidget, QTableWidget, QTableWidgetItem,
+    QTextEdit, QToolButton, QTreeWidget, QTreeWidgetItem, QVBoxLayout,
+    QWidget,
 )
 
 from . import assets, binary, codegen, diff, doctor, export, filters, ghidra, howto, launch, log, presets, reblend_bridge, replay, sample, screenshot, store, unpin, update, websocket, wine
@@ -50,20 +54,42 @@ QMainWindow, QWidget { background: #17171c; color: #e8e8ea; font-size: 14px; }
 QTabWidget::pane { border: 1px solid #33333a; }
 QTabBar::tab { background: #222228; padding: 10px 18px; margin-right: 2px; }
 QTabBar::tab:selected { background: #2c2c33; color: #b48fdd; }
-QPushButton { background: #2c2c33; border: 1px solid #44444c; padding: 10px 16px; }
+QPushButton { background: #2c2c33; border: 1px solid #44444c; border-bottom: 2px solid #55555e; border-radius: 6px; padding: 10px 16px; }
 QPushButton:hover { border-color: #b48fdd; }
+QPushButton:pressed { background: #232329; border-bottom: 1px solid #44444c; }
 QPushButton:disabled { color: #66666e; }
 QPushButton#big { font-size: 16px; padding: 14px; background: #3a2f4a; }
+QPushButton#big:pressed { background: #2e2438; }
+/* v0.6 T11: visible focus ring (entry 001): violet border, quiet. */
+QPushButton:focus, QToolButton:focus, QComboBox:focus, QListWidget:focus, QTableWidget:focus, QTextEdit:focus, QLineEdit:focus, QCheckBox:focus { border: 2px solid #b48fdd; }
 QListWidget, QTableWidget, QTextEdit, QComboBox {
     background: #1e1e24; border: 1px solid #33333a; }
 QComboBox { padding: 6px; }
-QGroupBox { border: 1px solid #33333a; margin-top: 12px; padding-top: 8px; }
+QGroupBox { border: 1px solid #33333a; border-radius: 8px; margin-top: 12px; padding-top: 8px; }
 QGroupBox::title { color: #b48fdd; }
 QLabel#banner { background: #3a2f4a; padding: 8px 12px; font-weight: bold; }
 QLabel#explain { color: #9a9aa2; font-size: 12px; }
+QLabel#section { font-size: 15px; font-weight: bold; }
+QLabel#wordmark { font-size: 20px; font-weight: bold; color: #b48fdd; }
+QDialog { background: #232329; border: 1px solid #4a4a52; }
+QDialog QLabel { background: transparent; }
 QWidget#livestrip { background: #222228; }
 QLabel#livedot { color: #e06c6c; font-size: 16px; }
-QToolButton { background: #2c2c33; border: 1px solid #44444c; padding: 8px 12px; text-align: left; }
+QToolButton { background: #2c2c33; border: 1px solid #44444c; border-bottom: 2px solid #55555e; border-radius: 6px; padding: 8px 12px; text-align: left; }
+QToolButton:pressed { background: #232329; border-bottom: 1px solid #44444c; }
+QFrame#pad { background: #2c2c33; border: 1px solid #44444c; border-bottom: 2px solid #55555e; border-radius: 8px; }
+QFrame#tile { background: #26262c; border: 1px solid #3d3d46; border-radius: 16px; }
+QFrame#tile QLabel { background: transparent; }
+QFrame#pad[padState="selected"] { border: 2px solid #b48fdd; background: #3a2f4a; }
+QFrame#pad[padState="recording"] { border: 2px solid #e06c6c; background: #3a2f2f; }
+QFrame#pad[padPressed="true"] { background: #232329; }
+/* v0.6 T11: a focused pad rings near-white, so focus never reads
+   as selection (violet) or recording (red). */
+QFrame#pad:focus { border: 2px solid #e8e8ea; }
+QLabel#padtitle { font-size: 15px; font-weight: bold; background: transparent; }
+QLabel#padtitle:disabled { color: #66666e; }
+QLabel#padsub { font-size: 12px; color: #9a9aa2; background: transparent; }
+QLabel#padsub:disabled { color: #66666e; }
 """
 
 LIGHT_STYLESHEET = """
@@ -71,20 +97,85 @@ QMainWindow, QWidget { background: #f2f2f4; color: #1c1c1e; font-size: 14px; }
 QTabWidget::pane { border: 1px solid #c9c9cf; }
 QTabBar::tab { background: #e2e2e8; padding: 10px 18px; margin-right: 2px; }
 QTabBar::tab:selected { background: #ffffff; color: #6b3fa0; }
-QPushButton { background: #ffffff; border: 1px solid #b9b9c0; padding: 10px 16px; }
+QPushButton { background: #ffffff; border: 1px solid #b9b9c0; border-bottom: 2px solid #a9a9b0; border-radius: 6px; padding: 10px 16px; }
 QPushButton:hover { border-color: #b48fdd; }
+QPushButton:pressed { background: #e8e8ec; border-bottom: 1px solid #b9b9c0; }
 QPushButton:disabled { color: #9a9aa2; }
 QPushButton#big { font-size: 16px; padding: 14px; background: #e8ddf2; }
+QPushButton#big:pressed { background: #d9c8ea; }
+/* v0.6 T11: visible focus ring (entry 001): violet border, quiet. */
+QPushButton:focus, QToolButton:focus, QComboBox:focus, QListWidget:focus, QTableWidget:focus, QTextEdit:focus, QLineEdit:focus, QCheckBox:focus { border: 2px solid #6b3fa0; }
 QListWidget, QTableWidget, QTextEdit, QComboBox {
     background: #ffffff; border: 1px solid #c9c9cf; }
 QComboBox { padding: 6px; }
-QGroupBox { border: 1px solid #c9c9cf; margin-top: 12px; padding-top: 8px; }
+QGroupBox { border: 1px solid #c9c9cf; border-radius: 8px; margin-top: 12px; padding-top: 8px; }
 QGroupBox::title { color: #6b3fa0; }
 QLabel#banner { background: #e8ddf2; padding: 8px 12px; font-weight: bold; }
 QLabel#explain { color: #66666e; font-size: 12px; }
+QLabel#section { font-size: 15px; font-weight: bold; }
+QLabel#wordmark { font-size: 20px; font-weight: bold; color: #6b3fa0; }
+QDialog { background: #ffffff; border: 1px solid #b9b9c0; }
+QDialog QLabel { background: transparent; }
 QWidget#livestrip { background: #e2e2e8; }
 QLabel#livedot { color: #c0392b; font-size: 16px; }
-QToolButton { background: #ffffff; border: 1px solid #b9b9c0; padding: 8px 12px; text-align: left; }
+QToolButton { background: #ffffff; border: 1px solid #b9b9c0; border-bottom: 2px solid #a9a9b0; border-radius: 6px; padding: 8px 12px; text-align: left; }
+QToolButton:pressed { background: #e8e8ec; border-bottom: 1px solid #b9b9c0; }
+QFrame#pad { background: #ffffff; border: 1px solid #b9b9c0; border-bottom: 2px solid #a9a9b0; border-radius: 8px; }
+QFrame#tile { background: #f4f4f6; border: 1px solid #d0d0d6; border-radius: 16px; }
+QFrame#tile QLabel { background: transparent; }
+QFrame#pad[padState="selected"] { border: 2px solid #6b3fa0; background: #e8ddf2; }
+QFrame#pad[padState="recording"] { border: 2px solid #c0392b; background: #f2dddd; }
+QFrame#pad[padPressed="true"] { background: #e8e8ec; }
+/* v0.6 T11: a focused pad rings near-black, so focus never reads
+   as selection (violet) or recording (red). */
+QFrame#pad:focus { border: 2px solid #1c1c1e; }
+QLabel#padtitle { font-size: 15px; font-weight: bold; background: transparent; }
+QLabel#padtitle:disabled { color: #9a9aa2; }
+QLabel#padsub { font-size: 12px; color: #66666e; background: transparent; }
+QLabel#padsub:disabled { color: #9a9aa2; }
+"""
+
+HIGH_CONTRAST_STYLESHEET = """
+QMainWindow, QWidget { background: #000000; color: #ffffff; font-size: 14px; }
+QTabWidget::pane { border: 2px solid #ffffff; }
+QTabBar::tab { background: #000000; color: #ffffff; padding: 10px 18px; margin-right: 2px; }
+QTabBar::tab:selected { background: #ffffff; color: #000000; }
+QPushButton { background: #000000; border: 2px solid #ffffff; border-radius: 6px; padding: 10px 16px; }
+QPushButton:hover { border-color: #ffff00; }
+QPushButton:pressed { background: #333333; }
+QPushButton:disabled { color: #808080; }
+QPushButton#big { font-size: 16px; padding: 14px; background: #000000; }
+QPushButton#big:pressed { background: #333333; }
+/* v0.6 T13: high-contrast focus ring: yellow, 2 px. */
+QPushButton:focus, QToolButton:focus, QComboBox:focus, QListWidget:focus, QTableWidget:focus, QTextEdit:focus, QLineEdit:focus, QCheckBox:focus { border: 2px solid #ffff00; }
+QListWidget, QTableWidget, QTextEdit, QComboBox {
+    background: #000000; border: 2px solid #ffffff; }
+QComboBox { padding: 6px; }
+QGroupBox { border: 2px solid #ffffff; border-radius: 8px; margin-top: 12px; padding-top: 8px; }
+QGroupBox::title { color: #ffff00; }
+QLabel#banner { background: #ffffff; color: #000000; padding: 8px 12px; font-weight: bold; }
+QLabel#explain { color: #e0e0e0; font-size: 12px; }
+QLabel#section { font-size: 15px; font-weight: bold; }
+QLabel#wordmark { font-size: 20px; font-weight: bold; color: #ffff00; }
+QDialog { background: #000000; border: 2px solid #ffffff; }
+QDialog QLabel { background: transparent; }
+QWidget#livestrip { background: #000000; }
+QLabel#livedot { color: #ff6b6b; font-size: 16px; }
+QToolButton { background: #000000; border: 2px solid #ffffff; border-radius: 6px; padding: 8px 12px; text-align: left; }
+QToolButton:pressed { background: #333333; }
+QFrame#pad { background: #000000; border: 2px solid #ffffff; border-radius: 8px; }
+QFrame#tile { background: #000000; border: 2px solid #ffffff; border-radius: 16px; }
+QFrame#tile QLabel { background: transparent; }
+QFrame#pad[padState="selected"] { border: 2px solid #ffff00; background: #1a1a1a; }
+QFrame#pad[padState="recording"] { border: 2px solid #ff6b6b; background: #1a0000; }
+QFrame#pad[padPressed="true"] { background: #333333; }
+/* v0.6 T13: a focused pad rings white, so focus never reads as
+   selection (yellow) or recording (red). */
+QFrame#pad:focus { border: 2px solid #ffffff; }
+QLabel#padtitle { font-size: 15px; font-weight: bold; background: transparent; }
+QLabel#padtitle:disabled { color: #808080; }
+QLabel#padsub { font-size: 12px; color: #e0e0e0; background: transparent; }
+QLabel#padsub:disabled { color: #808080; }
 """
 
 THEMES = ("dark", "light")
@@ -99,6 +190,41 @@ def current_theme():
 def theme_stylesheet(name):
     """The stylesheet for a theme name (unknown names get dark)."""
     return LIGHT_STYLESHEET if name == "light" else STYLESHEET
+
+
+# Accessibility presets (v0.6 T13, entry 015): one tap for a whole
+# comfort setup. Each is its own setting — a preset is a starting
+# point, not a wall, so every one stays adjustable on its own.
+ACCESS_PRESETS = (
+    ("big_text", "Big text"),
+    ("high_contrast", "High contrast"),
+    ("reduced_motion", "Reduced motion"),
+    ("one_touch", "One-touch capture"),
+)
+
+
+def access_setting(key):
+    """An accessibility setting (v0.6 T13): all off by default."""
+    return _settings().value(f"access/{key}", False, type=bool)
+
+
+def set_access_setting(key, value):
+    """Persist one accessibility setting."""
+    _settings().setValue(f"access/{key}", bool(value))
+
+
+def effective_stylesheet():
+    """The stylesheet to apply: the high-contrast sheet when that
+    preset is on, else the current theme — with big text applied
+    on top when that preset is on (v0.6 T13)."""
+    if access_setting("high_contrast"):
+        sheet = HIGH_CONTRAST_STYLESHEET
+    else:
+        sheet = theme_stylesheet(current_theme())
+    if access_setting("big_text"):
+        sheet = sheet.replace("font-size: 14px", "font-size: 18px")
+        sheet = sheet.replace("font-size: 12px", "font-size: 15px")
+    return sheet
 
 # Record-tab instructions, worded for the GUI (item 21): they point at
 # tabs and buttons, never at terminal commands. The CLI keeps its own
@@ -165,12 +291,27 @@ Windows program capture (via WinLinx): MIMIK captures, WinLinx runs:
   those show no traffic, same as pinned phone apps.
 """
 
-TARGETS = [
-    ("android", "Android phone (same Wi-Fi)"),
-    ("linux-app", "Linux app (installed)"),
-    ("file", "Program from file (AppImage / archive / ISO / .deb)"),
-    ("web", "Web app (HAR / cURL, no proxy)"),
-    ("windows", "Windows program (via WinLinx, capture only)"),
+# Capture pads (v0.6 T16, entry 024): one pad per target — tap it
+# and it starts. The subtitle is the plain-words line (U20) for
+# that pad. They replace the v0.5 target combo (Joshua's call,
+# 2026-11-13).
+PAD_TARGETS = [
+    ("android", "Android phone", "Your phone, over Wi-Fi"),
+    ("linux-app", "Linux app", "An app installed on this PC"),
+    ("file", "Program from file", "An AppImage, archive, ISO, or .deb"),
+    ("web", "Web app", "A website, via HAR or cURL (no proxy)"),
+    ("windows", "Windows program", "Already running in WinLinx"),
+]
+
+# First-run checklist (v0.6 T3, entry 020): four steps to the first
+# client. "picked" starts ticked — installing and opening the app
+# were real work (entry 020: the first step is already ticked,
+# honestly). The rest tick only when they really happen.
+_CHECKLIST_STEPS = [
+    ("picked", "Pick a source"),
+    ("started", "Start the proxy"),
+    ("host_seen", "First host seen"),
+    ("generated", "Generate your first client"),
 ]
 
 
@@ -221,6 +362,92 @@ def _empty_item(text):
     item = QListWidgetItem(text)
     item.setFlags(Qt.NoItemFlags)
     return item
+
+
+def _snapshot_list(widget):
+    """(v0.6 T5) A QListWidget's place before a refill: the selected
+    item's UserRole data + the scrollbar value."""
+    item = widget.currentItem()
+    data = item.data(Qt.UserRole) if item is not None else None
+    return (data, widget.verticalScrollBar().value())
+
+
+def _restore_list(widget, snap):
+    """Restore a _snapshot_list snapshot after a refill. A selection
+    whose item is gone stays gone (no guessing); the scrollbar
+    clamps to the new content."""
+    data, scroll = snap
+    if data is not None:
+        for i in range(widget.count()):
+            if widget.item(i).data(Qt.UserRole) == data:
+                widget.setCurrentRow(i)
+                break
+    widget.verticalScrollBar().setValue(scroll)
+
+
+def _snapshot_table(widget):
+    """(v0.6 T5) A QTableWidget's place before a refill: the selected
+    row's column-0 UserRole data + the scrollbar value."""
+    row = widget.currentRow()
+    item = widget.item(row, 0) if row >= 0 else None
+    data = item.data(Qt.UserRole) if item is not None else None
+    return (data, widget.verticalScrollBar().value())
+
+
+def _restore_table(widget, snap, key=None):
+    """Restore a _snapshot_table snapshot after a refill. `key`
+    picks the identity out of the column-0 UserRole data (a dict
+    key); without it the whole data value is compared."""
+    data, scroll = snap
+    if data is not None:
+        want = data.get(key) if key else data
+        for i in range(widget.rowCount()):
+            item = widget.item(i, 0)
+            if item is None:
+                continue
+            got = item.data(Qt.UserRole)
+            if key and isinstance(got, dict):
+                got = got.get(key)
+            if got == want:
+                widget.setCurrentCell(i, 0)
+                break
+    widget.verticalScrollBar().setValue(scroll)
+
+
+class _SeenItem(QTableWidgetItem):
+    """A Seen-column cell (v0.6 T6): sorts by the count, not the
+    text, so 10 sorts after 2."""
+
+    def __lt__(self, other):
+        try:
+            return int(self.text()) < int(other.text())
+        except ValueError:
+            return super().__lt__(other)
+
+
+def _preview_auth(headers):
+    """(v0.6 T7) The auth shape for the Generate preview: scheme
+    words and header NAMES only, never values."""
+    scheme = None
+    cookie = False
+    api_key = False
+    for pair in headers:
+        name, value = pair[0], pair[1] if len(pair) > 1 else ""
+        low = name.lower()
+        if low == "authorization" and scheme is None:
+            words = (value or "").split(None, 1)
+            scheme = words[0].lower() if words else "authorization"
+        elif low == "cookie":
+            cookie = True
+        elif "api" in low and "key" in low:
+            api_key = True
+    if scheme:
+        return scheme
+    if cookie:
+        return "cookie"
+    if api_key:
+        return "api key"
+    return None
 
 
 def _empty_table_row(table, text):
@@ -281,6 +508,9 @@ class RecordWorker(QThread):
     hosts_updated = Signal(list)
     status = Signal(str)
     finished = Signal()
+    # v0.6 T9: the capture filter's dropped hosts, when the set
+    # changes (a sorted list; empty when nothing is dropped).
+    dropped_updated = Signal(list)
 
     def __init__(self, target, file_path=None, pick=None, plan=None,
                  launch_cmd=None, deb_install=False):
@@ -417,6 +647,10 @@ class RecordWorker(QThread):
             session = ProxySession(
                 meta=meta,
                 on_update=self._hosts_updated,
+                on_dropped=self.dropped_updated.emit,
+                # v0.6 T8: the record honors this target's own
+                # filter choice, not just the global value.
+                target=self.target,
             )
             self._session = session
             try:
@@ -558,17 +792,103 @@ def window_icon():
     return icon
 
 
+_TRAY_COLORS = {"idle": "#9a9aa2", "recording": "#e06c6c"}
+
+
+def _tray_pixmap(state):
+    """The tray icon (v0.6 T2, entry 021): one colored dot, the
+    recording state at a glance. Grey = idle, red = recording. Drawn
+    in code, not a new artwork file — the numbers live in the
+    tooltip, the dot is the glance."""
+    pix = QPixmap(32, 32)
+    pix.fill(Qt.transparent)
+    painter = QPainter(pix)
+    painter.setRenderHint(QPainter.Antialiasing)
+    painter.setBrush(QBrush(QColor(_TRAY_COLORS.get(state, "#9a9aa2"))))
+    painter.setPen(Qt.NoPen)
+    painter.drawEllipse(4, 4, 24, 24)
+    painter.end()
+    return pix
+
+
+class _PadButton(QFrame):
+    """One capture pad (v0.6 T16, entry 024): a big tappable tile
+    with a title + plain-words subtitle. A real button's semantics
+    (click, Space/Enter, focus) on a tile's layout — QPushButton
+    can't render two text sizes, so the pad is a frame with two
+    labels. States (entry 024: every pad needs a clear state):
+    idle, selected, recording — via the padState property, which
+    the stylesheet reads. Pressed feedback is a static style
+    change, not an animation (no motion cost, nothing for reduced
+    motion to switch off)."""
+
+    clicked = Signal()
+
+    def __init__(self, key, title, subtitle, parent=None):
+        super().__init__(parent)
+        self.key = key
+        self.setObjectName("pad")
+        self.setFocusPolicy(Qt.StrongFocus)
+        self.setProperty("padState", "idle")
+        self.setProperty("padPressed", False)
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(12, 10, 12, 10)
+        self.title_label = QLabel(title)
+        self.title_label.setObjectName("padtitle")
+        self.title_label.setAttribute(Qt.WA_TransparentForMouseEvents)
+        lay.addWidget(self.title_label)
+        self.subtitle_label = QLabel(subtitle)
+        self.subtitle_label.setObjectName("padsub")
+        self.subtitle_label.setWordWrap(True)
+        self.subtitle_label.setAttribute(Qt.WA_TransparentForMouseEvents)
+        lay.addWidget(self.subtitle_label)
+
+    def set_state(self, state):
+        """idle | selected | recording — re-polish so the
+        stylesheet's [padState="..."] rule re-applies."""
+        self.setProperty("padState", state)
+        self.style().unpolish(self)
+        self.style().polish(self)
+        self.update()
+
+    def _set_pressed(self, pressed):
+        self.setProperty("padPressed", pressed)
+        self.style().unpolish(self)
+        self.style().polish(self)
+        self.update()
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self._set_pressed(True)
+        super().mousePressEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        self._set_pressed(False)
+        if (event.button() == Qt.LeftButton and self.isEnabled()
+                and self.rect().contains(event.position().toPoint())):
+            self.clicked.emit()
+        super().mouseReleaseEvent(event)
+
+    def keyPressEvent(self, event):
+        if event.key() in (Qt.Key_Space, Qt.Key_Return, Qt.Key_Enter):
+            self.clicked.emit()
+            return
+        super().keyPressEvent(event)
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle(f"MIMIK {__version__}: any app, as a Python library")
         self.setWindowIcon(window_icon())
-        self.setStyleSheet(theme_stylesheet(current_theme()))
+        self.setStyleSheet(effective_stylesheet())
         self.resize(900, 650)  # 620 + room for the status bar (item 7)
         self._restore_geometry()  # reopens where it was left (item 8)
         self.worker = None
         self.plan = None
         self.file_path = None
+        # v0.6 T9: hosts the capture filter dropped in this session.
+        self._dropped_hosts = []
         self.har_path = None
         self.curl_path = None
         self.gen_out = None
@@ -578,8 +898,15 @@ class MainWindow(QMainWindow):
         # Background-task state (item 4): one task at a time, cached
         # flows, tabs that load their data on first show.
         self._flows_cache = None
+        # v0.6 T14: the timeline's range for the selected host
+        # (None until a host with timed endpoints loads).
+        self._timeline_min = None
+        self._timeline_max = None
         self._task = None
         self._task_on_done = None
+        # v0.6 T10: the polish-availability probe thread (its own
+        # thread, not the single _run_task slot).
+        self._polish_task = None
         self._task_disable = []
         self._pending_host = None
         self._loaded = set()
@@ -587,6 +914,9 @@ class MainWindow(QMainWindow):
         # Hosts → Generate jump (item 10): the host to pick once the
         # Generate tab's host combo has loaded.
         self._gen_jump_host = None
+        # v0.6 T7: the Generate host combo starts unselected on its
+        # first load only — refreshes keep the picked host.
+        self._gen_hosts_loaded_once = False
         # The latest asset preview dialog (item 10).
         self._preview_dialog = None
         # Live strip (item 19): built by _record_tab below; None
@@ -600,6 +930,14 @@ class MainWindow(QMainWindow):
         # one press-dip animation per button, reused across presses.
         self._done_text = None
         self._dip_anims = {}
+        # Tray icon / status chip (v0.6 T2): the out-of-window
+        # recording surface. Set up at the end of __init__ (after
+        # the status bar exists); None until then, so
+        # _update_status_bar can call _update_tray safely.
+        self.tray_icon = None
+        self._tray_state = None
+        self.status_chip = None
+        self._chip_label = None
 
         tabs = QTabWidget()
         tabs.addTab(self._record_tab(), "Record")
@@ -613,6 +951,13 @@ class MainWindow(QMainWindow):
         self.tabs = tabs
         tabs.currentChanged.connect(self._tab_shown)
         self._build_menus()
+        # v0.6 T11: F9 starts or stops recording from the keyboard.
+        # No conflict: the menus use Ctrl+R / Ctrl+Q / Ctrl+1..8 /
+        # F5, and nothing else claims F9.
+        self._record_toggle_shortcut = QShortcut(
+            QKeySequence("F9"), self)
+        self._record_toggle_shortcut.activated.connect(
+            self._toggle_recording)
 
         # Progress row: visible only while a background task runs.
         self.progress_bar = QWidget()
@@ -648,6 +993,102 @@ class MainWindow(QMainWindow):
         self._status_timer.timeout.connect(self._update_status_bar)
         self._refresh_saved_flows()
         self._update_status_bar()
+        # Tray icon / status chip (v0.6 T2, entry 021): the recording
+        # state visible from another app. Tray when the desktop has
+        # one; a tiny always-on-top chip when it doesn't.
+        self._setup_tray()
+        self._update_tray()
+
+    def _setup_tray(self):
+        """The out-of-window recording surface (v0.6 T2). One fact,
+        one action — not a mini-app: the tray icon shows the state,
+        a click stops a recording (or shows the window when idle).
+        No context menu on purpose (entry 021: the moment a
+        glanceable surface grows a menu it has become a mini-app)."""
+        if QSystemTrayIcon.isSystemTrayAvailable():
+            tray = QSystemTrayIcon(self)
+            tray.setIcon(QIcon(_tray_pixmap("idle")))
+            tray.setToolTip("MIMIK: Proxy stopped")
+            tray.activated.connect(self._tray_activated)
+            tray.show()
+            self.tray_icon = tray
+            return
+        # No tray on this desktop: a tiny always-on-top chip instead,
+        # shown only while recording. A top-level window does not
+        # inherit the window's stylesheet, so the chip carries its
+        # own (kept in step by set_theme).
+        chip = QWidget(self, Qt.Tool | Qt.WindowStaysOnTopHint
+                       | Qt.FramelessWindowHint)
+        chip.setObjectName("livestrip")
+        chip.setStyleSheet(effective_stylesheet())
+        lay = QHBoxLayout(chip)
+        lay.setContentsMargins(10, 6, 10, 6)
+        dot = QLabel("●")
+        dot.setObjectName("livedot")
+        lay.addWidget(dot)
+        self._chip_label = QLabel("")
+        lay.addWidget(self._chip_label, 1)
+        stop = QPushButton("Stop")
+        stop.clicked.connect(self._stop_recording)
+        lay.addWidget(stop)
+        chip.setVisible(False)
+        self.status_chip = chip
+
+    def _update_tray(self):
+        """Sync the tray icon / chip with the recording state. The
+        icon is rebuilt only when the state changes; the tooltip (or
+        chip text) updates every tick with live numbers."""
+        recording = (self.worker is not None
+                     and self._record_started is not None)
+        state = "recording" if recording else "idle"
+        if recording:
+            elapsed = time.monotonic() - self._record_started
+            flows = "flow" if self._flow_count == 1 else "flows"
+            hosts = "host" if self._host_count == 1 else "hosts"
+            text = (f"MIMIK: Recording {_fmt_elapsed(elapsed)}, "
+                    f"{self._flow_count} {flows} from "
+                    f"{self._host_count} {hosts}. Click to stop.")
+            chip_text = (f"Recording {_fmt_elapsed(elapsed)}  ·  "
+                         f"{self._flow_count} {flows}")
+        else:
+            text = "MIMIK: Proxy stopped. Click to show MIMIK."
+            chip_text = ""
+        if self.tray_icon is not None:
+            if state != self._tray_state:
+                self.tray_icon.setIcon(QIcon(_tray_pixmap(state)))
+                self._tray_state = state
+            self.tray_icon.setToolTip(text)
+        if self.status_chip is not None:
+            if recording:
+                self._chip_label.setText(chip_text)
+                if not self.status_chip.isVisible():
+                    self._place_chip()
+                    self.status_chip.setVisible(True)
+            else:
+                self.status_chip.setVisible(False)
+
+    def _place_chip(self):
+        """Bottom-right of the primary screen, 12 px off the edges."""
+        screen = QApplication.primaryScreen()
+        if screen is None:
+            return
+        self.status_chip.adjustSize()
+        area = screen.availableGeometry()
+        size = self.status_chip.size()
+        self.status_chip.move(area.right() - size.width() - 12,
+                              area.bottom() - size.height() - 12)
+
+    def _tray_activated(self, reason):
+        """Tray click (v0.6 T2): one action — Stop while recording,
+        show the window when idle. Both Trigger and DoubleClick:
+        some desktops send one, some the other."""
+        if reason not in (QSystemTrayIcon.Trigger,
+                          QSystemTrayIcon.DoubleClick):
+            return
+        if self.worker is not None:
+            self._stop_recording()
+        else:
+            self.bring_to_front()
 
     def _refresh_saved_flows(self):
         """Re-count saved flows for the idle status bar. Runs at
@@ -695,6 +1136,7 @@ class MainWindow(QMainWindow):
                 f"{self._saved_flows} saved {flows}")
             if self.live_strip is not None:
                 self.live_strip.setVisible(False)
+        self._update_tray()
 
     # ---- close + startup safety ---------------------------------------------
 
@@ -739,6 +1181,12 @@ class MainWindow(QMainWindow):
                 self._close_pending = True
                 event.ignore()
                 return
+        if self._polish_task is not None:
+            # v0.6 T10: the probe is bounded (a 3 s Ollama timeout
+            # at most) — wait it out so the thread never outlives
+            # the window.
+            self._polish_task.wait(5000)
+            self._polish_task = None
         worker = self.worker
         if worker is not None and worker.isRunning():
             if not self._confirm_stop_recording():
@@ -748,6 +1196,8 @@ class MainWindow(QMainWindow):
             worker.force_stop()
         # The close is going ahead — remember where the window was.
         _settings().setValue("geometry", self.saveGeometry())
+        if self.tray_icon is not None:
+            self.tray_icon.hide()
         event.accept()
 
     def _restore_geometry(self):
@@ -980,6 +1430,18 @@ class MainWindow(QMainWindow):
         dark_act.triggered.connect(self._menu_toggle_theme)
         view_menu.addAction(dark_act)
         self._dark_theme_action = dark_act
+        view_menu.addSeparator()
+        # v0.6 T13: accessibility presets, one tap each (entry 015).
+        access_menu = view_menu.addMenu("Accessibility")
+        self._access_actions = {}
+        for key, label in ACCESS_PRESETS:
+            act = QAction(label, self)
+            act.setCheckable(True)
+            act.setChecked(access_setting(key))
+            act.setData(key)
+            act.triggered.connect(self._access_action_triggered)
+            access_menu.addAction(act)
+            self._access_actions[key] = act
 
         help_menu = menubar.addMenu("Help")
         self._help_menu = help_menu
@@ -987,6 +1449,10 @@ class MainWindow(QMainWindow):
         howto_act.triggered.connect(self._show_howto)
         help_menu.addAction(howto_act)
         self._howto_action = howto_act
+        checklist_act = QAction("Show the first-run checklist", self)
+        checklist_act.triggered.connect(self._checklist_show)
+        help_menu.addAction(checklist_act)
+        self._checklist_action = checklist_act
         about_act = QAction("About MIMIK", self)
         about_act.triggered.connect(self._show_about)
         help_menu.addAction(about_act)
@@ -1075,13 +1541,63 @@ class MainWindow(QMainWindow):
         stylesheet wins over the app-level one, so both are set."""
         name = name if name in THEMES else "dark"
         _settings().setValue("theme", name)
-        sheet = theme_stylesheet(name)
+        self._apply_stylesheet()
+        if hasattr(self, "_dark_theme_action"):
+            self._dark_theme_action.setChecked(name == "dark")
+
+    def _apply_stylesheet(self):
+        """(v0.6 T13) Apply the effective stylesheet — theme, plus
+        the big-text / high-contrast presets — to the app, this
+        window, and the status chip."""
+        sheet = effective_stylesheet()
         app = QApplication.instance()
         if app is not None:
             app.setStyleSheet(sheet)
         self.setStyleSheet(sheet)
-        if hasattr(self, "_dark_theme_action"):
-            self._dark_theme_action.setChecked(name == "dark")
+        if self.status_chip is not None:
+            self.status_chip.setStyleSheet(sheet)
+
+    def _set_access(self, key, value):
+        """(v0.6 T13) One accessibility preset changed — persist it,
+        apply it, and sync the other control that shows it (the View
+        menu action or the checklist checkbox)."""
+        set_access_setting(key, bool(value))
+        if key in ("big_text", "high_contrast"):
+            self._apply_stylesheet()
+        elif key == "one_touch":
+            if value:
+                # One-touch starts with defaults: filter on,
+                # screenshot off, for the current target. The
+                # checkboxes' own handlers write the presets and
+                # sync the Record menu.
+                self.filter_check.setChecked(True)
+                self.screenshot_check.setChecked(False)
+            self._apply_one_touch()
+        # Reduced motion needs no apply step: _dip_button reads the
+        # setting on every press.
+        for control in (getattr(self, "_access_actions", {}).get(key),
+                        getattr(self, "_access_checks", {}).get(key)):
+            if control is not None:
+                control.blockSignals(True)
+                control.setChecked(bool(value))
+                control.blockSignals(False)
+
+    def _access_action_triggered(self, checked):
+        """(v0.6 T13) A View-menu Accessibility action toggled. A
+        bound method, not a lambda: lambdas on signals corrupt the
+        heap at teardown (see the guard test). The action carries
+        its preset key."""
+        action = self.sender()
+        if action is not None:
+            self._set_access(action.data(), checked)
+
+    def _access_check_toggled(self, checked):
+        """(v0.6 T13) A checklist comfort checkbox toggled. A bound
+        method, not a lambda (heap rule, as above). The checkbox
+        carries its preset key as a property."""
+        check = self.sender()
+        if check is not None:
+            self._set_access(check.property("access_key"), checked)
 
     def bring_to_front(self):
         """Raise this window (used by the single-instance guard,
@@ -1128,10 +1644,44 @@ class MainWindow(QMainWindow):
         if index < 0 or index >= len(self._TAB_KEYS):
             return
         key = self._TAB_KEYS[index]
+        if key == "generate":
+            # v0.6 T10: engines may have started (or stopped) since
+            # the last visit — re-check on every show.
+            self._refresh_polish()
+        # v0.6 T11: focus lands on the tab's primary action, on
+        # every show — the tab is usable without the mouse.
+        self._focus_tab_primary(key)
         if key in self._loaded or key == "record":
             return
         if self._load_tab(key):
             self._loaded.add(key)
+
+    def _focus_tab_primary(self, key):
+        """(v0.6 T11) Put keyboard focus on the tab's primary action:
+        the selected pad (or Stop while recording) on Record, the
+        list or first field everywhere else."""
+        target = None
+        if key == "record":
+            if self.worker is not None:
+                target = self.stop_btn
+            else:
+                target = self.pads.get(self._current_target)
+        elif key == "hosts":
+            target = self.hosts_list
+        elif key == "generate":
+            target = self.gen_host
+        elif key == "assets":
+            target = self.asset_group
+        elif key == "clients":
+            target = self.clients_list
+        elif key == "binary":
+            target = self.binary_analyze_btn
+        elif key == "doctor":
+            target = self.doctor_recheck_btn
+        elif key == "presets":
+            target = self.presets_list
+        if target is not None and target.isEnabled():
+            target.setFocus()
 
     def _load_tab(self, key):
         """Load one tab's data. Returns False if a background task is
@@ -1160,11 +1710,12 @@ class MainWindow(QMainWindow):
     # ---- Record tab ----------------------------------------------------------
 
     def _record_tab(self):
-        # Toy surface (v0.5 item 16, U34): pick a target, Start, Stop
-        # — nothing else visible by default. Everything else lives
-        # behind one collapsible "More options" section; NOTHING is
-        # removed (U1: reorganize only). Every remaining field
-        # explains itself in plain words directly underneath it (U20).
+        # Toy surface (v0.5 item 16, U34; pads v0.6 T16): tap a pad
+        # to start, Stop to end — nothing else visible by default.
+        # Everything else lives behind one collapsible "More options"
+        # section; NOTHING is removed (U1: reorganize only). Every
+        # remaining field explains itself in plain words directly
+        # underneath it (U20), and every pad carries its own line.
         #
         # The content sits in a scroll area: with the file target +
         # More options expanded the tab is taller than the window,
@@ -1183,6 +1734,23 @@ class MainWindow(QMainWindow):
         outer.addWidget(scroll, 1)
         lay = QVBoxLayout(w)
 
+        # Identity header (v0.6 T1, U15): the MIMIK mark + wordmark
+        # inside the window, static — the icon used to appear only in
+        # the title bar. No new artwork: the same icon files as the
+        # window icon. An empty pixmap (no icon files anywhere) leaves
+        # a blank label, never a crash.
+        head = QHBoxLayout()
+        self.identity_icon = QLabel()
+        pix = window_icon().pixmap(32, 32)
+        if not pix.isNull():
+            self.identity_icon.setPixmap(pix)
+        head.addWidget(self.identity_icon)
+        self.identity_wordmark = QLabel("MIMIK")
+        self.identity_wordmark.setObjectName("wordmark")
+        head.addWidget(self.identity_wordmark)
+        head.addStretch(1)
+        lay.addLayout(head)
+
         lay.addWidget(QLabel(
             "Capture your own app's traffic, then turn it into a Python "
             "library. Own accounts only."))
@@ -1192,17 +1760,60 @@ class MainWindow(QMainWindow):
         self.start_here.setWordWrap(True)
         self.start_here.setObjectName("banner")
         lay.addWidget(self.start_here)
-        row = QHBoxLayout()
-        row.addWidget(QLabel("Capture target:"))
-        self.target_combo = QComboBox()
-        for key, label in TARGETS:
-            self.target_combo.addItem(label, key)
-        self.target_combo.currentIndexChanged.connect(self._target_changed)
-        row.addWidget(self.target_combo, 1)
-        lay.addLayout(row)
-        lay.addWidget(_explain_label(
-            "What you want to capture traffic from. The steps below "
-            "change with the target."))
+
+        # First-run checklist (v0.6 T3, entries 014 + 020): four
+        # steps to the first client, tracked live. It replaces the
+        # old welcome modal + sample-guide modal chain (U18): the
+        # sample is pre-loaded, the steps tick as they really
+        # happen, and the box goes away when done or dismissed —
+        # never reappearing on its own. Hidden until _maybe_first_run
+        # (main-only) decides to show it.
+        self.checklist_box = QGroupBox(
+            "Your first client, in four steps")
+        clay = QVBoxLayout(self.checklist_box)
+        self._checklist_labels = {}
+        for key, text in _CHECKLIST_STEPS:
+            lbl = QLabel()
+            self._checklist_labels[key] = lbl
+            clay.addWidget(lbl)
+        # v0.6 T13: the comfort presets at first boot (entry 015) —
+        # one tap each, and every one stays adjustable on its own
+        # from the View menu afterwards. Signals blocked while the
+        # saved state loads: the window is still being built.
+        clay.addWidget(QLabel("Comfort, one tap each:"))
+        self._access_checks = {}
+        for key, label in ACCESS_PRESETS:
+            check = QCheckBox(label)
+            check.blockSignals(True)
+            check.setChecked(access_setting(key))
+            check.blockSignals(False)
+            check.setProperty("access_key", key)
+            check.toggled.connect(self._access_check_toggled)
+            self._access_checks[key] = check
+            clay.addWidget(check)
+        dismiss = QPushButton("Done with this")
+        dismiss.clicked.connect(self._checklist_dismiss)
+        clay.addWidget(dismiss)
+        self.checklist_box.setVisible(False)
+        lay.addWidget(self.checklist_box)
+
+        # Capture pads (v0.6 T16, entry 024): one pad per target —
+        # tap it and it starts. They replace the v0.5 target combo
+        # (Joshua's call, 2026-11-13). Each pad explains itself in
+        # plain words (U20); the steps below still change with the
+        # target. 3 + 2 grid: big enough to tap, small enough to fit.
+        pads_label = QLabel("What do you want to capture?")
+        pads_label.setObjectName("section")
+        lay.addWidget(pads_label)
+        grid = QGridLayout()
+        self.pads = {}
+        for i, (key, title, subtitle) in enumerate(PAD_TARGETS):
+            pad = _PadButton(key, title, subtitle)
+            pad.clicked.connect(self._pad_clicked)
+            self.pads[key] = pad
+            grid.addWidget(pad, i // 3, i % 3)
+        lay.addLayout(grid)
+        self._current_target = "android"
 
         # "More options": one collapsible section holding everything
         # the toy surface does not need. It auto-expands when the
@@ -1287,6 +1898,12 @@ class MainWindow(QMainWindow):
         self.launch_edit = QLineEdit()
         self.launch_edit.setPlaceholderText("e.g. firefox   (leave blank to "
                                             "launch it yourself)")
+        # v0.6 T8: remember the last launch command. Restored
+        # before the signal connects, so startup doesn't re-save.
+        saved_cmd = _settings().value("record/last_launch_cmd", "") or ""
+        if saved_cmd:
+            self.launch_edit.setText(saved_cmd)
+        self.launch_edit.textChanged.connect(self._launch_cmd_changed)
         alay.addWidget(self.launch_edit)
         alay.addWidget(_explain_label(
             "A command MIMIK runs for you. Leave it blank and launch "
@@ -1301,14 +1918,17 @@ class MainWindow(QMainWindow):
         self.host_list.setMaximumHeight(110)
         self.host_list.addItem(_empty_item(
             "No live hosts yet. Start the proxy and use the app."))
-        lay.addWidget(QLabel("Live hosts while recording:"))
+        # v0.6 T13: stored, so one-touch capture can hide it with
+        # the list.
+        self.live_hosts_label = QLabel("Live hosts while recording:")
+        self.live_hosts_label.setObjectName("section")
+        lay.addWidget(self.live_hosts_label)
         lay.addWidget(self.host_list)
 
+        # Stop stays pinned at the bottom, full width: the pads start
+        # a capture (tap to start), Stop ends it. The old Start proxy
+        # button is gone with the combo (v0.6 T16).
         brow = QHBoxLayout()
-        self.start_btn = QPushButton("Start proxy")
-        self.start_btn.setObjectName("big")
-        self.start_btn.clicked.connect(self._start_recording)
-        self.start_btn.pressed.connect(self._dip_start)
         self.stop_btn = QPushButton("Stop")
         self.stop_btn.setObjectName("big")
         self.stop_btn.setEnabled(False)
@@ -1328,14 +1948,30 @@ class MainWindow(QMainWindow):
         slay.addWidget(self.live_dot)
         self.live_text = QLabel("")
         slay.addWidget(self.live_text, 1)
+        # v0.6 T9: what the capture filter dropped, quietly — one
+        # tap opens the Excluded hosts dialog with the names.
+        self.live_dropped = QPushButton("")
+        self.live_dropped.setFlat(True)
+        self.live_dropped.setVisible(False)
+        self.live_dropped.clicked.connect(self._show_excluded_hosts)
+        slay.addWidget(self.live_dropped)
         self.live_strip.setVisible(False)
         outer.addWidget(self.live_strip)
 
-        brow.addWidget(self.start_btn, 1)
         brow.addWidget(self.stop_btn, 1)
         outer.addLayout(brow)
 
-        self._target_changed()
+        # v0.6 T8: restore the last capture setup. The file restores
+        # before the target is selected, so a restored file target
+        # builds its plan on select.
+        saved_file = _settings().value("record/last_file", "") or ""
+        if saved_file and os.path.exists(saved_file):
+            self.file_path = saved_file
+            self.file_label.setText(saved_file)
+        saved_target = _settings().value("record/last_target", "") or ""
+        if saved_target not in self.pads:
+            saved_target = "android"
+        self._select_target(saved_target)
         return tab
 
     def _dip_button(self, button):
@@ -1343,6 +1979,8 @@ class MainWindow(QMainWindow):
         back over 150 ms. Geometry only — no layout thrash, no
         shadow or blur work, cheap on a 2-core PC. One animation per
         button, reused across presses (a re-press restarts it)."""
+        if access_setting("reduced_motion"):
+            return  # v0.6 T13: the off-switch for this animation.
         anim = self._dip_anims.get(button)
         if anim is None:
             anim = QPropertyAnimation(button, b"geometry", self)
@@ -1361,9 +1999,6 @@ class MainWindow(QMainWindow):
         anim.setEndValue(start)
         anim.start()
 
-    def _dip_start(self):
-        self._dip_button(self.start_btn)
-
     def _dip_stop(self):
         self._dip_button(self.stop_btn)
 
@@ -1373,8 +2008,45 @@ class MainWindow(QMainWindow):
         self.more_btn.setArrowType(
             Qt.DownArrow if checked else Qt.RightArrow)
 
-    def _target_changed(self):
-        key = self.target_combo.currentData()
+    def _apply_one_touch(self):
+        """(v0.6 T13) One-touch capture: the Record tab shows only
+        the pads and Stop. The options box (filter, screenshot,
+        file/app pickers), the steps text, and the live-hosts list
+        hide — their settings stay as they are, adjustable from
+        the Record menu while hidden. With the preset off, each
+        control goes back to its natural state."""
+        simple = access_setting("one_touch")
+        self.more_btn.setVisible(not simple)
+        self.more_box.setVisible(
+            not simple and self.more_btn.isChecked())
+        self.steps.setVisible(not simple)
+        self.live_hosts_label.setVisible(not simple)
+        self.host_list.setVisible(not simple)
+
+    def _select_target(self, key):
+        """Select a capture target (v0.6 T16): the steps text, the
+        file/app boxes, and the pad states follow the selection.
+        Selection only — starting is _tap_pad's job."""
+        self._current_target = key
+        # v0.6 T8: remember the last target, and show this target's
+        # filter + screenshot choices. Signals blocked: this is a
+        # restore, not a user toggle.
+        _settings().setValue("record/last_target", key)
+        self.filter_check.blockSignals(True)
+        self.filter_check.setChecked(
+            presets.filtering_enabled(target=key))
+        self.filter_check.blockSignals(False)
+        self.screenshot_check.blockSignals(True)
+        self.screenshot_check.setChecked(
+            presets.screenshot_enabled(target=key))
+        self.screenshot_check.blockSignals(False)
+        for k, pad in self.pads.items():
+            if self.worker is not None and k == key:
+                pad.set_state("recording")
+            elif k == key:
+                pad.set_state("selected")
+            else:
+                pad.set_state("idle")
         self.file_box.setVisible(key == "file")
         self.app_box.setVisible(key == "linux-app")
         # The file picker and the launch box live inside "More
@@ -1387,12 +2059,8 @@ class MainWindow(QMainWindow):
 
         if key == "android":
             self.steps.setText(GUI_ANDROID_STEPS.format(ip=doctor.lan_ip()))
-            self.start_btn.setEnabled(True)
-            self.start_btn.setText("Start proxy")
         elif key == "linux-app":
             self.steps.setText(GUI_LINUX_APP_STEPS)
-            self.start_btn.setEnabled(True)
-            self.start_btn.setText("Start proxy")
         elif key == "file":
             self.steps.setText(
                 "Pick a program file: AppImage, executable, script, archive\n"
@@ -1402,26 +2070,79 @@ class MainWindow(QMainWindow):
                 "are mounted READ-ONLY and you pick the program inside.\n\n"
                 "Windows .exe/.msi are WinLinx's job: MIMIK never runs them.\n"
                 "To capture one, run it in WinLinx and use the Windows target.")
-            self.start_btn.setEnabled(self.plan is not None
-                                      and self.plan.command is not None)
-            self.start_btn.setText("Start proxy + launch program")
+            # v0.6 T8: a restored file's plan builds lazily on
+            # first select (not at startup — archives extract).
+            if self.file_path and self.plan is None:
+                self._prepare_file()
+            else:
+                self._refresh_file_pad()
         elif key == "web":
             self.steps.setText(GUI_WEB_STEPS)
-            self.start_btn.setEnabled(False)
-            self.start_btn.setText("No proxy needed: import a HAR instead")
         elif key == "windows":
             self.steps.setText(GUI_WINDOWS_STEPS + "\nCommands MIMIK will run:\n"
                 "  wine regedit /s <proxy.reg>\n"
                 "  wine certutil -addstore -f -user Root "
                 "~/.mitmproxy/mitmproxy-ca-cert.pem\n"
                 "Stop restores the prefix's original proxy settings.")
-            self.start_btn.setEnabled(True)
-            self.start_btn.setText("Start proxy (configure prefix)")
+        # v0.6 T13: one-touch re-hides what the auto-expand above
+        # just showed, so a target switch never undoes the preset.
+        self._apply_one_touch()
+
+    def _tap_pad(self, key):
+        """A pad was tapped (v0.6 T16, entry 024): tap it and it
+        starts. Tapping the recording pad stops it (like a playing
+        clip); tapping another pad mid-recording does nothing — one
+        recording at a time. The file pad with no file opens the
+        picker; the web pad only selects (no proxy to start)."""
+        if self.worker is not None:
+            if key == self._current_target:
+                self._stop_recording()
+            return
+        self._select_target(key)
+        if key == "file" and (self.plan is None
+                              or not self.plan.command):
+            self._choose_file()
+            return
+        if key == "web":
+            return
+        self._start_recording()
+
+    def _pad_clicked(self):
+        """A pad's clicked signal — the pad carries its key."""
+        pad = self.sender()
+        if pad is not None:
+            self._tap_pad(pad.key)
+
+    def _set_pads_enabled(self, enabled):
+        """Grey the pads while a recording runs (the recording pad
+        stays enabled so tapping it stops)."""
+        for key, pad in self.pads.items():
+            pad.setEnabled(enabled or key == self._current_target)
+
+    def _refresh_file_pad(self):
+        """The file pad's subtitle names the chosen file, or says
+        to tap to choose one."""
+        pad = self.pads.get("file")
+        if pad is None:
+            return
+        if self.plan is not None and self.plan.command:
+            name = os.path.basename(self.file_path or "")
+            pad.subtitle_label.setText(f"Ready: {name}, tap to record")
+        else:
+            pad.subtitle_label.setText("Tap to choose a file")
+
+    def _launch_cmd_changed(self, text):
+        """(v0.6 T8) Remember the last launch command."""
+        _settings().setValue("record/last_launch_cmd", text)
 
     def _filter_toggled(self, _state=None):
         """The Record tab's filter checkbox — a persistent setting,
-        like auto-learn."""
-        presets.set_filtering_enabled(self.filter_check.isChecked())
+        like auto-learn. Per target (v0.6 T8): the choice follows
+        the job. Guarded: this fires during tab construction,
+        before any target is selected."""
+        presets.set_filtering_enabled(
+            self.filter_check.isChecked(),
+            target=getattr(self, "_current_target", None))
         # Keep the Record menu toggle in sync. Guarded: this fires
         # during tab construction, before the menus exist.
         action = getattr(self, "_menu_filter_act", None)
@@ -1439,6 +2160,12 @@ class MainWindow(QMainWindow):
             "Hosts never captured: their traffic is dropped before\n"
             "it reaches the store or the host list. Subdomains of a\n"
             "listed host are excluded too."))
+        # v0.6 T9: the hosts actually dropped in this session.
+        if self._dropped_hosts:
+            dropped = QLabel("Dropped while recording: "
+                             + ", ".join(self._dropped_hosts))
+            dropped.setWordWrap(True)
+            lay.addWidget(dropped)
         lst = QListWidget()
         self._excluded_list = lst
         lay.addWidget(lst, 1)
@@ -1508,6 +2235,8 @@ class MainWindow(QMainWindow):
             return
         self.file_path = path
         self.file_label.setText(path)
+        # v0.6 T8: remember the last chosen file.
+        _settings().setValue("record/last_file", path)
         self._prepare_file()
 
     def _prepare_file(self, pick=None):
@@ -1519,7 +2248,7 @@ class MainWindow(QMainWindow):
                 deb_install=self.deb_install_check.isChecked())
         except launch.LaunchError as e:
             self.cmd_label.setText(str(e))
-            self.start_btn.setEnabled(False)
+            self._refresh_file_pad()
             return
         self.plan = plan
         for c in plan.candidates:
@@ -1531,10 +2260,9 @@ class MainWindow(QMainWindow):
                     break
             self.cmd_label.setText(f"will run:  {plan.command_display}\n"
                                    f"{plan.message or ''}")
-            self.start_btn.setEnabled(True)
         else:
             self.cmd_label.setText("pick the program to run from the list")
-            self.start_btn.setEnabled(False)
+        self._refresh_file_pad()
 
     def _candidate_changed(self, row):
         if self.plan is None or row < 0:
@@ -1542,14 +2270,31 @@ class MainWindow(QMainWindow):
         exe = self.plan.candidates[row]
         self.plan.command = launch.build_launch_command(exe)
         self.cmd_label.setText(f"will run:  {self.plan.command_display}")
-        self.start_btn.setEnabled(True)
+        self._refresh_file_pad()
 
     def _clear_runs(self):
         n = launch.clear_runs()
         QMessageBox.information(self, "MIMIK", f"cleared {n} temp extraction(s)")
 
+    def _toggle_recording(self):
+        """F9 (v0.6 T11): start the proxy, or stop it if it is
+        running. The pads and the Record menu do the same job with
+        the mouse; this is the keyboard path."""
+        if self.worker is not None:
+            self._stop_recording()
+        else:
+            self._start_recording()
+
     def _start_recording(self):
-        key = self.target_combo.currentData()
+        key = self._current_target
+        if key == "web":
+            # No proxy to start: the steps already say to import a
+            # HAR. (The pads never call this for web; the Record
+            # menu and F9 can.)
+            self.steps.append(
+                "Web apps need no proxy: import a HAR on the "
+                "Generate tab.")
+            return
         plan = None
         if key == "file":
             plan = self.plan
@@ -1570,12 +2315,16 @@ class MainWindow(QMainWindow):
         self.worker.hosts_updated.connect(self._show_hosts)
         self.worker.status.connect(self._append_step)
         self.worker.finished.connect(self._recording_finished)
+        self.worker.dropped_updated.connect(self._dropped_updated)
+        # v0.6 T9: a fresh recording starts with no dropped hosts.
+        self._dropped_hosts = []
+        self.live_dropped.setVisible(False)
         self.worker.start()
-        self.start_btn.setEnabled(False)
         self.stop_btn.setEnabled(True)
         self._menu_start_act.setEnabled(False)
         self._menu_stop_act.setEnabled(True)
-        self.target_combo.setEnabled(False)
+        self._set_pads_enabled(False)
+        self._select_target(key)
         self.host_list.clear()
         self._record_started = time.monotonic()
         self._flow_count = 0
@@ -1584,6 +2333,7 @@ class MainWindow(QMainWindow):
         self._record_bytes_start = _dir_size(store.captures_dir())
         self._status_timer.start()
         self._update_status_bar()
+        self._checklist_tick("started")
 
     def _append_step(self, text):
         """RecordWorker status line -> Record tab log. A bound method,
@@ -1602,8 +2352,20 @@ class MainWindow(QMainWindow):
             self.host_list.addItem(_empty_item(
                 "Listening. Use the app and its hosts appear here."))
             return
+        self._checklist_tick("host_seen")
         for host, n in rows:
             self.host_list.addItem(f"{n:>6}  {host}")
+
+    def _dropped_updated(self, hosts):
+        """(v0.6 T9) The capture filter dropped hosts — say so
+        quietly in the live strip; the names are one tap away in
+        the Excluded hosts dialog."""
+        self._dropped_hosts = list(hosts)
+        n = len(hosts)
+        self.live_dropped.setVisible(n > 0)
+        if n:
+            self.live_dropped.setText(
+                f"telemetry dropped: {n} host{'s' if n != 1 else ''}")
 
     def _stop_recording(self):
         if self.worker is not None:
@@ -1614,8 +2376,12 @@ class MainWindow(QMainWindow):
             self.steps.append("stopping…")
 
     def _screenshot_toggled(self):
+        """Per target (v0.6 T8), like the filter toggle. Guarded:
+        this fires during tab construction, before any target is
+        selected."""
         presets.set_screenshot_enabled(
-            self.screenshot_check.isChecked())
+            self.screenshot_check.isChecked(),
+            target=getattr(self, "_current_target", None))
         # Keep the Record menu toggle in sync. Guarded: this fires
         # during tab construction, before the menus exist.
         action = getattr(self, "_menu_shot_act", None)
@@ -1652,12 +2418,11 @@ class MainWindow(QMainWindow):
         self._done_text = (f"✓ Recorded {self._flow_count} {flows} "
                            f"from {self._host_count} {hosts}")
         self._update_status_bar()
-        self.start_btn.setEnabled(True)
         self.stop_btn.setEnabled(False)
         self._menu_start_act.setEnabled(True)
         self._menu_stop_act.setEnabled(False)
-        self.target_combo.setEnabled(True)
-        self._target_changed()
+        self._set_pads_enabled(True)
+        self._select_target(self._current_target)
         self._invalidate_flows()
         # Flow-backed tabs that already loaded go stale — reload the one
         # on screen now; the others reload when next shown.
@@ -1688,9 +2453,10 @@ class MainWindow(QMainWindow):
         lay.addLayout(row)
         self.hosts_list = QListWidget()
         self.hosts_list.currentItemChanged.connect(self._host_selected)
-        self.hosts_list.addItem(_empty_item(
-            "No captures yet. Record an app, or import a HAR on the "
-            "Generate tab."))
+        # v0.6 T4: pending until the first load answers — never a
+        # false empty. The honest empty state arrives in
+        # _refresh_hosts' done.
+        self.hosts_list.addItem(_empty_item("Loading captures…"))
         lay.addWidget(self.hosts_list, 1)
         brow = QHBoxLayout()
         self.host_binary_label = QLabel("Binary: none linked yet.")
@@ -1700,7 +2466,9 @@ class MainWindow(QMainWindow):
         self.host_binary_jump.setEnabled(False)
         brow.addWidget(self.host_binary_jump)
         lay.addLayout(brow)
-        lay.addWidget(QLabel("Endpoints for the selected host:"))
+        ep_label = QLabel("Endpoints for the selected host:")
+        ep_label.setObjectName("section")
+        lay.addWidget(ep_label)
         frow = QHBoxLayout()
         frow.addWidget(QLabel("Filter:"))
         self.ep_filter = QLineEdit()
@@ -1710,12 +2478,36 @@ class MainWindow(QMainWindow):
         self.ep_filter_info = QLabel("")
         frow.addWidget(self.ep_filter_info)
         lay.addLayout(frow)
-        self.ep_table = QTableWidget(0, 3)
-        self.ep_table.setHorizontalHeaderLabels(["Method", "Path", "Status"])
+        self.ep_table = QTableWidget(0, 4)
+        self.ep_table.setHorizontalHeaderLabels(
+            ["Method", "Path", "Status", "Seen"])
         self.ep_table.horizontalHeader().setStretchLastSection(True)
+        # v0.6 T6: sortable — the Seen column sorts numerically
+        # (see _SeenItem); the other columns sort as text. The
+        # header's indicator defaults to column 0 descending in
+        # this Qt build, which would reorder the table on load —
+        # clear it so insertion order stands until the user clicks.
+        self.ep_table.setSortingEnabled(True)
+        self.ep_table.horizontalHeader().setSortIndicator(
+            -1, Qt.AscendingOrder)
         _empty_table_row(self.ep_table,
                          "Select a host to see its endpoints.")
         lay.addWidget(self.ep_table, 2)
+        # v0.6 T14: capture timeline — drag to filter the endpoints
+        # to the calls made up to that moment. The data (first_seen
+        # per endpoint) is computed when the host loads, before any
+        # drag (entry 018).
+        trow = QHBoxLayout()
+        trow.addWidget(QLabel("Timeline:"))
+        self.timeline_slider = QSlider(Qt.Horizontal)
+        self.timeline_slider.setRange(0, 1000)
+        self.timeline_slider.setValue(1000)
+        self.timeline_slider.setEnabled(False)
+        self.timeline_slider.valueChanged.connect(self._timeline_moved)
+        trow.addWidget(self.timeline_slider, 1)
+        self.timeline_label = QLabel("no times recorded yet")
+        trow.addWidget(self.timeline_label)
+        lay.addLayout(trow)
         rrow = QHBoxLayout()
         self.replay_btn = QPushButton("Replay selected…")
         self.replay_btn.clicked.connect(self._replay_selected)
@@ -1759,17 +2551,35 @@ class MainWindow(QMainWindow):
         when it ends)."""
         def work(worker):
             _m, flows, src = self._flows(refresh=refresh)
+            worker.progress.emit(f"read {len(flows)} flows…")
             rows = []
             for host, n in mitm_mod.hosts(flows):
                 stats = store.capture_stats(host)
                 rows.append((host, n,
                              src == "saved" and stats["truncated"],
                              stats["bytes"]))
+            worker.progress.emit(f"{len(rows)} hosts found")
             return rows
 
         def done(ok, rows):
             if not ok:
+                # First load never answered: say so honestly
+                # instead of leaving the pending row up forever. A
+                # refresh failure keeps the last good content.
+                if (self.hosts_list.count() == 1
+                        and self.hosts_list.item(0).text().startswith(
+                            "Loading")):
+                    self.hosts_list.clear()
+                    self.hosts_list.addItem(_empty_item(
+                        "Couldn't load captures. Press Refresh to "
+                        "try again."))
                 return
+            # v0.6 T5: refresh keeps your place — the snapshot is
+            # taken here, at refill time, so a host picked while the
+            # load ran is the one restored. Restoring the selection
+            # re-fires _host_selected, so the endpoints view comes
+            # back with it instead of being wiped.
+            snap = _snapshot_list(self.hosts_list)
             self.hosts_list.clear()
             if not rows:
                 self.hosts_list.addItem(_empty_item(
@@ -1786,6 +2596,7 @@ class MainWindow(QMainWindow):
                 item = QListWidgetItem(text)
                 item.setData(Qt.UserRole, host)
                 self.hosts_list.addItem(item)
+            _restore_list(self.hosts_list, snap)
 
         return self._run_task("loading hosts…", work, done)
 
@@ -1839,6 +2650,7 @@ class MainWindow(QMainWindow):
         self.ep_table.setRowCount(0)
         if current is None:
             self._update_host_binary_link(None)
+            self._setup_timeline([])
             return
         host = current.data(Qt.UserRole)
         self._update_host_binary_link(host)
@@ -1955,7 +2767,17 @@ class MainWindow(QMainWindow):
             if not eps:
                 _empty_table_row(self.ep_table,
                                  "No endpoints for this host.")
+                self._setup_timeline([])
                 return
+            # Sorting stays off during the fill: every setItem
+            # would re-sort, and the UserRole below would land on
+            # the wrong row after a move (v0.6 T6). The user's sort
+            # (if any) is re-applied after; otherwise insertion
+            # order stands.
+            header = self.ep_table.horizontalHeader()
+            section = header.sortIndicatorSection()
+            order = header.sortIndicatorOrder()
+            self.ep_table.setSortingEnabled(False)
             self.ep_table.setRowCount(len(eps))
             for i, e in enumerate(eps):
                 self.ep_table.setItem(i, 0, QTableWidgetItem(e["method"]))
@@ -1964,13 +2786,86 @@ class MainWindow(QMainWindow):
                 if e.get("websocket"):
                     status += " (WS)"
                 self.ep_table.setItem(i, 2, QTableWidgetItem(status))
+                # v0.6 T6: how many captured calls fed this endpoint.
+                self.ep_table.setItem(
+                    i, 3, _SeenItem(str(e.get("samples", 1))))
                 # The endpoint carries its sample flow (item 10) — the
                 # Replay button re-sends it.
                 self.ep_table.item(i, 0).setData(Qt.UserRole, e)
+            header.setSortIndicator(-1, Qt.AscendingOrder)
+            self.ep_table.setSortingEnabled(True)
+            if section >= 0:
+                self.ep_table.sortByColumn(section, order)
             self._update_replay_button()
+            # v0.6 T14: the timeline's range is computed here, once,
+            # from the loaded endpoints — the drag only reads it.
+            self._setup_timeline(eps)
             self._filter_ep_table()
 
         return self._run_task(f"loading endpoints for {host}…", work, done)
+
+    def _setup_timeline(self, eps):
+        """(v0.6 T14) The timeline's range, computed once when the
+        host loads — the drag only reads it (entry 018)."""
+        times = [e["first_seen"] for e in eps
+                 if e.get("first_seen") is not None]
+        if not times or min(times) == max(times):
+            self._timeline_min = None
+            self._timeline_max = None
+            self.timeline_slider.setEnabled(False)
+            self.timeline_slider.setValue(1000)
+            self.timeline_label.setText(
+                "no times recorded yet" if not times
+                else "all calls at one moment")
+            return
+        self._timeline_min = min(times)
+        self._timeline_max = max(times)
+        self.timeline_slider.setEnabled(True)
+        self.timeline_slider.blockSignals(True)
+        self.timeline_slider.setValue(1000)
+        self.timeline_slider.blockSignals(False)
+        self._update_timeline_label()
+
+    def _timeline_cutoff(self):
+        """The timeline's cutoff epoch, or None when the timeline
+        shows everything (slider at max, or disabled)."""
+        if (self._timeline_min is None or self._timeline_max is None
+                or not self.timeline_slider.isEnabled()
+                or self.timeline_slider.value() >= 1000):
+            return None
+        frac = self.timeline_slider.value() / 1000
+        return (self._timeline_min
+                + (self._timeline_max - self._timeline_min) * frac)
+
+    def _update_timeline_label(self):
+        """The timeline's readout: the cutoff time + how many
+        endpoints it shows. Counts the timeline filter only — the
+        search box has its own count."""
+        if self._timeline_min is None:
+            return  # _setup_timeline already wrote the label
+        cutoff = self._timeline_cutoff()
+        shown = total = 0
+        for r in range(self.ep_table.rowCount()):
+            if self.ep_table.columnSpan(r, 0) > 1:
+                continue
+            total += 1
+            item = self.ep_table.item(r, 0)
+            e = item.data(Qt.UserRole) if item is not None else None
+            first = e.get("first_seen") if isinstance(e, dict) else None
+            if first is None or cutoff is None or first <= cutoff:
+                shown += 1
+        if cutoff is None:
+            self.timeline_label.setText(f"all {total} endpoints")
+        else:
+            when = time.strftime("%H:%M:%S", time.localtime(cutoff))
+            self.timeline_label.setText(
+                f"up to {when} ({shown} of {total})")
+
+    def _timeline_moved(self, _value=None):
+        """(v0.6 T14) The scrubber moved: re-filter + update the
+        readout. The filter data was computed at host load."""
+        self._update_timeline_label()
+        self._filter_ep_table()
 
     def _update_replay_button(self):
         """The Replay button is live only when a row with a flow is
@@ -2316,8 +3211,24 @@ class MainWindow(QMainWindow):
             label.setText("")
 
     def _filter_ep_table(self, _text=None):
+        # v0.6 T14: search and timeline compose — a row shows only
+        # when it passes both. The shared helper does the search
+        # pass; the timeline pass hides more rows, never unhides.
         visible, total = self._apply_table_filter(
             self.ep_table, self.ep_filter.text())
+        cutoff = self._timeline_cutoff()
+        if cutoff is not None:
+            for r in range(self.ep_table.rowCount()):
+                if self.ep_table.isRowHidden(r):
+                    continue  # search already hid it
+                if self.ep_table.columnSpan(r, 0) > 1:
+                    continue  # empty-state row stays visible
+                item = self.ep_table.item(r, 0)
+                e = item.data(Qt.UserRole) if item is not None else None
+                first = e.get("first_seen") if isinstance(e, dict) else None
+                if first is not None and first > cutoff:
+                    self.ep_table.setRowHidden(r, True)
+                    visible -= 1
         self._filter_info(self.ep_filter_info, self.ep_filter.text(),
                           visible, total)
 
@@ -2349,8 +3260,8 @@ class MainWindow(QMainWindow):
         # Set it on the line edit, not the combo: QComboBox's own
         # placeholderText stores the value but never forwards it to
         # the line edit in this Qt build, so nothing renders.
-        self.gen_host.lineEdit().setPlaceholderText(
-            "No hosts yet. Record an app or import a HAR")
+        # v0.6 T4: pending until the first load answers.
+        self.gen_host.lineEdit().setPlaceholderText("Loading hosts…")
         row.addWidget(self.gen_host, 1)
         refresh = QPushButton("Refresh hosts")
         refresh.clicked.connect(self._refresh_gen_hosts_clicked)
@@ -2359,6 +3270,13 @@ class MainWindow(QMainWindow):
         lay.addWidget(_explain_label(
             "The server the app talks to. Usually the one with JSON, "
             "not media or CDN."))
+        # v0.6 T7: what Generate will make for the picked host,
+        # before the button is pressed. Empty until a host with
+        # flows is picked.
+        self.gen_preview = QLabel("")
+        self.gen_preview.setWordWrap(True)
+        lay.addWidget(self.gen_preview)
+        self.gen_host.currentTextChanged.connect(self._update_gen_preview)
 
         row = QHBoxLayout()
         har_btn = QPushButton("Import HAR…")
@@ -2375,12 +3293,18 @@ class MainWindow(QMainWindow):
         row = QHBoxLayout()
         row.addWidget(QLabel("Polish:"))
         self.polish_combo = QComboBox()
+        # v0.6 T10: real availability lands from the background probe
+        # when the tab is shown; until then, say so honestly.
         self.polish_combo.addItem("none (deterministic, free)", "none")
-        self.polish_combo.addItem("ollama (local model, if running)", "ollama")
-        self.polish_combo.addItem("claude (CLI, if installed)", "claude")
-        self.polish_combo.addItem("opencode (CLI, if installed)", "opencode")
+        self.polish_combo.addItem("ollama (checking…)", "ollama")
+        self.polish_combo.addItem("claude (checking…)", "claude")
+        self.polish_combo.addItem("opencode (checking…)", "opencode")
         row.addWidget(self.polish_combo, 1)
         lay.addLayout(row)
+        self.polish_explain = _explain_label(
+            "Polish rewrites the generated client so it reads better. "
+            "None is free and always works.")
+        lay.addWidget(self.polish_explain)
 
         gen_btn = QPushButton("Generate client")
         gen_btn.setObjectName("big")
@@ -2420,14 +3344,29 @@ class MainWindow(QMainWindow):
         thread. Returns False if a task is already running."""
         def work(worker):
             _m, flows, _src = self._flows(refresh=refresh)
-            return [h for h, _n in mitm_mod.hosts(flows)]
+            worker.progress.emit(f"read {len(flows)} flows…")
+            hosts = [h for h, _n in mitm_mod.hosts(flows)]
+            worker.progress.emit(f"{len(hosts)} hosts found")
+            return hosts
 
         def done(ok, hosts):
             if not ok:
+                # First load never answered: say so honestly
+                # instead of leaving the pending text up forever.
+                if self.gen_host.lineEdit().placeholderText(
+                        ).startswith("Loading"):
+                    self.gen_host.lineEdit().setPlaceholderText(
+                        "Couldn't load hosts. Press Refresh hosts "
+                        "to try again.")
                 return
             current = self.gen_host.currentText()
             self.gen_host.clear()
             self.gen_host.addItems(hosts)
+            # The honest empty text: it only renders when the
+            # combo has no items (v0.6 T4).
+            self.gen_host.lineEdit().setPlaceholderText(
+                "No hosts yet. Record an app or import a HAR")
+            jumped = False
             if current:
                 self.gen_host.setCurrentText(current)
             if self._gen_jump_host:
@@ -2436,9 +3375,92 @@ class MainWindow(QMainWindow):
                 idx = self.gen_host.findText(self._gen_jump_host)
                 if idx >= 0:
                     self.gen_host.setCurrentIndex(idx)
+                    jumped = True
                 self._gen_jump_host = None
+            if not self._gen_hosts_loaded_once:
+                self._gen_hosts_loaded_once = True
+                if not current and not jumped and hosts:
+                    # First load: start unselected (v0.6 T7) — the
+                    # user picks a host, and the preview says what
+                    # Generate will make for it.
+                    self.gen_host.setCurrentIndex(-1)
+                    self.gen_host.lineEdit().setPlaceholderText(
+                        "pick a host")
 
         return self._run_task("loading hosts…", work, done)
+
+    def _refresh_polish(self):
+        """Re-probe polish-engine availability off the UI thread (v0.6
+        T10). Runs on its own thread, not the single _run_task slot,
+        so it never blocks a hosts load or flashes the progress bar.
+        One probe at a time."""
+        if self._polish_task is not None:
+            return
+
+        def work(_worker):
+            return doctor.polish_engines()
+
+        worker = TaskWorker(work)
+        self._polish_task = worker
+        worker.result.connect(self._polish_finished)
+        worker.start()
+
+    def _polish_finished(self, ok, engines):
+        """The availability probe answered — rebuild the polish combo
+        with real labels, keeping the user's pick."""
+        worker = self._polish_task
+        self._polish_task = None
+        if worker is not None:
+            # Join before dropping the reference (see _task_finished):
+            # the result signal fires at the end of run(), while the
+            # thread is still winding down.
+            worker.wait()
+        if not ok:
+            # The probe itself failed — say nothing is ready rather
+            # than leaving "checking…" up forever.
+            engines = [
+                {"key": "ollama", "ok": False,
+                 "label": "ollama (not running)"},
+                {"key": "claude", "ok": False,
+                 "label": "claude (not installed)"},
+                {"key": "opencode", "ok": False,
+                 "label": "opencode (not installed)"},
+            ]
+        current = self.polish_combo.currentData()
+        self.polish_combo.clear()
+        self.polish_combo.addItem("none (deterministic, free)", "none")
+        for engine in engines:
+            self.polish_combo.addItem(engine["label"], engine["key"])
+        idx = self.polish_combo.findData(current)
+        self.polish_combo.setCurrentIndex(idx if idx >= 0 else 0)
+
+    def _update_gen_preview(self, _text=None):
+        """(v0.6 T7) What Generate will make for the picked host,
+        from the already-cached flows — distinct endpoints counted
+        WITHOUT fetching bodies. Empty until a host with flows is
+        picked. Reads the cache only: never triggers a fetch from
+        the UI thread."""
+        host = self.gen_host.currentText().strip()
+        self.gen_preview.setText("")
+        if not host or self._flows_cache is None:
+            return
+        _m, flows, _src = self._flows_cache
+        endpoints = set()
+        auth = None
+        for f in flows:
+            req = f.get("request") or {}
+            if req.get("host") != host:
+                continue
+            endpoints.add((req.get("method", ""),
+                           (req.get("path") or "").split("?")[0]))
+            if auth is None:
+                auth = _preview_auth(req.get("headers") or [])
+        if not endpoints:
+            return
+        n = len(endpoints)
+        self.gen_preview.setText(
+            f"{n} endpoint{'s' if n != 1 else ''} → {n} method"
+            f"{'s' if n != 1 else ''}, auth: {auth or 'none seen'}")
 
     def _import_har(self):
         path, _ = QFileDialog.getOpenFileName(
@@ -2567,6 +3589,7 @@ class MainWindow(QMainWindow):
             self.open_btn.setEnabled(True)
             self.copy_btn.setEnabled(True)
             self._refresh_clients()
+            self._checklist_tick("generated")
             # Quiet completion state (item 20): the settled status
             # names the client that was written.
             self._done_text = (f"✓ Client written: "
@@ -2625,6 +3648,20 @@ class MainWindow(QMainWindow):
             "Assets captured from your apps: images, models, audio, "
             "fonts. Build them into a Reblend pack."))
 
+        # v0.6 T15: bento — hero asset table on the left, Reblend +
+        # pack as side tiles stacked on the right (entry 005: 20 px
+        # gaps, 16 px corners, size is the hierarchy).
+        brow = QHBoxLayout()
+        brow.setSpacing(20)
+
+        # Hero tile: the assets themselves — the main point, the
+        # biggest tile.
+        hero = QFrame()
+        hero.setObjectName("tile")
+        hlay = QVBoxLayout(hero)
+        hlay.setContentsMargins(12, 12, 12, 12)
+        hlay.setSpacing(8)
+
         row = QHBoxLayout()
         row.addWidget(QLabel("Capture:"))
         self.asset_group = QComboBox()
@@ -2637,7 +3674,7 @@ class MainWindow(QMainWindow):
         delete_group_btn = QPushButton("Delete group…")
         delete_group_btn.clicked.connect(self._delete_group)
         row.addWidget(delete_group_btn)
-        lay.addLayout(row)
+        hlay.addLayout(row)
 
         self.asset_table = QTableWidget(0, 5)
         self.asset_table.setHorizontalHeaderLabels(
@@ -2654,10 +3691,11 @@ class MainWindow(QMainWindow):
         frow.addWidget(self.asset_filter, 1)
         self.asset_filter_info = QLabel("")
         frow.addWidget(self.asset_filter_info)
-        lay.addLayout(frow)
-        lay.addWidget(self.asset_table, 2)
+        hlay.addLayout(frow)
+        hlay.addWidget(self.asset_table, 2)
 
-        row = QHBoxLayout()
+        grid = QGridLayout()
+        grid.setSpacing(8)
         har_btn = QPushButton("Import HAR…")
         har_btn.clicked.connect(self._import_assets_har)
         self.assets_har_btn = har_btn
@@ -2668,23 +3706,32 @@ class MainWindow(QMainWindow):
         preview_btn.clicked.connect(self._preview_asset_button)
         reveal_btn = QPushButton("Reveal in folder")
         reveal_btn.clicked.connect(self._reveal_asset)
-        row.addWidget(har_btn)
-        row.addWidget(scan_btn)
-        row.addWidget(preview_btn)
-        row.addWidget(reveal_btn)
-        row.addStretch(1)
-        lay.addLayout(row)
+        grid.addWidget(har_btn, 0, 0)
+        grid.addWidget(scan_btn, 0, 1)
+        grid.addWidget(preview_btn, 1, 0)
+        grid.addWidget(reveal_btn, 1, 1)
+        hlay.addLayout(grid)
+        brow.addWidget(hero, 3)
 
-        # Reblend location
-        rbox = QGroupBox("Reblend (for converting models into a scene)")
-        rlay = QVBoxLayout(rbox)
-        rrow = QHBoxLayout()
+        # Side tiles, stacked: Reblend status, then pack actions.
+        side = QVBoxLayout()
+        side.setSpacing(20)
+
+        reblend_tile = QFrame()
+        reblend_tile.setObjectName("tile")
+        rlay = QVBoxLayout(reblend_tile)
+        rlay.setContentsMargins(12, 12, 12, 12)
+        rlay.setSpacing(8)
+        reblend_head = QLabel(
+            "Reblend (for converting models into a scene)")
+        reblend_head.setObjectName("section")
+        rlay.addWidget(reblend_head)
         self.reblend_label = QLabel("")
+        self.reblend_label.setWordWrap(True)
+        rlay.addWidget(self.reblend_label)
         pick_btn = QPushButton("Choose Reblend folder…")
         pick_btn.clicked.connect(self._choose_reblend)
-        rrow.addWidget(self.reblend_label, 1)
-        rrow.addWidget(pick_btn)
-        rlay.addLayout(rrow)
+        rlay.addWidget(pick_btn)
         srow = QHBoxLayout()
         srow.addWidget(QLabel("Model scale (cm per unit):"))
         self.scale_spin = QSpinBox()
@@ -2693,15 +3740,23 @@ class MainWindow(QMainWindow):
         srow.addWidget(self.scale_spin)
         srow.addStretch(1)
         rlay.addLayout(srow)
-        lay.addWidget(rbox)
+        side.addWidget(reblend_tile)
 
+        pack_tile = QFrame()
+        pack_tile.setObjectName("tile")
+        play = QVBoxLayout(pack_tile)
+        play.setContentsMargins(12, 12, 12, 12)
+        play.setSpacing(8)
+        pack_head = QLabel("Asset pack")
+        pack_head.setObjectName("section")
+        play.addWidget(pack_head)
         build_btn = QPushButton("Build asset pack")
         build_btn.setObjectName("big")
         build_btn.clicked.connect(self._build_pack)
         self.build_pack_btn = build_btn
-        lay.addWidget(build_btn)
-
-        row = QHBoxLayout()
+        play.addWidget(build_btn)
+        grid = QGridLayout()
+        grid.setSpacing(8)
         self.open_pack_btn = QPushButton("Open pack folder")
         self.open_pack_btn.setEnabled(False)
         self.open_pack_btn.clicked.connect(self._open_pack_folder)
@@ -2714,20 +3769,22 @@ class MainWindow(QMainWindow):
         export_pack_btn.clicked.connect(self._export_pack)
         import_pack_btn = QPushButton("Import pack…")
         import_pack_btn.clicked.connect(self._import_pack)
-        row.addWidget(self.open_pack_btn)
-        row.addWidget(self.open_reblend_btn)
-        row.addWidget(delete_pack_btn)
-        row.addWidget(export_pack_btn)
-        row.addWidget(import_pack_btn)
-        row.addStretch(1)
-        lay.addLayout(row)
-
+        grid.addWidget(self.open_pack_btn, 0, 0)
+        grid.addWidget(self.open_reblend_btn, 0, 1)
+        grid.addWidget(delete_pack_btn, 1, 0)
+        grid.addWidget(export_pack_btn, 1, 1)
+        grid.addWidget(import_pack_btn, 2, 0)
+        play.addLayout(grid)
         self.assets_log = QTextEdit()
         self.assets_log.setReadOnly(True)
-        self.assets_log.setMaximumHeight(110)
+        self.assets_log.setMaximumHeight(80)
         self.assets_log.setPlaceholderText(
             "Build a pack to see the result here.")
-        lay.addWidget(self.assets_log, 1)
+        play.addWidget(self.assets_log)
+        side.addWidget(pack_tile)
+        side.addStretch(1)
+        brow.addLayout(side, 2)
+        lay.addLayout(brow, 1)
 
         # No fetch here — the tab loads on first show (_tab_shown).
         return w
@@ -2775,6 +3832,10 @@ class MainWindow(QMainWindow):
         self._asset_group_selected()
 
     def _asset_group_selected(self, _idx=None):
+        # v0.6 T5: refresh keeps your place — the asset's path is
+        # the identity, so a group switch (where the path is gone)
+        # clears the selection instead of keeping a wrong row.
+        snap = _snapshot_table(self.asset_table)
         self.asset_table.setRowCount(0)
         gdir = self.asset_group.currentData()
         if not gdir:
@@ -2826,6 +3887,7 @@ class MainWindow(QMainWindow):
             self.asset_table.setItem(
                 i, 4, QTableWidgetItem(
                     status_map.get(e.get("sha256"), "saved")))
+        _restore_table(self.asset_table, snap, key="path")
         self._filter_asset_table()
 
     # ---- Asset preview (item 10) ------------------------------------------
@@ -3303,6 +4365,9 @@ class MainWindow(QMainWindow):
         self.preset_source.blockSignals(False)
         if current:
             self.preset_source.setCurrentText(current)
+        # v0.6 T5: refresh keeps your place in both lists.
+        snap = _snapshot_list(self.presets_list)
+        snap_patterns = _snapshot_list(self.pattern_presets_list)
         self.presets_list.clear()
         saved = presets.list_presets()
         if not saved:
@@ -3327,6 +4392,8 @@ class MainWindow(QMainWindow):
                 f"app{'s' if len(learned_from) != 1 else ''}")
             item.setData(Qt.UserRole, p["name"])
             self.pattern_presets_list.addItem(item)
+        _restore_list(self.presets_list, snap)
+        _restore_list(self.pattern_presets_list, snap_patterns)
         self._preset_selected()
 
     def _preset_selected(self, _current=None, _prev=None):
@@ -3511,7 +4578,16 @@ class MainWindow(QMainWindow):
         lay.addLayout(frow)
         self.clients_list = QListWidget()
         self.clients_list.itemDoubleClicked.connect(self._open_client_item)
+        self.clients_list.currentItemChanged.connect(self._client_selected)
         lay.addWidget(self.clients_list, 1)
+        # v0.6 T12: preview pane — host, methods, date for the
+        # selected client, parsed with ast (never executed).
+        self.client_preview = QTextEdit()
+        self.client_preview.setReadOnly(True)
+        self.client_preview.setMaximumHeight(120)
+        self.client_preview.setPlaceholderText(
+            "Select a client to see its host, methods, and date.")
+        lay.addWidget(self.client_preview)
         smoke = QPushButton("Smoke-test selected client")
         smoke.clicked.connect(self._smoke_test)
         self.smoke_btn = smoke
@@ -3536,6 +4612,8 @@ class MainWindow(QMainWindow):
         return w
 
     def _refresh_clients(self):
+        # v0.6 T5: refresh keeps your place.
+        snap = _snapshot_list(self.clients_list)
         self.clients_list.clear()
         clients = store.list_clients()
         if not clients:
@@ -3546,7 +4624,29 @@ class MainWindow(QMainWindow):
             item = QListWidgetItem(f"{name}  ({size} bytes)")
             item.setData(Qt.UserRole, path)
             self.clients_list.addItem(item)
+        _restore_list(self.clients_list, snap)
         self._filter_clients_list()
+
+    def _client_selected(self, current, _prev):
+        """(v0.6 T12) Fill the preview pane for the selected client,
+        or clear it when nothing is selected."""
+        if current is None or not current.data(Qt.UserRole):
+            self.client_preview.clear()
+            return
+        info = codegen.preview_client(current.data(Qt.UserRole))
+        if info is None:
+            self.client_preview.setPlainText("Could not read this file.")
+            return
+        host = info["host"] or "unknown (not a MIMIK client)"
+        methods = info["methods"]
+        if methods:
+            method_line = (f"Methods ({len(methods)}): "
+                           + ", ".join(methods))
+        else:
+            method_line = "Methods: none found"
+        generated = info["date"] or "unknown"
+        self.client_preview.setPlainText(
+            f"Host: {host}\n{method_line}\nGenerated: {generated}")
 
     def _open_client_item(self, item):
         """Double-click on a client — open it in the default editor."""
@@ -3814,6 +4914,11 @@ class MainWindow(QMainWindow):
         """Reload the analyzed-binaries list. Returns True (sync — no
         background task needed, the list is small)."""
         rows = binary.list_binaries()
+        # v0.6 T5: refresh keeps your place — the model state
+        # (_binary_sha) is the selection identity, as before, plus
+        # the scrollbar value, which used to reset.
+        snap = (self._binary_sha,
+                self.binaries_list.verticalScrollBar().value())
         self.binaries_list.clear()
         if not rows:
             self.binaries_list.addItem(_empty_item(
@@ -3832,8 +4937,7 @@ class MainWindow(QMainWindow):
                 f"ghidra: {'yes' if row['has_ghidra'] else 'no'})")
             item.setData(Qt.UserRole, row["sha256"])
             self.binaries_list.addItem(item)
-        if self._binary_sha is not None:
-            self._select_binary(self._binary_sha)
+        _restore_list(self.binaries_list, snap)
         return True
 
     def _select_binary(self, sha):
@@ -4212,8 +5316,9 @@ class MainWindow(QMainWindow):
         w = QWidget()
         lay = QVBoxLayout(w)
         lay.addWidget(QLabel("Setup check: green is good, red has a fix."))
-        refresh = QPushButton("Re-check")
-        refresh.clicked.connect(self._run_doctor)
+        # v0.6 T11: stored, so tab switches can focus it.
+        self.doctor_recheck_btn = QPushButton("Re-check")
+        self.doctor_recheck_btn.clicked.connect(self._run_doctor)
         about = QPushButton("About MIMIK")
         about.clicked.connect(self._show_about)
         view_log = QPushButton("View log")
@@ -4227,7 +5332,7 @@ class MainWindow(QMainWindow):
         debug_btn = QPushButton("Copy debug report")
         debug_btn.clicked.connect(self._copy_debug_report)
         row = QHBoxLayout()
-        row.addWidget(refresh)
+        row.addWidget(self.doctor_recheck_btn)
         row.addWidget(about)
         row.addWidget(view_log)
         row.addWidget(sample_btn)
@@ -4238,6 +5343,10 @@ class MainWindow(QMainWindow):
         self.doctor_text = QTextEdit()
         self.doctor_text.setReadOnly(True)
         self.doctor_text.setPlaceholderText("Running the setup check…")
+        # v0.6 T4: the check names with a pending state, so the tab
+        # is never a blank box — the real results replace them when
+        # the probe finishes.
+        self.doctor_text.setHtml(self._render_doctor_pending())
         lay.addWidget(self.doctor_text, 1)
         # No check here — the tab loads on first show (_tab_shown).
         return w
@@ -4348,57 +5457,100 @@ class MainWindow(QMainWindow):
         self._ghidra_setup_dialog = dlg
         dlg.exec()
 
-    # ---- first-run onboarding (item 28) --------------------------------------
+    # ---- first-run checklist (v0.6 T3, entries 014 + 020) ------------------
+    # The old welcome modal + sample-guide modal chain is gone (U18):
+    # a fresh data dir gets the sample capture pre-loaded, silently,
+    # and the Record tab shows a four-step checklist that ticks as
+    # the steps really happen. No modal ever appears at startup.
 
-    def _maybe_offer_sample(self):
-        """First-run offer: a fresh data dir gets the sample capture.
+    def _maybe_first_run(self):
+        """First-run setup: a fresh data dir gets the sample capture
+        pre-loaded (no modal) and the checklist on the Record tab. A
+        returning user whose steps are incomplete sees the checklist
+        too; a user who finished (or dismissed) never sees it.
         Called once from main() after the window is up — never from
         MainWindow itself, so tests that build a window on an empty
-        dir don't get a modal dialog."""
-        if not sample.is_fresh():
+        dir don't load the sample unasked."""
+        if sample.is_fresh():
+            self._load_sample()
+            presets.set_sample_offered()
+        if _settings().value("checklist/dismissed", False, type=bool):
             return
-        dlg = QDialog(self)
-        dlg.setWindowTitle("Welcome to MIMIK")
-        lay = QVBoxLayout(dlg)
-        lay.addWidget(QLabel(
-            "MIMIK turns an app's traffic into a Python library:\n"
-            "1. Record an app  →  2. pick a host  →  "
-            "3. generate a client."))
-        lay.addWidget(QLabel(
-            "No app to record yet? Load a sample capture of a demo "
-            "game API (demo.example.com) and try the whole flow: "
-            "hosts, preset, generated client, with no recording."))
-        row = QHBoxLayout()
-        load_btn = QPushButton("Load the sample capture")
-        load_btn.clicked.connect(self._sample_offer_accept)
-        row.addWidget(load_btn)
-        no_btn = QPushButton("No thanks")
-        no_btn.clicked.connect(self._sample_offer_decline)
-        row.addWidget(no_btn)
-        lay.addLayout(row)
-        self._sample_dialog = dlg
-        dlg.exec()
+        if not self._refresh_checklist():
+            self.checklist_box.setVisible(True)
 
-    def _sample_offer_accept(self):
-        self._sample_dialog.accept()
-        presets.set_sample_offered()
-        result = self._load_sample()
-        if not result["already_loaded"]:
-            self._show_sample_guide(result)
+    def _checklist_done(self, key):
+        """Whether a checklist step is done: the persisted flag, or
+        the real store state — a returning user with captures and
+        clients has done these steps already, so the checklist never
+        nags someone who finished before it existed."""
+        if _settings().value(f"checklist/{key}", False, type=bool):
+            return True
+        if key == "picked":
+            return True  # opening the app was real work
+        try:
+            if key in ("started", "host_seen"):
+                # The sample capture doesn't count: it is pre-loaded,
+                # not the user's own recording. Any other host does —
+                # traffic in the store means the record stage is done.
+                return any(h != sample.SAMPLE_HOST
+                           for h, _n, _t in store.list_captures())
+            if key == "generated":
+                return bool(store.list_clients())
+        except Exception:
+            return False
+        return False
 
-    def _sample_offer_decline(self):
-        self._sample_dialog.accept()
-        presets.set_sample_offered()
+    def _refresh_checklist(self):
+        """Re-render the step ticks. Returns True when every step is
+        done — the box goes away and never comes back."""
+        all_done = True
+        for key, text in _CHECKLIST_STEPS:
+            done = self._checklist_done(key)
+            mark = "✓" if done else "○"
+            self._checklist_labels[key].setText(f"{mark} {text}")
+            all_done = all_done and done
+        if all_done:
+            _settings().setValue("checklist/dismissed", True)
+            self.checklist_box.setVisible(False)
+        return all_done
+
+    def _checklist_tick(self, key):
+        """A step really happened — persist it and re-render. A
+        second tick of the same step is a no-op, so the live-hosts
+        poll (every couple of seconds) costs one settings read."""
+        if _settings().value(f"checklist/{key}", False, type=bool):
+            return
+        _settings().setValue(f"checklist/{key}", True)
+        self._refresh_checklist()
+
+    def _checklist_dismiss(self):
+        """The user is done with the checklist — never reappears on
+        its own (Help menu can bring it back)."""
+        _settings().setValue("checklist/dismissed", True)
+        self.checklist_box.setVisible(False)
+
+    def _checklist_show(self):
+        """Help menu: show the checklist again after a dismiss. A
+        no-op when every step is already done — there is nothing to
+        show."""
+        _settings().setValue("checklist/dismissed", False)
+        if not self._refresh_checklist():
+            self.checklist_box.setVisible(True)
 
     def _load_sample_clicked(self):
-        """The Doctor tab's "Load sample capture" button."""
+        """The Doctor tab's "Load sample capture" button. Reports
+        into the Doctor text — no modal (v0.6 T3)."""
         result = self._load_sample()
         if result["already_loaded"]:
             self.doctor_text.append(
                 f"The sample capture is already loaded "
                 f"({result['flows']} flows for {sample.SAMPLE_HOST}).")
         else:
-            self._show_sample_guide(result)
+            self.doctor_text.append(
+                f"Sample capture loaded: {result['flows']} flows for "
+                f"{sample.SAMPLE_HOST}. Open the Hosts and Learn tab "
+                f"to see it, then Generate a client.")
 
     def _load_sample(self):
         """Load the sample capture and refresh every tab that shows
@@ -4409,42 +5561,6 @@ class MainWindow(QMainWindow):
         self._refresh_saved_flows()
         self._update_status_bar()
         return result
-
-    def _show_sample_guide(self, result):
-        """Step 2 of the guide: the sample is loaded — offer the jump
-        to the Generate tab with the sample host pre-selected, so one
-        press of Generate produces the first working client."""
-        dlg = QDialog(self)
-        dlg.setWindowTitle("Sample loaded")
-        lay = QVBoxLayout(dlg)
-        lay.addWidget(QLabel(
-            f"demo.example.com is ready: {result['flows']} flows, "
-            f"{result['assets']} "
-            f"asset{'s' if result['assets'] != 1 else ''}"
-            + (", preset learned" if result["preset"] else "")
-            + ".\n\nYour first client is one press away. Open the "
-              "Generate tab and press Generate."))
-        row = QHBoxLayout()
-        go_btn = QPushButton("Take me to Generate")
-        go_btn.clicked.connect(self._sample_guide_go)
-        row.addWidget(go_btn)
-        explore_btn = QPushButton("I'll explore")
-        explore_btn.clicked.connect(self._sample_guide_close)
-        row.addWidget(explore_btn)
-        lay.addLayout(row)
-        self._sample_guide_dialog = dlg
-        dlg.exec()
-
-    def _sample_guide_go(self):
-        self._sample_guide_dialog.accept()
-        # The jump host rides _refresh_gen_hosts: discard "generate"
-        # so switching tabs reloads it and lands on the sample host.
-        self._gen_jump_host = sample.SAMPLE_HOST
-        self._loaded.discard("generate")
-        self.tabs.setCurrentIndex(2)  # Generate tab
-
-    def _sample_guide_close(self):
-        self._sample_guide_dialog.accept()
 
     def _check_for_updates(self):
         """Manual update check (item 31) — one GitHub API call, off
@@ -4479,6 +5595,23 @@ class MainWindow(QMainWindow):
 
         self._run_task("checking for updates…", work, done)
 
+    def _render_doctor_pending(self):
+        """The setup check's names with a pending marker (v0.6 T4):
+        shown while the probes run, instead of a blank box."""
+        grey = "#9e9e9e"
+
+        def line(text):
+            return (f'<font color="{grey}">'
+                    f"{html.escape(text)}</font>")
+
+        names = doctor.check_names()
+        out = [line(f"…  {n}") for n in names["required"]]
+        out.append(line("…  mitmweb running + reachable"))
+        out.append("")
+        out.append(line("optional:"))
+        out.extend(line(f"…  {n}") for n in names["optional"])
+        return "<br>".join(out)
+
     def _run_doctor(self):
         """Setup check — the network probes (mitmweb, Ollama) run off
         the UI thread, so opening the tab never freezes the window.
@@ -4489,8 +5622,15 @@ class MainWindow(QMainWindow):
         def done(ok, result):
             if ok:
                 self.doctor_text.setHtml(self._render_doctor(result))
+            else:
+                self.doctor_text.setHtml(
+                    "<i>The setup check failed. Press Re-check to "
+                    "try again.</i>")
 
-        return self._run_task("running setup check…", work, done)
+        started = self._run_task("running setup check…", work, done)
+        if started:
+            self.doctor_text.setHtml(self._render_doctor_pending())
+        return started
 
     def _render_doctor(self, result):
         """The shared setup check as colored HTML — green is good, red
@@ -4598,7 +5738,7 @@ def main():
         pass
     app.setApplicationName("MIMIK")
     app.setWindowIcon(window_icon())
-    app.setStyleSheet(theme_stylesheet(current_theme()))
+    app.setStyleSheet(effective_stylesheet())
     win = MainWindow()
     guard.start_server(win.bring_to_front)
     win.show()
@@ -4606,8 +5746,9 @@ def main():
     # the Wine prefix pointing at the proxy (a saved state with no
     # restore). Deferred so the window is up before any dialog appears.
     QTimer.singleShot(0, win.check_stale_wine_state)
-    # Same deferral for the first-run sample offer (item 28).
-    QTimer.singleShot(0, win._maybe_offer_sample)
+    # Same deferral for the first-run setup (v0.6 T3): the sample
+    # pre-loads silently and the checklist appears on the Record tab.
+    QTimer.singleShot(0, win._maybe_first_run)
     sys.exit(app.exec())
 
 

@@ -1,5 +1,72 @@
 # MIMIK Changelog
 
+## v0.6 — 2026-11-16
+
+The UI audit build: every finding from the audit against the BNB UI
+design library, in priority order (T1–T16). Items in build order:
+
+- A look of its own (T1): the Record tab carries the MIMIK icon +
+  wordmark in-window, buttons press with a soft shadow + a visible
+  pressed state in both themes, dialog surfaces are raised, and type
+  has a hierarchy instead of one size everywhere.
+- Recording is visible from another app (T2): a tray icon shows the
+  recording state, elapsed time, and flow count, with Stop on its
+  menu; where no tray exists, an always-on-top status chip takes
+  its place.
+- First run is a checklist, not two modals (T3): the four steps to
+  a first client live on the Record tab and tick off as you do
+  them. The startup modals are gone.
+- Honest loading states (T4): lists show "Loading captures…" while
+  the worker runs and only say "No captures yet" once the load has
+  actually answered; the Doctor tab shows its pending check names;
+  workers report real counts as they go.
+- Refresh keeps your place (T5): hosts, presets, clients, assets,
+  and binaries restore your selection and scroll position after a
+  refresh instead of jumping back to the top.
+- Endpoints table "Seen" column, sortable (T6): each endpoint shows
+  how many times it was seen, sorted numerically (10 above 3, not
+  below 2). The table keeps capture order until you sort it.
+- Generate preview before pressing (T7): picking a host shows how
+  many endpoints it has, how many methods that makes, and the auth
+  scheme word — before you generate anything.
+- Remembers your last capture setup (T8): the last target, file,
+  and launch command come back on the next start; the telemetry
+  filter and screenshot choices are remembered per target, and the
+  recorder honors the per-target choice while it records.
+- Shows what the filter dropped (T9): while recording, the live
+  strip counts the telemetry hosts dropped so far; tapping it
+  lists them.
+- Guided polish picker (T10): the Generate tab shows which polish
+  engines are actually available right now (ollama running with
+  its model count, claude/opencode installed or not) in plain
+  words, instead of a bare list of names.
+- Keyboard path + visible focus (T11): every control shows a
+  violet focus ring (yellow in high contrast), switching tabs
+  lands focus on the tab's primary action, pads answer to
+  Space/Return, and F9 starts or stops recording.
+- Client preview pane (T12): selecting a client shows its host,
+  method names, and date, parsed from the file — never run.
+- Accessibility presets (T13): Big text, High contrast, Reduced
+  motion (turns the press animation off), and One-touch capture
+  (pads + Stop only), one tap each from the View menu or the
+  first-run checklist, and they persist across restarts.
+- Capture timeline (T14): every flow is stamped at save time
+  (mitmweb's request.timestamp_start, the HAR's startedDateTime,
+  or the save time); the Hosts tab has a scrubber that filters
+  endpoints to the time window you drag across.
+- Assets tab as a bento (T15): the asset table is the hero tile on
+  the left; Reblend status and pack actions are side tiles stacked
+  on the right (20 px gaps, 16 px corners).
+- One-tap capture pads (T16, Joshua's call): the Record tab's
+  target picker is five pads — one per target, tap to start, the
+  pad shows its state. The combo + Start button design is gone.
+
+Fixes folded in along the way: the per-target filter choice is now
+honored by the recorder (not just the checkbox); menu and checklist
+actions no longer use lambda signal slots (heap safety); the
+presets-test chunking artifact and the stale-lock flake are both
+documented as non-defects; test counts reconcile exactly (965).
+
 ## v0.5 — 2026-11-15
 
 Binary analysis with Ghidra (optional, never bundled) + a UI redesign

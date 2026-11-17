@@ -42,6 +42,46 @@ class MitmwebCmdTests(unittest.TestCase):
             self.assertEqual(recorder.mitmweb_cmd(), ["mitmweb"])
 
 
+class PollDroppedTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        os.environ["MIMIK_DATA_DIR"] = self.tmp
+
+    def tearDown(self):
+        del os.environ["MIMIK_DATA_DIR"]
+
+    def test_poll_reports_dropped_hosts(self):
+        # v0.6 T9: poll calls on_dropped with the sorted hosts the
+        # filter dropped, when the set changes (including back to
+        # empty); an unchanged set calls nothing.
+        from mimik import presets
+
+        presets.set_filtering_enabled(True)
+        presets.set_excluded_hosts(["google-analytics.com"])
+        kept = {"id": "1",
+                "request": {"host": "game.example.com", "method": "GET",
+                            "path": "/v1/x", "scheme": "https",
+                            "port": 443, "headers": []},
+                "response": {"status_code": 200, "headers": []}}
+        dropped = {"id": "2",
+                   "request": {"host": "google-analytics.com",
+                               "method": "GET", "path": "/g/collect",
+                               "scheme": "https", "port": 443,
+                               "headers": []},
+                   "response": {"status_code": 200, "headers": []}}
+        seen = []
+        s = recorder.ProxySession(on_dropped=seen.append)
+        s.mitm = mock.Mock()
+        s.mitm.flows.return_value = [kept, dropped]
+        s.poll()
+        self.assertEqual(seen, [["google-analytics.com"]])
+        s.poll()
+        self.assertEqual(len(seen), 1)
+        s.mitm.flows.return_value = [kept]
+        s.poll()
+        self.assertEqual(seen[-1], [])
+
+
 class ProxySessionStartTests(unittest.TestCase):
     def test_start_passes_unbuffered_env(self):
         # Regression: mitmweb buffers its startup lines when stdout is a

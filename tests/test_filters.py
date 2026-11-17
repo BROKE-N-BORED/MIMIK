@@ -98,6 +98,25 @@ class SettingsTests(unittest.TestCase):
         presets.set_filtering_enabled(True)
         self.assertTrue(presets.filtering_enabled())
 
+    def test_filtering_is_per_target(self):
+        # v0.6 T8: a target with its own choice uses it; others
+        # fall back to the global value, which is untouched.
+        presets.set_filtering_enabled(False)
+        presets.set_filtering_enabled(True, target="android")
+        self.assertTrue(presets.filtering_enabled(target="android"))
+        self.assertFalse(
+            presets.filtering_enabled(target="linux-app"))
+        self.assertFalse(presets.filtering_enabled())
+
+    def test_screenshot_is_per_target(self):
+        # v0.6 T8: same per-target shape as filtering; default OFF.
+        self.assertFalse(presets.screenshot_enabled())
+        presets.set_screenshot_enabled(True, target="android")
+        self.assertTrue(presets.screenshot_enabled(target="android"))
+        self.assertFalse(
+            presets.screenshot_enabled(target="linux-app"))
+        self.assertFalse(presets.screenshot_enabled())
+
     def test_apply_honors_toggle(self):
         flows = [flow("1", "game.example.com"),
                  flow("2", "google-analytics.com")]
@@ -108,6 +127,22 @@ class SettingsTests(unittest.TestCase):
         kept, dropped = filters.apply_capture_filter(flows)
         self.assertEqual([f["id"] for f in kept], ["1", "2"])
         self.assertEqual(dropped, set())
+
+    def test_apply_honors_target_choice(self):
+        # v0.6 T8: the filter uses the target's own choice when it
+        # has one, and the global value otherwise.
+        flows = [flow("1", "game.example.com"),
+                 flow("2", "google-analytics.com")]
+        presets.set_filtering_enabled(True)
+        presets.set_filtering_enabled(False, target="android")
+        kept, dropped = filters.apply_capture_filter(
+            flows, target="android")
+        self.assertEqual([f["id"] for f in kept], ["1", "2"])
+        self.assertEqual(dropped, set())
+        kept, dropped = filters.apply_capture_filter(
+            flows, target="linux-app")
+        self.assertEqual([f["id"] for f in kept], ["1"])
+        self.assertEqual(dropped, {"google-analytics.com"})
 
     def test_settings_preserve_other_keys(self):
         presets.set_auto_learn(True)
@@ -141,6 +176,27 @@ class RecorderFilterTests(unittest.TestCase):
         hosts = [h for h, _n, _t in store.list_captures()]
         self.assertEqual(hosts, ["game.example.com"])
         self.assertEqual(store.load_host("google-analytics.com"), [])
+
+    def test_poll_honors_target_filter_choice(self):
+        # v0.6 T8: the record path uses the target's own choice, not
+        # the global — the checkbox must change what gets recorded.
+        from mimik import presets
+
+        presets.set_filtering_enabled(True)
+        presets.set_filtering_enabled(False, target="android")
+        s = recorder.ProxySession(target="android")
+        s.mitm = mock.Mock()
+        s.mitm.flows.return_value = [
+            flow("1", "game.example.com"),
+            flow("2", "google-analytics.com"),
+        ]
+        s.mitm.body.return_value = b""
+        rows = s.poll()
+        self.assertEqual(sorted(rows), [("game.example.com", 1),
+                                        ("google-analytics.com", 1)])
+        hosts = sorted(h for h, _n, _t in store.list_captures())
+        self.assertEqual(hosts, ["game.example.com",
+                                 "google-analytics.com"])
 
     def test_poll_logs_dropped_hosts_once_per_change(self):
         from mimik import log as mimik_log

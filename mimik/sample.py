@@ -7,6 +7,7 @@ host is a reserved example.com name that can never be a real app,
 and the token/password carry "fake" in the value itself.
 """
 import json
+import time
 
 from . import assets, presets, store
 
@@ -22,7 +23,7 @@ _FAKE_PASSWORD = "fake-demo-password-sample-only"
 
 def _flow(fid, method, path, status=200, req_headers=None,
           resp_headers=None, req_body=None, resp_body=None,
-          resp_b64=False):
+          resp_b64=False, ts=None):
     """One flow dict in the store's shape, bodies already embedded
     (save_flows passes embedded bodies through when mitm is None)."""
     flow = {
@@ -33,6 +34,10 @@ def _flow(fid, method, path, status=200, req_headers=None,
         "response": {"status_code": status,
                      "headers": resp_headers or []},
     }
+    if ts is not None:
+        # v0.6 T14: the sample's own capture time, so the timeline
+        # has something real to scrub.
+        flow["request"]["timestamp_start"] = ts
     if req_body is not None:
         flow["_saved_request_body"] = req_body
     if resp_body is not None:
@@ -44,10 +49,13 @@ def _flow(fid, method, path, status=200, req_headers=None,
 
 def sample_flows():
     """The sample capture: 6 flows for a fictional game API. Fresh
-    dicts on every call, so callers can mutate them freely."""
+    dicts on every call, so callers can mutate them freely. The
+    flows are spread 10 s apart ending now (v0.6 T14), so the
+    sample capture has a real timeline to scrub."""
     auth = [["Authorization", f"Bearer {_FAKE_TOKEN}"],
             ["User-Agent", "DemoGame/1.0"]]
     json_hdr = [["Content-Type", "application/json"]]
+    now = time.time()
     return [
         _flow("sample-login", "POST", "/api/auth/login",
               req_headers=[["Content-Type", "application/json"]],
@@ -55,28 +63,34 @@ def sample_flows():
               req_body=json.dumps({"username": "demo-player",
                                    "password": _FAKE_PASSWORD}),
               resp_body=json.dumps({"access_token": _FAKE_TOKEN,
-                                    "player_id": "player-1"})),
+                                    "player_id": "player-1"}),
+              ts=now - 50),
         _flow("sample-user-1", "GET", "/api/users/123",
               req_headers=auth, resp_headers=json_hdr,
               resp_body=json.dumps({"id": 123, "name": "Demo Player",
-                                    "level": 7})),
+                                    "level": 7}),
+              ts=now - 40),
         _flow("sample-user-2", "GET", "/api/users/456",
               req_headers=auth, resp_headers=json_hdr,
               resp_body=json.dumps({"id": 456, "name": "Second Player",
-                                    "level": 3})),
+                                    "level": 3}),
+              ts=now - 30),
         _flow("sample-items", "GET", "/api/items",
               req_headers=auth, resp_headers=json_hdr,
               resp_body=json.dumps(
                   {"items": [{"id": 1, "name": "Sword"},
-                             {"id": 2, "name": "Shield"}]})),
+                             {"id": 2, "name": "Shield"}]}),
+              ts=now - 20),
         _flow("sample-item-1", "GET", "/api/items/7",
               req_headers=auth, resp_headers=json_hdr,
               resp_body=json.dumps({"id": 7, "name": "Potion",
-                                    "price": 50})),
+                                    "price": 50}),
+              ts=now - 10),
         _flow("sample-logo", "GET", "/assets/logo.png",
               req_headers=auth,
               resp_headers=[["Content-Type", "image/png"]],
-              resp_body=_LOGO_B64, resp_b64=True),
+              resp_body=_LOGO_B64, resp_b64=True,
+              ts=now),
     ]
 
 

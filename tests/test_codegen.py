@@ -468,3 +468,41 @@ class WebSocketCodegenTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PreviewClientTests(unittest.TestCase):
+    """v0.6 T12: the client preview parses with ast, never exec."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+
+    def _write(self, name, source):
+        path = os.path.join(self.tmp, name)
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(source)
+        return path
+
+    def test_generated_client(self):
+        from datetime import date
+
+        src = codegen.generate_deterministic("api.example.com", EPS)
+        info = codegen.preview_client(self._write("api_client.py", src))
+        self.assertEqual(info["host"], "api.example.com")
+        self.assertIn("like", info["methods"])
+        self.assertEqual(info["date"], date.today().isoformat())
+
+    def test_foreign_file_has_no_host(self):
+        info = codegen.preview_client(self._write("plain.py",
+                                                  "def fetch():\n"
+                                                  "    pass\n\n"
+                                                  "def save():\n"
+                                                  "    pass\n"))
+        self.assertIsNone(info["host"])
+        self.assertEqual(info["methods"], ["fetch", "save"])
+        self.assertIsNotNone(info["date"])
+
+    def test_unreadable_and_unparseable(self):
+        self.assertIsNone(codegen.preview_client(
+            os.path.join(self.tmp, "missing.py")))
+        self.assertIsNone(codegen.preview_client(
+            self._write("broken.py", "def broken(:\n")))

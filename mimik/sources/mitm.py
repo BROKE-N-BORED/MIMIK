@@ -133,6 +133,7 @@ def endpoints(mitm, flows, host):
     """
     by_key = {}
     counts = {}
+    first_seen = {}
     for f in flows:
         req = f.get("request")
         if not req or req["host"] != host:
@@ -140,6 +141,13 @@ def endpoints(mitm, flows, host):
         key = (req["method"], req["path"].split("?")[0])
         by_key[key] = f
         counts[key] = counts.get(key, 0) + 1
+        # v0.6 T14: the first time this endpoint was called — the
+        # timeline scrubs on it. Live flows carry timestamp_start;
+        # anything older has none.
+        ts = req.get("timestamp_start")
+        if isinstance(ts, (int, float)) \
+                and (key not in first_seen or ts < first_seen[key]):
+            first_seen[key] = ts
 
     out = []
     for (method, path), f in by_key.items():
@@ -159,6 +167,9 @@ def endpoints(mitm, flows, host):
                 # How many captured calls fed this endpoint (v0.4
                 # item 11) — codegen flags single-sample methods.
                 "samples": counts[(method, path)],
+                # First time this endpoint was called (v0.6 T14).
+                # None when no flow for it carried a timestamp.
+                "first_seen": first_seen.get((method, path)),
                 # WebSocket (v0.4 item 13): the sample flow's messages,
                 # fetched live — codegen turns them into a ws_replay
                 # method. A failed fetch means an empty session, never
@@ -192,6 +203,7 @@ def endpoints_from_saved(flows, host):
 
     by_key = {}
     counts = {}
+    first_seen = {}
     for f in flows:
         req = f.get("request")
         if not req or req["host"] != host:
@@ -199,6 +211,13 @@ def endpoints_from_saved(flows, host):
         key = (req["method"], req["path"].split("?")[0])
         by_key[key] = f
         counts[key] = counts.get(key, 0) + 1
+        # v0.6 T14: the first time this endpoint was called — the
+        # timeline scrubs on it. Live flows carry timestamp_start;
+        # anything older has none.
+        ts = req.get("timestamp_start")
+        if isinstance(ts, (int, float)) \
+                and (key not in first_seen or ts < first_seen[key]):
+            first_seen[key] = ts
 
     out = []
     for (method, path), f in by_key.items():
@@ -218,6 +237,9 @@ def endpoints_from_saved(flows, host):
                 # How many captured calls fed this endpoint (v0.4
                 # item 11) — codegen flags single-sample methods.
                 "samples": counts[(method, path)],
+                # First time this endpoint was called (v0.6 T14).
+                # None when no flow for it carried a timestamp.
+                "first_seen": first_seen.get((method, path)),
                 # WebSocket (v0.4 item 13): the saved messages ride
                 # with the flow (see store._embed_bodies).
                 "websocket": ws_mod.is_websocket_flow(f),

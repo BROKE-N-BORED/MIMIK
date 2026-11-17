@@ -21,7 +21,8 @@ TOPICS = [
      "for YOUR apps."),
     ("record",
      "Record tab",
-     "Pick a target, press Start, use the app, press Stop.\n\n"
+     "Pick a target, press Start, use the app, press Stop. "
+     "F9 starts or stops recording from the keyboard.\n\n"
      "Android phone: point the phone's Wi-Fi proxy at this computer "
      "(the tab shows the address), install the MIMIK certificate on "
      "the phone once, then use the app.\n\n"

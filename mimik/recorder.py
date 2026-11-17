@@ -40,11 +40,19 @@ class ProxySession:
     meta: dict stored with every capture (e.g. {"launched_file": ...}).
     on_update: callback(hosts) called after each successful poll, where
     hosts is [(host, count)] most frequent first.
+    target: the capture target ("android", "linux", ...). The capture
+    filter uses this target's own choice, falling back to the global
+    value; None (the CLI) always uses the global (v0.6 T8).
     """
 
-    def __init__(self, meta=None, on_update=None):
+    def __init__(self, meta=None, on_update=None, on_dropped=None,
+                 target=None):
         self.meta = meta or {}
         self.on_update = on_update
+        # v0.6 T9: called with the sorted dropped hosts whenever the
+        # set changes (including back to empty).
+        self.on_dropped = on_dropped
+        self.target = target
         self.proc = None
         self.mitm = None
         # The last set of hosts the capture filter dropped — the log
@@ -138,11 +146,14 @@ class ProxySession:
         # Capture filter (item 26): excluded hosts never reach the
         # store or the host list — filter before saving AND before
         # deriving the rows.
-        flows, dropped = filters.apply_capture_filter(flows)
+        flows, dropped = filters.apply_capture_filter(
+            flows, target=self.target)
         if dropped and dropped != self._last_dropped:
             log.log_info("recorder poll",
                          "excluded %d host(s): %s"
                          % (len(dropped), ", ".join(sorted(dropped))))
+        if dropped != self._last_dropped and self.on_dropped is not None:
+            self.on_dropped(sorted(dropped))
         self._last_dropped = dropped
         if flows:
             try:
@@ -170,7 +181,8 @@ class ProxySession:
             return []
         # Capture filter (item 26): an excluded host's assets are not
         # extracted either.
-        flows, _dropped = filters.apply_capture_filter(flows)
+        flows, _dropped = filters.apply_capture_filter(
+            flows, target=self.target)
         by_host = {}
         for f in flows:
             req = f.get("request") or {}

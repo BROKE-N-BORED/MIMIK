@@ -10,11 +10,14 @@ small local model if one is already there — never downloads anything);
 (b) the `claude` or `opencode` CLI if installed; (c) --prompt-only prints the
 prompt. Any polish failure silently falls back to the deterministic output.
 """
+import ast
 import base64
 import json
+import os
 import re
 import subprocess
 import sys
+from datetime import date
 from urllib.parse import parse_qsl
 
 from . import log
@@ -44,6 +47,48 @@ def is_generated_client(path):
     except (OSError, ValueError):
         return False
     return GENERATED_MARKER in head
+
+
+def preview_client(path):
+    """(v0.6 T12) The preview facts for a kept client file: host,
+    method list, generated date — parsed with ast, never exec, never
+    imported. Returns None when the file cannot be read or parsed;
+    otherwise a dict with host (None when the file carries no HOST
+    assignment), methods (def names, dunders excluded), and date
+    (the file's own date, YYYY-MM-DD, None when it cannot be read).
+    The generated client carries no date line, so the file's
+    modification date is the honest generated date."""
+    try:
+        with open(path, "r", encoding="utf-8", errors="strict") as fh:
+            source = fh.read()
+    except (OSError, ValueError):
+        return None
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return None
+    host = None
+    methods = []
+    for node in tree.body:
+        if isinstance(node, ast.ClassDef):
+            for stmt in node.body:
+                if isinstance(stmt, ast.Assign) and host is None:
+                    if any(isinstance(t, ast.Name) and t.id == "HOST"
+                           for t in stmt.targets) \
+                            and isinstance(stmt.value, ast.Constant) \
+                            and isinstance(stmt.value.value, str):
+                        host = stmt.value.value
+                elif isinstance(stmt, ast.FunctionDef) \
+                        and not stmt.name.startswith("_"):
+                    methods.append(stmt.name)
+        elif isinstance(node, ast.FunctionDef) \
+                and not node.name.startswith("_"):
+            methods.append(node.name)
+    try:
+        generated = date.fromtimestamp(os.path.getmtime(path)).isoformat()
+    except OSError:
+        generated = None
+    return {"host": host, "methods": methods, "date": generated}
 
 # POST to a bare verb endpoint keeps the verb: POST /like -> like().
 _POST_VERBS = {

@@ -57,8 +57,11 @@ class ZipModeTests(unittest.TestCase):
 
     def test_extracted_scripts_stay_executable(self):
         out = os.path.join(self.tmp, "extracted")
+        # stdin DEVNULL: unzip asks "Continue? (y/n/^C)" on a write
+        # error and hangs forever waiting for an answer. With stdin
+        # closed it fails fast instead of hanging the suite.
         subprocess.run(["unzip", "-q", self.zip_path, "-d", out],
-                       check=True)
+                       check=True, stdin=subprocess.DEVNULL)
         prefix = build_zip.PREFIX
         for name in ("install.sh", "uninstall.sh",
                      "Install MIMIK.desktop"):
@@ -71,8 +74,9 @@ class ZipModeTests(unittest.TestCase):
 
     def test_plain_files_are_not_executable(self):
         out = os.path.join(self.tmp, "extracted2")
+        # stdin DEVNULL: see test_extracted_scripts_stay_executable.
         subprocess.run(["unzip", "-q", self.zip_path, "-d", out],
-                       check=True)
+                       check=True, stdin=subprocess.DEVNULL)
         prefix = build_zip.PREFIX
         for rel in ("pyproject.toml", "README.md", "CHANGELOG.md",
                     "mimik/cli.py"):

@@ -54,6 +54,28 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(len(store.load_host("a.example.com", base=self.tmp)), 1)
         self.assertEqual(len(store.load_host("b.example.com", base=self.tmp)), 1)
 
+    def test_save_stamps_missing_timestamps(self):
+        # v0.6 T14: a flow with no timestamp gets stamped at save
+        # time, so every saved flow has a time to scrub by.
+        import time
+
+        before = time.time()
+        store.save_flows([flow("1", "api.example.com")], base=self.tmp)
+        loaded = store.load_host("api.example.com", base=self.tmp)
+        ts = loaded[0]["request"].get("timestamp_start")
+        self.assertIsNotNone(ts)
+        self.assertGreaterEqual(ts, before)
+        self.assertLessEqual(ts, time.time())
+
+    def test_save_keeps_existing_timestamp(self):
+        # v0.6 T14: a flow that already carries a timestamp (live
+        # mitmweb flows do) keeps it — the save never overwrites.
+        f = flow("1", "api.example.com")
+        f["request"]["timestamp_start"] = 123.0
+        store.save_flows([f], base=self.tmp)
+        loaded = store.load_host("api.example.com", base=self.tmp)
+        self.assertEqual(loaded[0]["request"]["timestamp_start"], 123.0)
+
     def test_save_embeds_bodies(self):
         store.save_flows([flow("1", "api.example.com")],
                          mitm=FakeMitm(), base=self.tmp)

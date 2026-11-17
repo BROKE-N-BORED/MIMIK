@@ -35,6 +35,66 @@ def lan_ip():
         s.close()
 
 
+def check_names():
+    """The setup check's names, without running any probe — the GUI
+    shows them with a pending state while the real check runs (v0.6
+    T4, entry 011). Keep in sync with doctor(): test_doctor pins
+    the two lists together."""
+    return {
+        "required": [
+            f"python {sys.version_info.major}."
+            f"{sys.version_info.minor} (3.10+ needed)",
+            "requests library",
+            "proxy (mitmweb or uvx)",
+            "Qt GUI (PySide6)",
+        ],
+        "optional": [
+            "Ollama (optional polish)",
+            "mitmproxy CA cert",
+            "wine (Windows capture target)",
+            "WinLinx (Windows capture target)",
+            "Reblend (asset packs)",
+            "git (fetch unpinning scripts)",
+            "frida (defeat pinning in the app)",
+            "objection (patch APKs for the Frida gadget)",
+            "Ghidra (binary analysis)",
+        ],
+    }
+
+
+def polish_engines():
+    """The Generate polish engines with real availability (v0.6 T10,
+    U39): which engines are installed / running on this machine.
+    Returns [{key, ok, label}] in picker order. "none" is not listed
+    — it needs no engine and always works. Never raises for a
+    missing engine — absence is a result, not an exception."""
+    models = codegen.ollama_models()
+    if models:
+        n = len(models)
+        ollama = {
+            "key": "ollama",
+            "ok": True,
+            "label": f"ollama (running, {n} model"
+                     f"{'s' if n != 1 else ''})",
+        }
+    else:
+        ollama = {
+            "key": "ollama",
+            "ok": False,
+            "label": "ollama (not running)",
+        }
+    engines = [ollama]
+    for key in ("claude", "opencode"):
+        found = shutil.which(key) is not None
+        engines.append({
+            "key": key,
+            "ok": found,
+            "label": (f"{key} (installed)" if found
+                      else f"{key} (not installed)"),
+        })
+    return engines
+
+
 def doctor():
     """Run every setup check. Never raises for a failed check — a
     missing piece is a result, not an exception."""

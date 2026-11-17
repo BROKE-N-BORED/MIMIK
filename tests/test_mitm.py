@@ -73,6 +73,29 @@ class MitmTests(unittest.TestCase):
         self.assertEqual(by_path["/v1/users"]["samples"], 2)
         self.assertEqual(by_path["/v1/like"]["samples"], 1)
 
+    def test_endpoints_carry_first_seen(self):
+        # v0.6 T14: each endpoint carries its first call's time —
+        # the earliest timestamp among its flows.
+        flows = [
+            flow("1", "api.example.com", "GET", "/v1/users", 200),
+            flow("2", "api.example.com", "GET", "/v1/users", 200),
+            flow("3", "api.example.com", "POST", "/v1/like", 200),
+        ]
+        flows[0]["request"]["timestamp_start"] = 1020.0
+        flows[1]["request"]["timestamp_start"] = 1000.0
+        flows[2]["request"]["timestamp_start"] = 1010.0
+        eps = mitm.endpoints_from_saved(flows, "api.example.com")
+        by_path = {e["path"]: e for e in eps}
+        self.assertEqual(by_path["/v1/users"]["first_seen"], 1000.0)
+        self.assertEqual(by_path["/v1/like"]["first_seen"], 1010.0)
+
+    def test_endpoints_first_seen_none_without_timestamps(self):
+        # v0.6 T14: captures saved before v0.6 have no times — the
+        # endpoint says so instead of inventing one.
+        eps = mitm.endpoints_from_saved(FLOWS, "api.example.com")
+        for e in eps:
+            self.assertIsNone(e["first_seen"])
+
     def test_endpoints_live_ws_carries_messages(self):
         messages = [{"from_client": True, "timestamp": 1.0,
                      "text": "hello"}]

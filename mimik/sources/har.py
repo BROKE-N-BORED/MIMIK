@@ -11,6 +11,7 @@ import base64
 import binascii
 import hashlib
 import json
+from datetime import datetime
 from urllib.parse import urlencode, urlparse
 
 from . import mitm
@@ -113,6 +114,15 @@ def _entry_to_flow(prefix, index, entry, bodies=True):
             "status_code": resp.get("status", 0),
         },
     }
+    # v0.6 T14: HAR entries carry their own time — keep it, so a
+    # HAR import scrubs on real times instead of the save time.
+    started = entry.get("startedDateTime")
+    if isinstance(started, str):
+        try:
+            flow["request"]["timestamp_start"] = datetime.fromisoformat(
+                started.replace("Z", "+00:00")).timestamp()
+        except ValueError:
+            pass
     if bodies:
         _embed(flow, "request", _body_bytes(req.get("postData")))
         _embed(flow, "response", _content_bytes(resp.get("content")))

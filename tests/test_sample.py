@@ -43,6 +43,16 @@ class SampleTests(unittest.TestCase):
         self.assertEqual(sample.sample_flows()[0]["request"]["path"],
                          "/api/auth/login")
 
+    def test_sample_flows_have_spread_timestamps(self):
+        # v0.6 T14: the sample flows are spread 10 s apart, so the
+        # sample capture has a real timeline to scrub.
+        flows = sample.sample_flows()
+        ts = [f["request"]["timestamp_start"] for f in flows]
+        self.assertEqual(len(ts), 6)
+        self.assertEqual(ts, sorted(ts))
+        self.assertEqual(len(set(ts)), 6)
+        self.assertAlmostEqual(ts[-1] - ts[0], 50.0, places=0)
+
     def test_load_sample_saves_flows_assets_preset(self):
         result = sample.load_sample(base=self.tmp)
         self.assertEqual(result,

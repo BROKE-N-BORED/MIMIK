@@ -93,7 +93,11 @@ def verify(out_path):
             want = 0o100755 if os.path.basename(info.filename) in EXECUTABLES else 0o100644
             assert mode == want, f"{info.filename}: mode {oct(mode)}, want {oct(want)}"
     tmp = tempfile.mkdtemp()
-    subprocess.run(["unzip", "-q", out_path, "-d", tmp], check=True)
+    # stdin DEVNULL: unzip asks "Continue? (y/n/^C)" on a write error
+    # (e.g. /tmp full) and hangs forever waiting for an answer. With
+    # stdin closed it fails fast instead of hanging the build.
+    subprocess.run(["unzip", "-q", out_path, "-d", tmp], check=True,
+                   stdin=subprocess.DEVNULL)
     for name in ("install.sh", "uninstall.sh", "Install MIMIK.desktop"):
         p = os.path.join(tmp, PREFIX, name)
         assert os.access(p, os.X_OK), f"{name} lost its exec bit on extract"
