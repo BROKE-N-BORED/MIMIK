@@ -108,7 +108,13 @@ TOPICS = [
      "Load sample capture loads a demo capture so you can try the "
      "whole flow with no recording. Ghidra setup steps shows how "
      "to install Ghidra.\n\n"
-     "Check for updates asks GitHub whether a newer MIMIK is out."),
+     "Check for updates asks GitHub whether a newer MIMIK is out. "
+     "MIMIK also checks quietly when it starts: up to date means "
+     "nothing happens, and a newer release asks before anything is "
+     "downloaded. The download is checked against the release's "
+     "checksum, and the restart that completes the update is asked "
+     "about too. Help menu \"Check for updates on startup\" turns "
+     "the launch check off."),
     ("presets",
      "Presets tab",
      "Presets are what MIMIK has learned about a host: its URL "

@@ -38,7 +38,11 @@ if [ ! -x "$VENV/bin/python" ]; then
 fi
 
 echo "Installing packages (requests, PySide6, mitmproxy)…"
-"$VENV/bin/pip" install --quiet --upgrade pip
+# pip's self-upgrade is best-effort, never fatal: a dropped network at
+# this step (e.g. during a self-update) must not fail an install whose
+# packages are already satisfied. The FATAL verification below still
+# guards the real requirement (mimik, PySide6, mitmproxy present).
+"$VENV/bin/pip" install --quiet --upgrade pip || echo "WARNING: could not upgrade pip — continuing with the installed pip."
 "$VENV/bin/pip" install --quiet "$DIR"
 
 ln -sf "$VENV/bin/mimik" "$BIN/mimik"

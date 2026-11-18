@@ -13,7 +13,7 @@ import threading
 import time
 
 from PySide6.QtCore import (
-    QAbstractAnimation, QEasingCurve, QPropertyAnimation, QRect,
+    QAbstractAnimation, QEasingCurve, QProcess, QPropertyAnimation, QRect,
     QSettings, QSize, Qt, QThread, QTimer, QUrl, Signal,
 )
 from PySide6.QtGui import (
@@ -23,7 +23,7 @@ from PySide6.QtGui import (
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDialog, QFileDialog, QFrame,
     QGridLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit, QListWidget,
-    QListWidgetItem, QMainWindow, QMessageBox, QPushButton, QScrollArea,
+    QListWidgetItem, QMainWindow, QMessageBox, QProgressDialog, QPushButton, QScrollArea,
     QSlider, QSpinBox, QSystemTrayIcon, QTabWidget, QTableWidget, QTableWidgetItem,
     QTextEdit, QToolButton, QTreeWidget, QTreeWidgetItem, QVBoxLayout,
     QWidget,
@@ -907,6 +907,23 @@ class MainWindow(QMainWindow):
         # v0.6 T10: the polish-availability probe thread (its own
         # thread, not the single _run_task slot).
         self._polish_task = None
+        # v0.7: the update check/download thread (its own thread, not
+        # the single _run_task slot, like the polish probe).
+        self._update_task = None
+        self._update_phase = None  # "check" or "download"
+        self._update_silent = False  # the launch check says nothing
+        self._update_result = None  # the last check's result, while
+        # its dialog or download is up
+        self._update_progress = None  # the download progress dialog
+        self._update_check_ran = False  # the launch check runs once
+        self._restart_script = None  # set when the user says yes to
+        # restarting for an update; launched from closeEvent once the
+        # close is definitely going ahead
+        # v0.7: a note main() leaves for the window (a staged update
+        # that did not verify, or a failed install) — shown once,
+        # after the window is up.
+        self._startup_update_note = None
+        self._startup_update_failed = False
         self._task_disable = []
         self._pending_host = None
         self._loaded = set()
@@ -1187,6 +1204,24 @@ class MainWindow(QMainWindow):
             # the window.
             self._polish_task.wait(5000)
             self._polish_task = None
+        if self._update_task is not None:
+            # v0.7: an update check or download is running — cancel it
+            # and wait briefly; a blocking download defers the close
+            # until it ends (_update_task_finished closes then). The
+            # cancel flag also suppresses the update dialog, so a
+            # check that finished mid-close never pops up over a
+            # window the user is closing.
+            self._update_task.request_cancel()
+            task = self._update_task
+            if task is not None and not task.wait(2000):
+                self._close_pending = True
+                event.ignore()
+                return
+            QApplication.instance().processEvents()
+            if self._update_task is not None:
+                self._close_pending = True
+                event.ignore()
+                return
         worker = self.worker
         if worker is not None and worker.isRunning():
             if not self._confirm_stop_recording():
@@ -1198,6 +1233,14 @@ class MainWindow(QMainWindow):
         _settings().setValue("geometry", self.saveGeometry())
         if self.tray_icon is not None:
             self.tray_icon.hide()
+        if self._restart_script is not None:
+            # v0.7: the user said yes to restarting for an update, and
+            # the close is going ahead — launch the updater now. It
+            # waits for this process to exit, installs the staged zip,
+            # and relaunches MIMIK.
+            script = self._restart_script
+            self._restart_script = None
+            QProcess.startDetached(script)
         event.accept()
 
     def _restore_geometry(self):
@@ -1468,6 +1511,15 @@ class MainWindow(QMainWindow):
         update_act.triggered.connect(self._check_for_updates)
         help_menu.addAction(update_act)
         self._update_action = update_act
+        # v0.7: the silent launch check, on by default. Untick to stop
+        # MIMIK checking on startup; the manual check still works.
+        startup_act = QAction("Check for updates on startup", self)
+        startup_act.setCheckable(True)
+        startup_act.setChecked(
+            _settings().value("update/check_on_startup", True, type=bool))
+        startup_act.triggered.connect(self._toggle_startup_update_check)
+        help_menu.addAction(startup_act)
+        self._startup_update_action = startup_act
 
     def _menu_toggle_theme(self):
         """View menu theme toggle — the action's checked state is the theme."""
@@ -5562,38 +5614,265 @@ class MainWindow(QMainWindow):
         self._update_status_bar()
         return result
 
+    # ---- updates (v0.7) -------------------------------------------------
+    # The launch check is silent (current = nothing, failure = a
+    # status-bar line); the manual check reports both ways. A newer
+    # release is always asked about, never pulled unasked; the pull
+    # is verified against the release's checksum before anything is
+    # staged, and the restart that completes it is asked about too.
+
+    def _startup_update_check_enabled(self):
+        """Whether the silent launch check is on (default True)."""
+        return _settings().value("update/check_on_startup", True,
+                                 type=bool)
+
+    def _toggle_startup_update_check(self):
+        """Help menu toggle: the action's checked state is the
+        setting."""
+        action = self.sender()
+        checked = action.isChecked() if action is not None else True
+        _settings().setValue("update/check_on_startup", checked)
+
+    def _maybe_startup_update_check(self):
+        """The launch-time update step, deferred until the window is
+        up (called from main()). A note main() left, a staged update
+        that did not verify or a failed install, shows once first;
+        then the silent check runs, once per launch, when enabled."""
+        if self._update_check_ran:
+            return
+        self._update_check_ran = True
+        if self._startup_update_note:
+            note = self._startup_update_note
+            failed = self._startup_update_failed
+            self._startup_update_note = None
+            self._startup_update_failed = False
+            if failed:
+                QMessageBox.information(self, "MIMIK", note)
+            else:
+                self.statusBar().showMessage(note, 10000)
+        if self._startup_update_check_enabled():
+            self._start_update_check(silent=True)
+
     def _check_for_updates(self):
-        """Manual update check (item 31) — one GitHub API call, off
-        the UI thread. Nothing here runs on startup or on a timer."""
-        def work(worker):
+        """Manual update check (Help menu, Doctor tab): one GitHub
+        API call, off the UI thread, reporting both ways."""
+        self._start_update_check(silent=False)
+
+    def _start_update_check(self, silent):
+        """Run one update check off the UI thread, on the update
+        worker slot (not the single _run_task slot). Returns False
+        when a check or download is already running: refused plainly
+        for a manual check, silently for the launch check."""
+        if self._update_task is not None:
+            if not silent:
+                QMessageBox.information(
+                    self, "MIMIK", "Already checking for updates.")
+            return False
+
+        def work(_worker):
             return update.check_for_update()
 
-        def done(ok, result):
-            if not ok:
+        self._update_silent = silent
+        self._update_phase = "check"
+        worker = TaskWorker(work)
+        self._update_task = worker
+        worker.result.connect(self._update_task_finished)
+        worker.start()
+        return True
+
+    def _update_task_finished(self, ok, value):
+        """An update check or download answered. Joins the thread,
+        closes the progress dialog, and, unless the close was
+        deferred or the work was cancelled, hands the result to the
+        phase handler."""
+        worker = self._update_task
+        self._update_task = None
+        if worker is not None:
+            worker.wait()
+        if self._update_progress is not None:
+            try:
+                self._update_progress.close()
+            except RuntimeError:
+                pass  # the dialog went away with its parent
+            self._update_progress = None
+        cancelled = worker is not None and worker.cancelled
+        if self._close_pending:
+            # The close was deferred until this work ended: close now
+            # instead of showing any update dialog.
+            self._close_pending = False
+            self.close()
+            return
+        if cancelled:
+            return
+        if self._update_phase == "download":
+            self._download_finished(ok, value)
+        else:
+            self._check_finished(ok, value)
+
+    def _check_finished(self, ok, result):
+        """A check answered. Silent (launch) checks say nothing when
+        current, and only a status-bar line when they fail; manual
+        checks report both ways. A newer release is offered."""
+        if not ok:
+            if self._update_silent:
+                self.statusBar().showMessage(
+                    "could not check for updates.", 10000)
+            else:
                 QMessageBox.warning(
                     self, "MIMIK",
                     f"could not check for updates: {result}")
-                return
-            if result["error"]:
+            return
+        if result["error"]:
+            if self._update_silent:
+                self.statusBar().showMessage(
+                    "could not check for updates.", 10000)
+            else:
                 QMessageBox.warning(
                     self, "MIMIK",
                     f"could not check for updates: {result['error']}")
-                return
-            if not result["update_available"]:
+            return
+        if not result["update_available"]:
+            if not self._update_silent:
                 QMessageBox.information(
                     self, "MIMIK",
                     f"MIMIK {result['current']} is the latest version.")
-                return
+            return
+        self._update_result = result
+        self._offer_update(result)
+
+    def _offer_update(self, result):
+        """A newer release is out: ask. Installed runs get "Update
+        now"; a copy run from a source tree gets the releases page,
+        as before (there is no installed copy to update)."""
+        if update.is_installed():
             answer = QMessageBox.question(
                 self, "MIMIK",
                 f"MIMIK {result['latest']} is available "
                 f"(you have {result['current']}).\n\n"
-                f"Open the releases page in your browser?",
+                "Download and install it now? The download is checked "
+                "against the release's checksum before anything is "
+                "installed.",
                 QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes)
             if answer == QMessageBox.Yes:
-                QDesktopServices.openUrl(QUrl(result["url"]))
+                self._start_update_download(result)
+            return
+        answer = QMessageBox.question(
+            self, "MIMIK",
+            f"MIMIK {result['latest']} is available "
+            f"(you have {result['current']}).\n\n"
+            "Open the releases page in your browser?",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes)
+        if answer == QMessageBox.Yes:
+            QDesktopServices.openUrl(QUrl(result["url"]))
 
-        self._run_task("checking for updates…", work, done)
+    def _start_update_download(self, result):
+        """Pull the release zip on the update worker, with a progress
+        dialog. The download is verified before anything is staged
+        (see update.download_update)."""
+        self._update_phase = "download"
+        self._update_result = result
+        dest = update.pending_dir()
+
+        def work(worker):
+            def progress(done, total):
+                if total:
+                    worker.progress.emit(str(int(done * 100 / total)))
+                else:
+                    worker.progress.emit("-1")
+            return update.download_update(
+                result["zip_url"], result["sha_url"], dest,
+                progress=progress)
+
+        dialog = QProgressDialog(
+            f"Downloading MIMIK {result['latest']}…", "Cancel",
+            0, 100, self)
+        dialog.setCancelButton(None)
+        dialog.setWindowModality(Qt.WindowModal)
+        dialog.setMinimumDuration(0)
+        dialog.setAutoClose(False)
+        dialog.setAutoReset(False)
+        dialog.setWindowFlags(dialog.windowFlags()
+                              & ~Qt.WindowCloseButtonHint)
+        self._update_progress = dialog
+        worker = TaskWorker(work)
+        self._update_task = worker
+        worker.progress.connect(self._update_download_progress)
+        worker.result.connect(self._update_task_finished)
+        worker.start()
+        dialog.show()
+
+    def _update_download_progress(self, text):
+        """A download progress tick: a percent, or -1 when the server
+        sent no length (the bar goes busy)."""
+        dialog = self._update_progress
+        if dialog is None:
+            return
+        try:
+            pct = int(text)
+        except ValueError:
+            return
+        if pct < 0:
+            dialog.setRange(0, 0)
+            return
+        if dialog.maximum() == 0:
+            dialog.setRange(0, 100)
+        dialog.setValue(pct)
+
+    def _download_finished(self, ok, result):
+        """A download answered. Success stages the update and asks
+        about the restart; failure says why in plain words."""
+        if not ok:
+            QMessageBox.warning(
+                self, "MIMIK",
+                f"the update download failed: {result}")
+            return
+        if not result["ok"]:
+            QMessageBox.warning(
+                self, "MIMIK",
+                f"the update was not installed: {result['error']}")
+            return
+        info = self._update_result or {}
+        latest = info.get("latest", "")
+        update.write_pending(latest, result["path"], result["sha256"])
+        self._update_result = None
+        answer = QMessageBox.question(
+            self, "MIMIK",
+            f"MIMIK {latest} is downloaded and checked.\n\n"
+            "Restart MIMIK now to complete the update?",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes)
+        if answer == QMessageBox.Yes:
+            self._restart_for_update(latest)
+        else:
+            self.statusBar().showMessage(
+                f"Update to {latest} is ready - it will install when "
+                "MIMIK restarts.", 10000)
+
+    def _restart_for_update(self, version):
+        """Write the updater script and close: closeEvent launches the
+        updater once the close is definitely going ahead. When the
+        close is refused (a recording the user would not stop), the
+        update stays staged for the next launch."""
+        marker = update.read_pending()
+        if marker is None:
+            return
+        zip_path = os.path.join(update.pending_dir(), marker["zip"])
+        try:
+            udir = update.updates_dir()
+            os.makedirs(udir, mode=0o700, exist_ok=True)
+            script = os.path.join(udir, "update.sh")
+            with open(script, "w") as f:
+                f.write(update.updater_script_text(
+                    os.getpid(), zip_path, version))
+            os.chmod(script, 0o700)
+        except OSError as e:
+            QMessageBox.warning(
+                self, "MIMIK", f"could not start the update: {e}")
+            return
+        self._restart_script = script
+        self.close()
+        if self.isVisible() and not self._close_pending:
+            # The close was refused: the update stays staged.
+            self._restart_script = None
 
     def _render_doctor_pending(self):
         """The setup check's names with a pending marker (v0.6 T4):
@@ -5713,6 +5992,19 @@ def _install_crash_handler():
 def main():
     _install_crash_handler()
     app = QApplication(sys.argv)
+    # v0.7: a staged update applies before anything else opens. The
+    # user already said yes to the update; only the restart was
+    # deferred, so there is no second ask. A failed install is
+    # reported once, after the window is up (see
+    # _maybe_startup_update_check).
+    failed = update.read_failed()
+    outcome = None
+    if failed is not None:
+        update.clear_pending()
+    else:
+        outcome = update.apply_pending()
+    if outcome == "apply":
+        sys.exit(0)
     # Single instance (v0.5 item 14, U27): a second launch asks the
     # running window to come forward and exits, instead of starting
     # a second copy.
@@ -5740,6 +6032,16 @@ def main():
     app.setWindowIcon(window_icon())
     app.setStyleSheet(effective_stylesheet())
     win = MainWindow()
+    if failed is not None:
+        win._startup_update_note = (
+            f"The update did not install: {failed}\n\n"
+            f"MIMIK is still on {__version__}. Checking for updates "
+            "again will offer it fresh.")
+        win._startup_update_failed = True
+    elif outcome == "cleared":
+        win._startup_update_note = (
+            "The staged update did not check out, so it was thrown "
+            "away. Checking for updates again will offer it fresh.")
     guard.start_server(win.bring_to_front)
     win.show()
     # After the first event-loop turn: warn if a previous capture left
@@ -5749,6 +6051,9 @@ def main():
     # Same deferral for the first-run setup (v0.6 T3): the sample
     # pre-loads silently and the checklist appears on the Record tab.
     QTimer.singleShot(0, win._maybe_first_run)
+    # And for the silent launch update check (v0.7): it runs once,
+    # off the UI thread, and says nothing when current.
+    QTimer.singleShot(0, win._maybe_startup_update_check)
     sys.exit(app.exec())
 
 

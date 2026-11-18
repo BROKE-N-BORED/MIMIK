@@ -1,5 +1,37 @@
 # MIMIK Changelog
 
+## v0.7 — 2026-11-17
+
+The auto-update build (standing order, all projects): MIMIK checks for
+updates on launch, asks before pulling one, verifies the download
+against the release's checksum, and asks again before restarting to
+complete it.
+
+- Silent launch check (U3): when MIMIK starts it quietly asks GitHub
+  whether a newer release is out. Up to date means nothing happens,
+  no popup, no noise. A failed check is a status-bar line, never a
+  modal on startup. Help menu "Check for updates on startup" turns
+  it off; the manual check still works either way.
+- Ask-first pull (U4): when a newer release is out, MIMIK asks. Only
+  on your tap does it download, with a progress dialog. A copy run
+  from a source tree still offers the releases page instead, as
+  before (there is no installed copy to update).
+- Verified download (U1): the download is checked against the
+  release's .sha256 sidecar before anything is staged. No sidecar,
+  a bad checksum, or a failed fetch means the update is refused in
+  plain words and nothing is installed, never a blind download.
+- Ask-first restart (U5): once the update is downloaded and checked,
+  MIMIK asks whether to restart now to complete it. Yes restarts on
+  its own with the update applied. No leaves the update staged, and
+  it installs on the next launch. A failed install is reported once,
+  in plain words, on the next launch.
+- The release zip now ships with a .sha256 sidecar (U6), written by
+  the zip builder every time.
+- install.sh: pip's self-upgrade is best-effort, never fatal (U2),
+  so a dropped network during a self-update cannot fail an install
+  whose packages are already satisfied. The package verification
+  after it still guards the real requirement.
+
 ## v0.6 — 2026-11-16
 
 The UI audit build: every finding from the audit against the BNB UI

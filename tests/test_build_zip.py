@@ -86,6 +86,37 @@ class ZipModeTests(unittest.TestCase):
                              f"{rel} is unexpectedly executable: {oct(mode)}")
 
 
+class SidecarTests(unittest.TestCase):
+    """v0.7: the builder emits a .sha256 sidecar next to the zip —
+    the auto-updater refuses a release with no sidecar."""
+
+    def test_build_writes_matching_sidecar(self):
+        import hashlib
+
+        tmp = tempfile.mkdtemp()
+        try:
+            out = os.path.join(tmp, "mimik-v0.7.zip")
+            r = subprocess.run([sys.executable, BUILD_ZIP, out],
+                               capture_output=True, text=True, timeout=300,
+                               stdin=subprocess.DEVNULL)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            sidecar = out + ".sha256"
+            self.assertTrue(os.path.isfile(sidecar), "no sidecar written")
+            digest = hashlib.sha256()
+            with open(out, "rb") as f:
+                while True:
+                    chunk = f.read(65536)
+                    if not chunk:
+                        break
+                    digest.update(chunk)
+            with open(sidecar) as f:
+                content = f.read()
+            self.assertEqual(
+                content, f"{digest.hexdigest()}  mimik-v0.7.zip\n")
+        finally:
+            shutil.rmtree(tmp, True)
+
+
 class LicenseTests(unittest.TestCase):
     """v0.4 item 4: a LICENSE file with the MIT text, in the repo and
     in the release zip. LICENSE-NOTICE stays the attribution record."""

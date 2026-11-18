@@ -179,6 +179,10 @@ class GuiTests(unittest.TestCase):
         from mimik.gui import _settings
         _settings().remove("record")
         _settings().remove("access")
+        # v0.7: the startup update-check toggle lives in the real
+        # QSettings too — drop it so one test's toggle never leaks
+        # into the next test's fresh window.
+        _settings().remove("update")
         self.app.processEvents()
         gc.collect()
 
@@ -2015,7 +2019,7 @@ class GuiTests(unittest.TestCase):
                                    "openUrl") as opener:
                 win._check_for_updates()
                 self.assertTrue(_wait_for(
-                    self.app, lambda: win._task is None))
+                    self.app, lambda: win._update_task is None))
                 q.assert_called_once()
                 self.assertIn("0.4.0", q.call_args[0][2])
                 opener.assert_called_once()
@@ -2042,7 +2046,7 @@ class GuiTests(unittest.TestCase):
                                    "information") as info:
                 win._check_for_updates()
                 self.assertTrue(_wait_for(
-                    self.app, lambda: win._task is None))
+                    self.app, lambda: win._update_task is None))
                 info.assert_called_once()
                 self.assertIn("latest version", info.call_args[0][2])
         finally:
@@ -2065,9 +2069,320 @@ class GuiTests(unittest.TestCase):
                  mock.patch.object(QMessageBox, "warning") as warn:
                 win._check_for_updates()
                 self.assertTrue(_wait_for(
-                    self.app, lambda: win._task is None))
+                    self.app, lambda: win._update_task is None))
                 warn.assert_called_once()
                 self.assertIn("no route to host", warn.call_args[0][2])
+        finally:
+            win.close()
+
+    def test_startup_check_toggle_in_help_menu(self):
+        """v0.7: Help has a checkable "Check for updates on startup",
+        on by default; toggling it writes the setting."""
+        from mimik.gui import MainWindow, _settings
+
+        win = MainWindow()
+        try:
+            help_menu = [a.menu() for a in win.menuBar().actions()
+                         if a.text() == "Help"][0]
+            items = [a.text() for a in help_menu.actions()]
+            self.assertIn("Check for updates on startup", items)
+            action = win._startup_update_action
+            self.assertTrue(action.isCheckable())
+            self.assertTrue(action.isChecked())
+            self.assertTrue(win._startup_update_check_enabled())
+            action.trigger()
+            self.assertFalse(action.isChecked())
+            self.assertFalse(_settings().value(
+                "update/check_on_startup", True, type=bool))
+            self.assertFalse(win._startup_update_check_enabled())
+            action.trigger()
+            self.assertTrue(_settings().value(
+                "update/check_on_startup", True, type=bool))
+        finally:
+            win.close()
+
+    def test_startup_check_silent_when_current(self):
+        """v0.7: the launch check says nothing when current, and runs
+        only once per launch."""
+        from PySide6.QtWidgets import QMessageBox
+        from mimik import update
+        from mimik.gui import MainWindow
+
+        current = {"current": "0.6.0", "latest": "0.6.0",
+                   "update_available": False, "url": None, "error": None}
+        win = MainWindow()
+        win.show()
+        try:
+            with mock.patch.object(update, "check_for_update",
+                                   return_value=current) as check, \
+                 mock.patch.object(QMessageBox,
+                                   "information") as info, \
+                 mock.patch.object(QMessageBox, "warning") as warn:
+                win._maybe_startup_update_check()
+                self.assertTrue(_wait_for(
+                    self.app, lambda: win._update_task is None))
+                info.assert_not_called()
+                warn.assert_not_called()
+                self.assertTrue(win._update_check_ran)
+                win._maybe_startup_update_check()
+                self.assertEqual(check.call_count, 1)
+        finally:
+            win.close()
+
+    def test_startup_check_silent_when_failed(self):
+        """v0.7: a failed launch check is a status-bar line, never a
+        modal on startup."""
+        from PySide6.QtWidgets import QMessageBox
+        from mimik import update
+        from mimik.gui import MainWindow
+
+        error = {"current": "0.6.0", "latest": None,
+                 "update_available": False, "url": None,
+                 "error": "no route to host"}
+        win = MainWindow()
+        win.show()
+        try:
+            with mock.patch.object(update, "check_for_update",
+                                   return_value=error), \
+                 mock.patch.object(QMessageBox, "warning") as warn:
+                win._maybe_startup_update_check()
+                self.assertTrue(_wait_for(
+                    self.app, lambda: win._update_task is None))
+                warn.assert_not_called()
+                self.assertIn("could not check for updates",
+                              win.statusBar().currentMessage())
+        finally:
+            win.close()
+
+    def test_startup_check_disabled_runs_nothing(self):
+        """v0.7: with the startup check unticked, the launch step
+        makes no check at all."""
+        from mimik import update
+        from mimik.gui import MainWindow, _settings
+
+        _settings().setValue("update/check_on_startup", False)
+        win = MainWindow()
+        win.show()
+        try:
+            with mock.patch.object(update,
+                                   "check_for_update") as check:
+                win._maybe_startup_update_check()
+                self.app.processEvents()
+                check.assert_not_called()
+                self.assertIsNone(win._update_task)
+        finally:
+            win.close()
+
+    def test_second_check_while_running_refused(self):
+        """v0.7: a second check while one runs is refused plainly."""
+        import time
+
+        from PySide6.QtWidgets import QMessageBox
+        from mimik import update
+        from mimik.gui import MainWindow
+
+        def slow_check():
+            time.sleep(0.5)
+            return {"current": "0.6.0", "latest": "0.6.0",
+                    "update_available": False, "url": None,
+                    "error": None}
+
+        win = MainWindow()
+        win.show()
+        try:
+            with mock.patch.object(update, "check_for_update",
+                                   side_effect=slow_check), \
+                 mock.patch.object(QMessageBox,
+                                   "information") as info:
+                self.assertTrue(win._start_update_check(silent=False))
+                self.assertFalse(win._start_update_check(silent=False))
+                info.assert_called_once()
+                self.assertIn("Already checking",
+                              info.call_args[0][2])
+                self.assertTrue(_wait_for(
+                    self.app, lambda: win._update_task is None))
+        finally:
+            win.close()
+
+    def _newer_result(self):
+        return {"current": "0.6.0", "latest": "0.7.0",
+                "update_available": True,
+                "url": "https://github.com/x/releases/tag/v0.7",
+                "zip_url": "https://dl/mimik-v0.7.zip",
+                "zip_name": "mimik-v0.7.zip",
+                "sha_url": "https://dl/mimik-v0.7.zip.sha256",
+                "sha_name": "mimik-v0.7.zip.sha256",
+                "error": None}
+
+    def test_update_offer_downloads_and_restarts(self):
+        """v0.7: Yes to the offer downloads and verifies, Yes to the
+        restart prompt stages the update and launches the updater."""
+        import tempfile
+
+        from PySide6.QtCore import QProcess
+        from PySide6.QtWidgets import QMessageBox
+        from mimik import update
+        from mimik.gui import MainWindow
+
+        data_dir = tempfile.mkdtemp()
+        staged = os.path.join(update.pending_dir(base=data_dir),
+                              "mimik-v0.7.zip")
+        os.makedirs(update.pending_dir(base=data_dir), exist_ok=True)
+        with open(staged, "wb") as f:
+            f.write(b"zip bytes")
+        download = {"ok": True, "path": staged,
+                    "sha256": "ab" * 32, "size": 9}
+        win = MainWindow()
+        win.show()
+        try:
+            with mock.patch.dict(os.environ,
+                                 {"MIMIK_DATA_DIR": data_dir}), \
+                 mock.patch.object(update, "check_for_update",
+                                   return_value=self._newer_result()), \
+                 mock.patch.object(update, "is_installed",
+                                   return_value=True), \
+                 mock.patch.object(update, "download_update",
+                                   return_value=download) as dl, \
+                 mock.patch.object(QMessageBox, "question",
+                                   return_value=QMessageBox.Yes) as q, \
+                 mock.patch.object(QProcess,
+                                   "startDetached") as launch:
+                win._check_for_updates()
+                self.assertTrue(_wait_for(
+                    self.app, lambda: win._update_task is None))
+                dl.assert_called_once()
+                self.assertEqual(q.call_count, 2)
+                self.assertIn("Download and install",
+                              q.call_args_list[0][0][2])
+                self.assertIn("Restart MIMIK now",
+                              q.call_args_list[1][0][2])
+                marker = update.read_pending(base=data_dir)
+                self.assertEqual(marker["version"], "0.7.0")
+                self.assertEqual(marker["zip"], "mimik-v0.7.zip")
+                launch.assert_called_once()
+                script = launch.call_args[0][0]
+                self.assertTrue(script.endswith("update.sh"))
+                self.assertTrue(os.path.isfile(script))
+                self.assertFalse(win.isVisible())
+        finally:
+            win.close()
+
+    def test_update_offer_no_restart_leaves_staged(self):
+        """v0.7: No to the restart prompt leaves the update staged
+        for the next launch and does not relaunch."""
+        import tempfile
+
+        from PySide6.QtCore import QProcess
+        from PySide6.QtWidgets import QMessageBox
+        from mimik import update
+        from mimik.gui import MainWindow
+
+        data_dir = tempfile.mkdtemp()
+        staged = os.path.join(update.pending_dir(base=data_dir),
+                              "mimik-v0.7.zip")
+        os.makedirs(update.pending_dir(base=data_dir), exist_ok=True)
+        with open(staged, "wb") as f:
+            f.write(b"zip bytes")
+        download = {"ok": True, "path": staged,
+                    "sha256": "ab" * 32, "size": 9}
+        win = MainWindow()
+        win.show()
+        try:
+            with mock.patch.dict(os.environ,
+                                 {"MIMIK_DATA_DIR": data_dir}), \
+                 mock.patch.object(update, "check_for_update",
+                                   return_value=self._newer_result()), \
+                 mock.patch.object(update, "is_installed",
+                                   return_value=True), \
+                 mock.patch.object(update, "download_update",
+                                   return_value=download), \
+                 mock.patch.object(
+                     QMessageBox, "question",
+                     side_effect=[QMessageBox.Yes,
+                                  QMessageBox.No]) as q, \
+                 mock.patch.object(QProcess,
+                                   "startDetached") as launch:
+                win._check_for_updates()
+                self.assertTrue(_wait_for(
+                    self.app, lambda: win._update_task is None))
+                self.assertEqual(q.call_count, 2)
+                marker = update.read_pending(base=data_dir)
+                self.assertEqual(marker["version"], "0.7.0")
+                launch.assert_not_called()
+                self.assertTrue(win.isVisible())
+                self.assertIn("will install when MIMIK restarts",
+                              win.statusBar().currentMessage())
+        finally:
+            win.close()
+
+    def test_download_failure_warns_and_stages_nothing(self):
+        """v0.7: a refused download (no sidecar, bad checksum, or a
+        failed fetch) warns in plain words and stages nothing."""
+        import tempfile
+
+        from PySide6.QtWidgets import QMessageBox
+        from mimik import update
+        from mimik.gui import MainWindow
+
+        data_dir = tempfile.mkdtemp()
+        download = {"ok": False, "error":
+                    "the release has no checksum file, so MIMIK will "
+                    "not install it blind"}
+        win = MainWindow()
+        win.show()
+        try:
+            with mock.patch.dict(os.environ,
+                                 {"MIMIK_DATA_DIR": data_dir}), \
+                 mock.patch.object(update, "check_for_update",
+                                   return_value=self._newer_result()), \
+                 mock.patch.object(update, "is_installed",
+                                   return_value=True), \
+                 mock.patch.object(update, "download_update",
+                                   return_value=download), \
+                 mock.patch.object(QMessageBox, "question",
+                                   return_value=QMessageBox.Yes) as q, \
+                 mock.patch.object(QMessageBox, "warning") as warn:
+                win._check_for_updates()
+                self.assertTrue(_wait_for(
+                    self.app, lambda: win._update_task is None))
+                self.assertEqual(q.call_count, 1)
+                warn.assert_called_once()
+                self.assertIn("no checksum file", warn.call_args[0][2])
+                self.assertIsNone(update.read_pending(base=data_dir))
+        finally:
+            win.close()
+
+    def test_startup_update_note_shown_once(self):
+        """v0.7: a note main() left (a failed install) shows once as
+        a dialog; a plain note shows once in the status bar."""
+        from PySide6.QtWidgets import QMessageBox
+        from mimik.gui import MainWindow, _settings
+
+        _settings().setValue("update/check_on_startup", False)
+        win = MainWindow()
+        win.show()
+        try:
+            win._startup_update_note = "The update did not install: x"
+            win._startup_update_failed = True
+            with mock.patch.object(QMessageBox,
+                                   "information") as info:
+                win._maybe_startup_update_check()
+                info.assert_called_once()
+                self.assertIn("did not install", info.call_args[0][2])
+                self.assertIsNone(win._startup_update_note)
+        finally:
+            win.close()
+        _settings().setValue("update/check_on_startup", False)
+        win = MainWindow()
+        win.show()
+        try:
+            win._startup_update_note = "The staged update was thrown away."
+            with mock.patch.object(QMessageBox,
+                                   "information") as info:
+                win._maybe_startup_update_check()
+                info.assert_not_called()
+                self.assertIn("thrown away",
+                              win.statusBar().currentMessage())
         finally:
             win.close()
 

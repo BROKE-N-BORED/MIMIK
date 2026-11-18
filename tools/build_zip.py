@@ -9,6 +9,7 @@ external_attr carries the full regular-file type bits — 0o100755 for
 scripts/launchers, 0o100644 for plain files. Bare 0o755 is NOT enough.
 This script sets them explicitly and verifies the result.
 """
+import hashlib
 import os
 import re
 import sys
@@ -112,3 +113,16 @@ if __name__ == "__main__":
     size = os.path.getsize(out)
     print(f"built {out} ({size} bytes, {len(paths)} files)")
     print(f"modes verified, test-extracted to {tmp}")
+    # The checksum sidecar (v0.7): the auto-updater refuses a release
+    # with no sidecar, so every zip ships with one. sha256sum format.
+    digest = hashlib.sha256()
+    with open(out, "rb") as f:
+        while True:
+            chunk = f.read(65536)
+            if not chunk:
+                break
+            digest.update(chunk)
+    sidecar = out + ".sha256"
+    with open(sidecar, "w") as f:
+        f.write(f"{digest.hexdigest()}  {os.path.basename(out)}\n")
+    print(f"sidecar {sidecar}")
