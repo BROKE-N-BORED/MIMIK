@@ -9,6 +9,14 @@
     mimik learn <host>                show the endpoints MIMIK saw for a host
     mimik gen <host>                  generate a Python client for a host
     mimik clients                     list generated clients + saved captures
+    mimik diff <host> <a> <b>         compare two captures of a host
+    mimik import <file.har>           import a HAR file into the store
+    mimik prune [--days N]            delete old captures (asks first)
+    mimik delete <host>               delete a host's captures + client
+    mimik sample                      load the built-in demo capture
+    mimik update-check                check GitHub for a newer release
+    mimik exclude [list|add|remove]   manage the capture exclusion list
+    mimik encrypt [on|off|status]     encrypt saved captures (passphrase)
     mimik assets [host]               list captured assets (images, models, ...)
     mimik build-pack <host>           build a Reblend asset pack for a host
     mimik presets                     list learned presets
@@ -16,6 +24,8 @@
     mimik presets show <name>         show a preset in plain language
     mimik presets match <host>        which pattern presets would apply
     mimik presets delete <name>       delete a preset
+    mimik presets export/import       move a preset as a zip file
+    mimik pack [list|export|import]   manage built Reblend packs
     mimik doctor                      check your setup
     mimik ghidra-setup                steps to install Ghidra (binary analysis)
     mimik analyze <file>              analyze a binary (headers, strings, ...)
@@ -35,7 +45,7 @@ import shutil
 import subprocess
 import sys
 
-from . import assets, binary, codegen, diff, doctor, export, filters, ghidra, launch, presets, reblend_bridge, sample, screenshot, store, unpin, update, wine
+from . import assets, binary, codegen, crypto, diff, doctor, export, filters, ghidra, launch, presets, reblend_bridge, sample, screenshot, store, unpin, update, wine
 from . import __version__
 from .flows import fetch_flows
 from .recorder import ProxySession
@@ -503,6 +513,122 @@ def cmd_binary_unlink(args):
 
 # ---- hosts / learn / gen / clients -------------------------------------------
 
+# ---- capture encryption (v0.8 G1) -------------------------------------
+
+# Commands that read or write the capture store. When encryption is
+# on, main() asks for the passphrase once before dispatching these;
+# commands that never touch captures (doctor, analyze, encrypt
+# itself, update-check, …) are never interrupted.
+_STORE_CMDS = {"record", "hosts", "learn", "gen", "clients", "prune",
+               "delete", "import", "assets", "build-pack", "presets",
+               "pack", "diff", "sample"}
+
+
+def _prompt_unlock():
+    """Ask for the store passphrase once (terminal echo off).
+    Returns True when the store is now unlocked."""
+    import getpass
+    try:
+        pw = getpass.getpass("MIMIK captures are encrypted. "
+                             "Passphrase: ")
+    except (EOFError, KeyboardInterrupt):
+        return False
+    return store.unlock(pw)
+
+
+def _maybe_unlock(args):
+    """(v0.8 G1) Unlock the capture store before a store command
+    runs. A wrong passphrase stops the command in plain words —
+    locked captures are never mistaken for "no captures"."""
+    if getattr(args, "cmd", None) not in _STORE_CMDS:
+        return
+    if getattr(args, "har", None) or getattr(args, "curl", None):
+        return  # reading a file the user handed over, not the store
+    if not store.encryption_enabled() or store.unlocked():
+        return
+    try:
+        ok = _prompt_unlock()
+    except crypto.CryptoError as e:
+        raise SystemExit(str(e))
+    if not ok:
+        raise SystemExit(
+            "that passphrase did not unlock the captures: "
+            "nothing was run.")
+
+
+def cmd_encrypt_status(args):
+    if not store.encryption_enabled():
+        print("capture encryption: off. Captures are plain JSON on "
+              "disk (each file mode 0600, in a 0700 folder).")
+        print("Turn it on with: mimik encrypt on")
+        return
+    state = ("unlocked for this session" if store.unlocked()
+             else "locked: the passphrase is asked when a command "
+                  "needs the captures")
+    print(f"capture encryption: ON, {state}.")
+    if not crypto.available():
+        print("warning: the cryptography / argon2-cffi packages are "
+              "missing, so the captures cannot be opened until "
+              "MIMIK is reinstalled.")
+
+
+def cmd_encrypt_on(args):
+    if store.encryption_enabled():
+        print("capture encryption is already on.")
+        return
+    import getpass
+    pw1 = getpass.getpass("New passphrase for your captures: ")
+    if not pw1:
+        raise SystemExit("empty passphrase: encryption not "
+                         "turned on.")
+    pw2 = getpass.getpass("Type it again: ")
+    if pw1 != pw2:
+        raise SystemExit("the two passphrases did not match: "
+                         "encryption not turned on.")
+    try:
+        n = store.enable_encryption(pw1)
+    except crypto.CryptoError as e:
+        raise SystemExit(str(e))
+    print(f"Encryption on: {n} capture file(s) sealed.")
+    print("The passphrase is never stored. MIMIK asks for it each "
+          "time it starts.")
+    print("If you forget it, the encrypted captures cannot be "
+          "recovered, by design.")
+
+
+def cmd_encrypt_off(args):
+    if not store.encryption_enabled():
+        print("capture encryption is already off.")
+        return
+    if not store.unlocked():
+        try:
+            ok = _prompt_unlock()
+        except crypto.CryptoError as e:
+            raise SystemExit(str(e))
+        if not ok:
+            raise SystemExit(
+                "that passphrase did not unlock the captures: "
+                "encryption stays on.")
+    try:
+        n = store.disable_encryption()
+    except (crypto.CryptoError, store.StoreLockedError) as e:
+        raise SystemExit(str(e))
+    print(f"Encryption off: {n} capture file(s) are plain JSON on "
+          f"disk again.")
+
+
+def _warn_unreadable():
+    """(v0.8 B7) Name capture files that exist but could not be
+    parsed — they used to vanish silently from every listing."""
+    bad = store.unreadable_captures()
+    if bad:
+        names = ", ".join(name for name, _err in bad)
+        print(f"warning: skipped {len(bad)} unreadable capture "
+              f"file(s): {names}. The files are still on disk; "
+              f"the log (mimik doctor, View log) has the details.",
+              file=sys.stderr)
+
+
 def cmd_hosts(args):
     _m, flows, source = _flows_from_args(args)
     rows = mitm_mod.hosts(flows)
@@ -522,6 +648,7 @@ def cmd_hosts(args):
                 print(f"  note: {host}: {stats['flows']} flows saved, "
                       f"showing the newest {stats['kept']}")
     print("\nPick your API host (usually the one with JSON, not media/cdn).")
+    _warn_unreadable()
 
 
 def cmd_diff(args):
@@ -711,15 +838,20 @@ def _default_out(host):
 
 def _unique_out(host, directory):
     """A collision-free output filename in `directory`: the default
-    name, or _2/_3/... when it already exists."""
+    name, or _2/_3/... when it already exists.
+
+    v0.8 B2: the number goes BEFORE _client.py (api_foo_2_client.py),
+    never after — store.list_clients / delete_client only speak the
+    _client.py suffix, so the old api_foo_client_2.py form produced
+    clients the app itself could not list or delete."""
     name = _default_out(host)
     if not os.path.exists(os.path.join(directory, name)):
         return name
     stem = name[: -len("_client.py")]
     n = 2
-    while os.path.exists(os.path.join(directory, f"{stem}_client_{n}.py")):
+    while os.path.exists(os.path.join(directory, f"{stem}_{n}_client.py")):
         n += 1
-    return f"{stem}_client_{n}.py"
+    return f"{stem}_{n}_client.py"
 
 
 def _class_name(source):
@@ -740,8 +872,19 @@ def cmd_gen(args):
     out = args.out or _unique_out(args.host, os.getcwd())
     preset, applied, _pattern_ids, auth_label = presets.resolve_for_gen(
         args.host, flows=flows)
-    print(f"generating a client from {len(eps)} endpoints "
-          f"(polish: {args.polish})…", file=sys.stderr)
+    # v0.8 B6: count the way the generated file counts — concrete
+    # calls collapse into generalized endpoints (/users/123 and
+    # /users/456 are one method), so the message names both numbers
+    # instead of disagreeing with the file's own header.
+    shapes = codegen._generalize_endpoints(eps)
+    if len(shapes) != len(eps):
+        print(f"generating a client from {len(eps)} captured calls "
+              f"({len(shapes)} endpoint"
+              f"{'s' if len(shapes) != 1 else ''} after generalizing "
+              f"paths) (polish: {args.polish})…", file=sys.stderr)
+    else:
+        print(f"generating a client from {len(eps)} endpoints "
+              f"(polish: {args.polish})…", file=sys.stderr)
     if applied:
         print("presets applied: " + "; ".join(applied), file=sys.stderr)
     src = codegen.generate(args.host, eps, polish=args.polish,
@@ -754,12 +897,31 @@ def cmd_gen(args):
     with open(out, "w") as f:
         f.write(src)
     store.save_client_copy(os.path.basename(out), src)
-    cls = _class_name(src)
+    cls = _class_name(src) or "Client"
     print(f"\nwrote {out}")
-    print(f"\n    from {out[:-3] if out.endswith('.py') else out} "
-          f"import {cls or 'Client'}")
-    print(f"    acc = {cls or 'Client'}()")
-    print("    # then call the generated methods\n")
+    # v0.8 B2: the old snippet interpolated the whole --out PATH as
+    # a module name ("from /home/you/subdir/cli-out import …" —
+    # not valid Python for any path with a folder or a dash in it).
+    # Print an import that is actually true for where the file
+    # landed, or plain instructions when no import line can be.
+    module = os.path.basename(out)
+    if module.endswith(".py"):
+        module = module[:-3]
+    if module.isidentifier() and (
+            os.path.dirname(os.path.abspath(out)) == os.getcwd()):
+        print(f"\n    from {module} import {cls}")
+        print(f"    acc = {cls}()")
+        print("    # then call the generated methods\n")
+    elif module.isidentifier():
+        print(f"\n    copy {os.path.basename(out)} into your project "
+              f"folder, then:")
+        print(f"    from {module} import {cls}")
+        print(f"    acc = {cls}()\n")
+    else:
+        print(f"\n    rename the file to a plain Python name "
+              f"(letters, numbers, underscores, e.g. my_client.py), "
+              f"then import it:")
+        print(f"    from my_client import {cls}\n")
 
 
 def cmd_clients(args):
@@ -775,6 +937,7 @@ def cmd_clients(args):
         print("  (none yet, run `mimik record`)")
     for host, n, stamp in caps:
         print(f"  {host}: {n} requests, last saved {stamp}")
+    _warn_unreadable()
 
 
 # ---- assets / build-pack --------------------------------------------------------
@@ -1413,7 +1576,24 @@ def main(argv=None):
                     help="turn capture filtering off").set_defaults(
                         func=cmd_exclude_off)
 
+    ecp = sub.add_parser(
+        "encrypt",
+        help="capture encryption: seal saved captures with a "
+             "passphrase (Argon2id + AES-GCM)")
+    ecp.set_defaults(func=cmd_encrypt_status)
+    xsub = ecp.add_subparsers(dest="encrypt_cmd")
+    xsub.add_parser(
+        "on", help="turn capture encryption on").set_defaults(
+            func=cmd_encrypt_on)
+    xsub.add_parser(
+        "off", help="turn capture encryption off (unseal captures)"
+        ).set_defaults(func=cmd_encrypt_off)
+    xsub.add_parser(
+        "status", help="show capture encryption state").set_defaults(
+            func=cmd_encrypt_status)
+
     args = p.parse_args(argv)
+    _maybe_unlock(args)
     args.func(args)
 
 

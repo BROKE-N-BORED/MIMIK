@@ -22,14 +22,14 @@ from PySide6.QtGui import (
 )
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDialog, QFileDialog, QFrame,
-    QGridLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit, QListWidget,
+    QGridLayout, QGroupBox, QHBoxLayout, QHeaderView, QInputDialog, QLabel, QLineEdit, QListWidget,
     QListWidgetItem, QMainWindow, QMessageBox, QProgressDialog, QPushButton, QScrollArea,
     QSlider, QSpinBox, QSystemTrayIcon, QTabWidget, QTableWidget, QTableWidgetItem,
     QTextEdit, QToolButton, QTreeWidget, QTreeWidgetItem, QVBoxLayout,
     QWidget,
 )
 
-from . import assets, binary, codegen, diff, doctor, export, filters, ghidra, howto, launch, log, presets, reblend_bridge, replay, sample, screenshot, store, unpin, update, websocket, wine
+from . import assets, binary, codegen, crypto, diff, doctor, export, filters, ghidra, howto, launch, log, presets, reblend_bridge, replay, sample, screenshot, store, unpin, update, websocket, wine
 from . import __version__
 from .flows import fetch_flows
 from .recorder import ProxySession
@@ -296,11 +296,15 @@ Windows program capture (via WinLinx): MIMIK captures, WinLinx runs:
 # that pad. They replace the v0.5 target combo (Joshua's call,
 # 2026-11-13).
 PAD_TARGETS = [
-    ("android", "Android phone", "Your phone, over Wi-Fi"),
-    ("linux-app", "Linux app", "An app installed on this PC"),
-    ("file", "Program from file", "An AppImage, archive, ISO, or .deb"),
-    ("web", "Web app", "A website, via HAR or cURL (no proxy)"),
-    ("windows", "Windows program", "Already running in WinLinx"),
+    # v0.8 B5: every subtitle names what a tap DOES — the pads read
+    # as selectors, and nothing else on the tab said tapping starts
+    # a recording (the Web pad is the odd one out: it only shows the
+    # HAR/cURL steps, no proxy starts, and now it says so).
+    ("android", "Android phone", "Your phone, over Wi-Fi. Tap to start"),
+    ("linux-app", "Linux app", "An app installed on this PC. Tap to start"),
+    ("file", "Program from file", "AppImage, archive, ISO, or .deb. Tap to choose"),
+    ("web", "Web app", "Via HAR or cURL, no proxy. Tap to see how"),
+    ("windows", "Windows program", "Already running in WinLinx. Tap to start"),
 ]
 
 # First-run checklist (v0.6 T3, entry 020): four steps to the first
@@ -1015,6 +1019,29 @@ class MainWindow(QMainWindow):
         # one; a tiny always-on-top chip when it doesn't.
         self._setup_tray()
         self._update_tray()
+        self._apply_accessible_names()
+
+    def _apply_accessible_names(self):
+        """v0.8 G8: screen readers had almost nothing to work with
+        (zero accessible names in the whole window). Give every
+        button and checkbox its visible label, every line edit its
+        placeholder, and every tab page its tab title, wherever a
+        name was not set by hand."""
+        for btn in self.findChildren(QPushButton):
+            if not btn.accessibleName() and btn.text():
+                btn.setAccessibleName(btn.text().replace("&", ""))
+        for box in self.findChildren(QCheckBox):
+            if not box.accessibleName() and box.text():
+                box.setAccessibleName(box.text().replace("&", ""))
+        for edit in self.findChildren(QLineEdit):
+            if not edit.accessibleName() and edit.placeholderText():
+                edit.setAccessibleName(edit.placeholderText())
+        self.tabs.setAccessibleName("Main sections")
+        for i in range(self.tabs.count()):
+            page = self.tabs.widget(i)
+            if page is not None and not page.accessibleName():
+                page.setAccessibleName(
+                    self.tabs.tabText(i).replace("&", ""))
 
     def _setup_tray(self):
         """The out-of-window recording surface (v0.6 T2). One fact,
@@ -1149,8 +1176,18 @@ class MainWindow(QMainWindow):
             # popup — just the line.
             self.status_proxy.setText(self._done_text or "Proxy stopped")
             flows = "flow" if self._saved_flows == 1 else "flows"
-            self.status_flows.setText(
-                f"{self._saved_flows} saved {flows}")
+            text = f"{self._saved_flows} saved {flows}"
+            # v0.8 G1: while locked, captures read as zero — say
+            # "locked", never a fake empty store.
+            if store.encryption_enabled() and not store.unlocked():
+                text = "Captures locked: File › Unlock captures…"
+            # v0.8 B7: unreadable capture files are named in the
+            # status bar instead of vanishing silently.
+            bad = store.unreadable_captures()
+            if bad:
+                text += (f" · {len(bad)} unreadable capture "
+                         f"file{'s' if len(bad) != 1 else ''} skipped")
+            self.status_flows.setText(text)
             if self.live_strip is not None:
                 self.live_strip.setVisible(False)
         self._update_tray()
@@ -1405,6 +1442,19 @@ class MainWindow(QMainWindow):
         sample_act.triggered.connect(self._menu_load_sample)
         file_menu.addAction(sample_act)
         file_menu.addSeparator()
+        # Capture encryption (v0.8 G1): unlock for this session, or
+        # turn encryption on/off. Their labels/states follow the
+        # store (see _refresh_encryption_actions).
+        unlock_act = QAction("Unlock captures…", self)
+        unlock_act.triggered.connect(self._unlock_captures)
+        file_menu.addAction(unlock_act)
+        self._unlock_action = unlock_act
+        encrypt_act = QAction("Encrypt captures…", self)
+        encrypt_act.triggered.connect(self._encrypt_captures_toggle)
+        file_menu.addAction(encrypt_act)
+        self._encrypt_action = encrypt_act
+        self._refresh_encryption_actions()
+        file_menu.addSeparator()
         quit_act = QAction("Quit", self)
         quit_act.setShortcut("Ctrl+Q")
         quit_act.triggered.connect(self.close)
@@ -1587,6 +1637,113 @@ class MainWindow(QMainWindow):
         handler reports into the Doctor text, so the tab must show."""
         self.tabs.setCurrentIndex(self._TAB_KEYS.index("doctor"))
         self._load_sample_clicked()
+
+    # ---- capture encryption (v0.8 G1) --------------------------------
+
+    def _refresh_encryption_actions(self):
+        """File-menu encryption actions follow the store: Unlock
+        only while locked, and the toggle names what it will do."""
+        enabled = store.encryption_enabled()
+        unlocked = enabled and store.unlocked()
+        self._unlock_action.setVisible(enabled and not unlocked)
+        self._encrypt_action.setText(
+            "Turn off capture encryption…" if enabled
+            else "Encrypt captures…")
+
+    def _ask_passphrase(self, title, label):
+        """A password-echo dialog. Returns the text, or None when
+        cancelled. Never logged, never stored."""
+        text, ok = QInputDialog.getText(
+            self, title, label, QLineEdit.Password)
+        return text if ok else None
+
+    def _unlock_captures(self):
+        """File › Unlock captures…: ask once, and on success reload
+        everything that read the store while it was locked."""
+        pw = self._ask_passphrase(
+            "Unlock captures",
+            "Your captures are encrypted. Type the passphrase:")
+        if pw is None:
+            return
+        try:
+            ok = store.unlock(pw)
+        except crypto.CryptoError as e:
+            QMessageBox.warning(self, "MIMIK", str(e))
+            return
+        if not ok:
+            QMessageBox.warning(
+                self, "MIMIK",
+                "That passphrase did not unlock the captures.")
+            return
+        self._refresh_encryption_actions()
+        self._invalidate_flows()
+        self._loaded.discard("hosts")
+        self._loaded.discard("generate")
+        self._refresh_saved_flows()
+        self._update_status_bar()
+        self.statusBar().showMessage(
+            "Captures unlocked for this session.", 4000)
+
+    def _encrypt_captures_toggle(self):
+        """File › Encrypt captures… / Turn off capture encryption…"""
+        if not store.encryption_enabled():
+            pw1 = self._ask_passphrase(
+                "Encrypt captures",
+                "Choose a passphrase. MIMIK will ask for it every "
+                "time it starts, and it is never stored:")
+            if pw1 is None:
+                return
+            if not pw1:
+                QMessageBox.warning(
+                    self, "MIMIK",
+                    "An empty passphrase would not protect anything: "
+                    "encryption stayed off.")
+                return
+            pw2 = self._ask_passphrase(
+                "Encrypt captures", "Type the passphrase again:")
+            if pw2 is None:
+                return
+            if pw1 != pw2:
+                QMessageBox.warning(
+                    self, "MIMIK",
+                    "The two passphrases did not match: encryption "
+                    "stayed off.")
+                return
+            try:
+                n = store.enable_encryption(pw1)
+            except crypto.CryptoError as e:
+                QMessageBox.warning(self, "MIMIK", str(e))
+                return
+            self._refresh_encryption_actions()
+            self._update_status_bar()
+            QMessageBox.information(
+                self, "MIMIK",
+                f"Encryption is on: {n} capture file(s) sealed.\n\n"
+                "If you forget the passphrase, the encrypted "
+                "captures cannot be recovered, by design.")
+            return
+        # Turning off: needs the store unlocked first.
+        if not store.unlocked():
+            self._unlock_captures()
+            if not store.unlocked():
+                return
+        answer = QMessageBox.question(
+            self, "MIMIK",
+            "Turn capture encryption off?\n\n"
+            "Every capture goes back to plain JSON on disk (still "
+            "mode 0600, in a 0700 folder).",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if answer != QMessageBox.Yes:
+            return
+        try:
+            n = store.disable_encryption()
+        except (crypto.CryptoError, store.StoreLockedError) as e:
+            QMessageBox.warning(self, "MIMIK", str(e))
+            return
+        self._refresh_encryption_actions()
+        self._update_status_bar()
+        self.statusBar().showMessage(
+            f"Capture encryption off ({n} file(s) unsealed).", 4000)
 
     def set_theme(self, name):
         """Switch the theme now + persist it (item 9). The window's own
@@ -1857,6 +2014,12 @@ class MainWindow(QMainWindow):
         pads_label = QLabel("What do you want to capture?")
         pads_label.setObjectName("section")
         lay.addWidget(pads_label)
+        # v0.8 B5: the one line the tab was missing — the pads ARE
+        # the Start button (T16), so say it where the user looks.
+        self.pads_hint = _explain_label(
+            "Tap a card to start recording. Tap the recording card "
+            "again (or Stop below) to end it.")
+        lay.addWidget(self.pads_hint)
         grid = QGridLayout()
         self.pads = {}
         for i, (key, title, subtitle) in enumerate(PAD_TARGETS):
@@ -1964,6 +2127,10 @@ class MainWindow(QMainWindow):
 
         self.steps = QTextEdit()
         self.steps.setReadOnly(True)
+        # v0.8 B5: at the default 900x650 the steps box was squeezed
+        # until the instructions cut mid-step; a floor keeps the
+        # first steps readable (the tab scrolls for the rest).
+        self.steps.setMinimumHeight(140)
         lay.addWidget(self.steps, 1)
 
         self.host_list = QListWidget()
@@ -2501,6 +2668,13 @@ class MainWindow(QMainWindow):
         link_btn = QPushButton("Link binary…")
         link_btn.clicked.connect(self._link_binary_clicked)
         row.addWidget(link_btn)
+        # v0.8 B3: these three act on the selected host — disabled
+        # until a real host row is current (the Binary tab's pattern).
+        self.host_delete_btn = delete_btn
+        self.host_gen_btn = gen_btn
+        self.host_link_btn = link_btn
+        for b in (delete_btn, gen_btn, link_btn):
+            b.setEnabled(False)
         row.addStretch(1)
         lay.addLayout(row)
         self.hosts_list = QListWidget()
@@ -2637,6 +2811,7 @@ class MainWindow(QMainWindow):
                 self.hosts_list.addItem(_empty_item(
                     "No captures yet. Record an app, or import a HAR "
                     "on the Generate tab."))
+                self._update_host_action_buttons()
                 return
             for host, n, truncated, size in rows:
                 text = f"{n:>6}  {host}"
@@ -2649,6 +2824,11 @@ class MainWindow(QMainWindow):
                 item.setData(Qt.UserRole, host)
                 self.hosts_list.addItem(item)
             _restore_list(self.hosts_list, snap)
+            # v0.8 G9: a lone host selects itself — otherwise the tab
+            # sits on "Select a host…" with exactly one thing to pick.
+            if len(rows) == 1 and self.hosts_list.currentItem() is None:
+                self.hosts_list.setCurrentRow(0)
+            self._update_host_action_buttons()
 
         return self._run_task("loading hosts…", work, done)
 
@@ -2698,7 +2878,18 @@ class MainWindow(QMainWindow):
                 self.gen_host.setCurrentIndex(idx)
                 self._gen_jump_host = None
 
+    def _update_host_action_buttons(self):
+        """(v0.8 B3) Delete / Generate / Link act on the selected
+        host: enabled only while a real host row is current (the
+        empty-state placeholder carries no host data)."""
+        item = self.hosts_list.currentItem()
+        has = item is not None and bool(item.data(Qt.UserRole))
+        for b in (self.host_delete_btn, self.host_gen_btn,
+                  self.host_link_btn):
+            b.setEnabled(has)
+
     def _host_selected(self, current, _prev):
+        self._update_host_action_buttons()
         self.ep_table.setRowCount(0)
         if current is None:
             self._update_host_binary_link(None)
@@ -3329,6 +3520,8 @@ class MainWindow(QMainWindow):
         self.gen_preview.setWordWrap(True)
         lay.addWidget(self.gen_preview)
         self.gen_host.currentTextChanged.connect(self._update_gen_preview)
+        self.gen_host.currentTextChanged.connect(
+            self._update_gen_button)
 
         row = QHBoxLayout()
         har_btn = QPushButton("Import HAR…")
@@ -3362,6 +3555,8 @@ class MainWindow(QMainWindow):
         gen_btn.setObjectName("big")
         gen_btn.clicked.connect(self._generate)
         self.gen_btn = gen_btn
+        # v0.8 B3: nothing to generate until a host is picked/typed.
+        gen_btn.setEnabled(False)
         lay.addWidget(gen_btn)
 
         self.gen_log = QTextEdit()
@@ -3485,6 +3680,15 @@ class MainWindow(QMainWindow):
             self.polish_combo.addItem(engine["label"], engine["key"])
         idx = self.polish_combo.findData(current)
         self.polish_combo.setCurrentIndex(idx if idx >= 0 else 0)
+
+    def _update_gen_button(self, _text=None):
+        """(v0.8 B3) Generate needs a host: enabled only while the
+        host box names one (picked from the list or typed). The
+        "No hosts yet" state is a placeholder with an empty combo,
+        so the button stays disabled there."""
+        host = self.gen_host.currentText().strip()
+        has_hosts = self.gen_host.count() > 0
+        self.gen_btn.setEnabled(bool(host) and has_hosts)
 
     def _update_gen_preview(self, _text=None):
         """(v0.6 T7) What Generate will make for the picked host,
@@ -3726,12 +3930,22 @@ class MainWindow(QMainWindow):
         delete_group_btn = QPushButton("Delete group…")
         delete_group_btn.clicked.connect(self._delete_group)
         row.addWidget(delete_group_btn)
+        # v0.8 B3: stored + state-managed by _update_asset_buttons.
+        self.asset_delete_group_btn = delete_group_btn
+        delete_group_btn.setEnabled(False)
         hlay.addLayout(row)
 
         self.asset_table = QTableWidget(0, 5)
         self.asset_table.setHorizontalHeaderLabels(
             ["Name", "Kind", "Size", "Source", "Status"])
-        self.asset_table.horizontalHeader().setStretchLastSection(True)
+        # v0.8 B4: Source is the wide column (URLs/paths) — it takes
+        # the stretch, not Status; every cell gets a tooltip with its
+        # full text, so an elided cell is still readable.
+        self.asset_table.horizontalHeader().setStretchLastSection(False)
+        self.asset_table.horizontalHeader().setSectionResizeMode(
+            3, QHeaderView.Stretch)
+        self.asset_table.itemSelectionChanged.connect(
+            self._update_asset_buttons)
         self.asset_table.itemDoubleClicked.connect(self._preview_asset_item)
         _empty_table_row(self.asset_table,
                          "No assets yet. Capture an app or import a HAR.")
@@ -3758,6 +3972,11 @@ class MainWindow(QMainWindow):
         preview_btn.clicked.connect(self._preview_asset_button)
         reveal_btn = QPushButton("Reveal in folder")
         reveal_btn.clicked.connect(self._reveal_asset)
+        # v0.8 B3: both act on the selected asset row.
+        self.asset_preview_btn = preview_btn
+        self.asset_reveal_btn = reveal_btn
+        preview_btn.setEnabled(False)
+        reveal_btn.setEnabled(False)
         grid.addWidget(har_btn, 0, 0)
         grid.addWidget(scan_btn, 0, 1)
         grid.addWidget(preview_btn, 1, 0)
@@ -3806,6 +4025,8 @@ class MainWindow(QMainWindow):
         build_btn.setObjectName("big")
         build_btn.clicked.connect(self._build_pack)
         self.build_pack_btn = build_btn
+        # v0.8 B3: no capture group picked, nothing to build from.
+        build_btn.setEnabled(False)
         play.addWidget(build_btn)
         grid = QGridLayout()
         grid.setSpacing(8)
@@ -3819,6 +4040,11 @@ class MainWindow(QMainWindow):
         delete_pack_btn.clicked.connect(self._delete_pack)
         export_pack_btn = QPushButton("Export pack…")
         export_pack_btn.clicked.connect(self._export_pack)
+        # v0.8 B3: both act on the current group's built pack.
+        self.asset_delete_pack_btn = delete_pack_btn
+        self.asset_export_pack_btn = export_pack_btn
+        delete_pack_btn.setEnabled(False)
+        export_pack_btn.setEnabled(False)
         import_pack_btn = QPushButton("Import pack…")
         import_pack_btn.clicked.connect(self._import_pack)
         grid.addWidget(self.open_pack_btn, 0, 0)
@@ -3868,20 +4094,43 @@ class MainWindow(QMainWindow):
         self.asset_group.clear()
         for gdir, manifest in groups:
             n = len(manifest.get("assets", []))
-            label = (f"{manifest.get('group')}: "
-                     f"{manifest.get('captured_at', '')} ({n} assets)")
+            # v0.8 B4: short label — the full timestamp made every
+            # real entry overflow the combo ("demo.example.com:
+            # 2026-11-19T11:…"). The date rides in the tooltip.
+            label = (f"{manifest.get('group')} "
+                     f"({n} asset{'s' if n != 1 else ''})")
             self.asset_group.addItem(label, gdir)
+            if manifest.get("captured_at"):
+                self.asset_group.setItemData(
+                    self.asset_group.count() - 1,
+                    f"captured {manifest['captured_at']}",
+                    Qt.ToolTipRole)
         if not groups:
             # No data — a placeholder item (no UserRole data, so
             # _asset_group_selected treats it as "nothing selected").
-            self.asset_group.addItem(
-                "No captures yet. Record an app or import a HAR")
+            self.asset_group.addItem("No captures yet")
         self.asset_group.blockSignals(False)
         if current:
             idx = self.asset_group.findData(current)
             if idx >= 0:
                 self.asset_group.setCurrentIndex(idx)
         self._asset_group_selected()
+
+    def _update_asset_buttons(self):
+        """(v0.8 B3) Assets action states: Delete group / Build pack
+        need a capture group; Preview / Reveal need a selected asset
+        row; Delete / Export pack need a built pack for the group
+        (pack_dir, wired by _wire_pack_buttons)."""
+        has_group = bool(self.asset_group.currentData())
+        self.asset_delete_group_btn.setEnabled(has_group)
+        self.build_pack_btn.setEnabled(has_group)
+        has_asset = self._selected_asset() is not None
+        self.asset_preview_btn.setEnabled(has_asset)
+        self.asset_reveal_btn.setEnabled(has_asset)
+        has_pack = getattr(self, "pack_dir", None) is not None
+        if hasattr(self, "asset_delete_pack_btn"):
+            self.asset_delete_pack_btn.setEnabled(has_pack)
+            self.asset_export_pack_btn.setEnabled(has_pack)
 
     def _asset_group_selected(self, _idx=None):
         # v0.6 T5: refresh keeps your place — the asset's path is
@@ -3890,10 +4139,15 @@ class MainWindow(QMainWindow):
         snap = _snapshot_table(self.asset_table)
         self.asset_table.setRowCount(0)
         gdir = self.asset_group.currentData()
+        tip = self.asset_group.currentData(Qt.ToolTipRole)
+        self.asset_group.setToolTip(
+            tip or self.asset_group.currentText())
         if not gdir:
             _empty_table_row(self.asset_table,
                              "No assets yet. Capture an app or import "
                              "a HAR.")
+            self.pack_dir = None
+            self._update_asset_buttons()
             return
         status_map = self._pack_status_map()
         entries = []
@@ -3909,6 +4163,7 @@ class MainWindow(QMainWindow):
         if not entries:
             _empty_table_row(self.asset_table,
                              "No assets in this group.")
+            self._update_asset_buttons()
             return
         self.asset_table.setRowCount(len(entries))
         for i, e in enumerate(entries):
@@ -3921,9 +4176,12 @@ class MainWindow(QMainWindow):
                 size_text = f"{size} B"
             source = e.get("source") or ""
             if e.get("url"):
-                source = f"traffic: {e['url'][:60]}"
+                # v0.8 B4: the full URL — the column stretches and
+                # the cell tooltip carries it whole; no more
+                # code-side cut at 60 chars.
+                source = f"traffic: {e['url']}"
             elif e.get("source_path"):
-                source = f"program file: {e['source_path'][:60]}"
+                source = f"program file: {e['source_path']}"
             self.asset_table.setItem(i, 0, QTableWidgetItem(e.get("name", "")))
             self.asset_table.item(i, 0).setData(Qt.UserRole, {
                 "path": os.path.join(gdir, e.get("file", "")),
@@ -3936,11 +4194,13 @@ class MainWindow(QMainWindow):
                     assets.KIND_LABELS.get(e.get("kind"), e.get("kind", ""))))
             self.asset_table.setItem(i, 2, QTableWidgetItem(size_text))
             self.asset_table.setItem(i, 3, QTableWidgetItem(source))
+            self.asset_table.item(i, 3).setToolTip(source)
             self.asset_table.setItem(
                 i, 4, QTableWidgetItem(
                     status_map.get(e.get("sha256"), "saved")))
         _restore_table(self.asset_table, snap, key="path")
         self._filter_asset_table()
+        self._update_asset_buttons()
 
     # ---- Asset preview (item 10) ------------------------------------------
 
@@ -4348,6 +4608,10 @@ class MainWindow(QMainWindow):
         learn_btn = QPushButton("Learn preset")
         learn_btn.clicked.connect(self._learn_preset)
         self.learn_btn = learn_btn
+        # v0.8 B3: nothing to learn from until a capture exists.
+        learn_btn.setEnabled(False)
+        self.preset_source.currentIndexChanged.connect(
+            self._update_preset_buttons)
         row.addWidget(learn_btn)
         refresh = QPushButton("Refresh")
         refresh.clicked.connect(self._refresh_presets)
@@ -4384,6 +4648,11 @@ class MainWindow(QMainWindow):
         export_btn = QPushButton("Export selected…")
         export_btn.clicked.connect(self._export_preset)
         row.addWidget(export_btn)
+        # v0.8 B3: both act on the selected preset.
+        self.preset_delete_btn = delete_btn
+        self.preset_export_btn = export_btn
+        delete_btn.setEnabled(False)
+        export_btn.setEnabled(False)
         import_btn = QPushButton("Import…")
         import_btn.clicked.connect(self._import_preset)
         row.addWidget(import_btn)
@@ -4446,9 +4715,33 @@ class MainWindow(QMainWindow):
             self.pattern_presets_list.addItem(item)
         _restore_list(self.presets_list, snap)
         _restore_list(self.pattern_presets_list, snap_patterns)
+        # v0.8 G9: a lone preset (either kind) selects itself, so
+        # its details and actions are right there.
+        if self.presets_list.currentItem() is None \
+                and self.pattern_presets_list.currentItem() is None:
+            real = []
+            for lst in (self.presets_list, self.pattern_presets_list):
+                for r in range(lst.count()):
+                    if lst.item(r).data(Qt.UserRole):
+                        real.append((lst, r))
+            if len(real) == 1:
+                lst, r = real[0]
+                lst.setCurrentRow(r)
         self._preset_selected()
 
+    def _update_preset_buttons(self):
+        """(v0.8 B3) Learn needs a capture in the source combo;
+        Delete / Export need a selected preset in either list."""
+        if hasattr(self, "learn_btn"):
+            self.learn_btn.setEnabled(
+                bool(self.preset_source.currentData()))
+        if hasattr(self, "preset_delete_btn"):
+            _is_pat, name = self._selected_preset()
+            self.preset_delete_btn.setEnabled(bool(name))
+            self.preset_export_btn.setEnabled(bool(name))
+
     def _preset_selected(self, _current=None, _prev=None):
+        self._update_preset_buttons()
         item = self.presets_list.currentItem()
         if item is None:
             if self.pattern_presets_list.currentItem() is None:
@@ -4464,6 +4757,7 @@ class MainWindow(QMainWindow):
         self.preset_detail.setText("\n".join(presets.describe(preset)))
 
     def _pattern_preset_selected(self, _current=None, _prev=None):
+        self._update_preset_buttons()
         item = self.pattern_presets_list.currentItem()
         if item is None:
             if self.presets_list.currentItem() is None:
@@ -4649,6 +4943,12 @@ class MainWindow(QMainWindow):
         open_btn.clicked.connect(self._open_client)
         reveal_btn = QPushButton("Reveal in folder")
         reveal_btn.clicked.connect(self._reveal_client)
+        # v0.8 B3: all four act on the selected client.
+        self.client_delete_btn = delete_btn
+        self.client_open_btn = open_btn
+        self.client_reveal_btn = reveal_btn
+        for b in (smoke, delete_btn, open_btn, reveal_btn):
+            b.setEnabled(False)
         row2 = QHBoxLayout()
         row2.addWidget(smoke)
         row2.addWidget(delete_btn)
@@ -4663,6 +4963,15 @@ class MainWindow(QMainWindow):
         # No fetch here — the tab loads on first show (_tab_shown).
         return w
 
+    def _update_client_buttons(self):
+        """(v0.8 B3) The four client actions need a selected client
+        (a row with a file path; the placeholder has none)."""
+        item = self.clients_list.currentItem()
+        has = item is not None and bool(item.data(Qt.UserRole))
+        for b in (self.smoke_btn, self.client_delete_btn,
+                  self.client_open_btn, self.client_reveal_btn):
+            b.setEnabled(has)
+
     def _refresh_clients(self):
         # v0.6 T5: refresh keeps your place.
         snap = _snapshot_list(self.clients_list)
@@ -4671,6 +4980,7 @@ class MainWindow(QMainWindow):
         if not clients:
             self.clients_list.addItem(_empty_item(
                 "No clients yet. Generate one on the Generate tab."))
+            self._update_client_buttons()
             return
         for name, path, size in clients:
             item = QListWidgetItem(f"{name}  ({size} bytes)")
@@ -4678,10 +4988,12 @@ class MainWindow(QMainWindow):
             self.clients_list.addItem(item)
         _restore_list(self.clients_list, snap)
         self._filter_clients_list()
+        self._update_client_buttons()
 
     def _client_selected(self, current, _prev):
         """(v0.6 T12) Fill the preview pane for the selected client,
         or clear it when nothing is selected."""
+        self._update_client_buttons()
         if current is None or not current.data(Qt.UserRole):
             self.client_preview.clear()
             return
@@ -4844,6 +5156,10 @@ class MainWindow(QMainWindow):
         lay.addLayout(row)
         split = QHBoxLayout()
         self.binaries_list = QListWidget()
+        # v0.8 B4: the list is a third of the tab — long item text
+        # (and the empty-state sentence) must wrap, not clip
+        # mid-word behind a horizontal scrollbar.
+        self.binaries_list.setWordWrap(True)
         self.binaries_list.currentItemChanged.connect(
             self._binary_selected)
         self.binaries_list.addItem(_empty_item(
@@ -6032,6 +6348,28 @@ def main():
     app.setWindowIcon(window_icon())
     app.setStyleSheet(effective_stylesheet())
     win = MainWindow()
+    # v0.8 G1: encrypted captures ask for the passphrase once, at
+    # startup. Cancelling (or three wrong tries) opens the window
+    # locked: the captures are never mistaken for an empty store,
+    # and File › Unlock captures… stays available all session.
+    if store.encryption_enabled() and not store.unlocked():
+        for _attempt in range(3):
+            pw = win._ask_passphrase(
+                "Unlock captures",
+                "Your captures are encrypted. Type the passphrase:")
+            if pw is None:
+                break
+            try:
+                if store.unlock(pw):
+                    break
+            except crypto.CryptoError:
+                break
+            QMessageBox.warning(
+                win, "MIMIK",
+                "That passphrase did not unlock the captures.")
+        win._refresh_encryption_actions()
+        win._refresh_saved_flows()
+        win._update_status_bar()
     if failed is not None:
         win._startup_update_note = (
             f"The update did not install: {failed}\n\n"

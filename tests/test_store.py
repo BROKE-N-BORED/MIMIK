@@ -148,6 +148,37 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(len(clients), 1)
         self.assertEqual(clients[0][0], "example_client.py")
 
+    def test_save_client_copy_normalizes_custom_name(self):
+        # v0.8 B2: a custom --out basename ("cli-out") used to land
+        # in the store under a name list_clients cannot see. The
+        # copy always carries the _client.py suffix.
+        path = store.save_client_copy(
+            "cli-out", 'class C:\n    HOST = "a.example.com"\n',
+            base=self.tmp)
+        self.assertTrue(path.endswith("cli-out_client.py"))
+        names = [c[0] for c in store.list_clients(base=self.tmp)]
+        self.assertEqual(names, ["cli-out_client.py"])
+
+    def test_save_client_copy_other_host_gets_sibling(self):
+        # v0.8 B2: same basename, DIFFERENT host — no overwrite;
+        # same host regenerating refreshes its own copy.
+        src_a = 'class A:\n    HOST = "a.example.com"\n'
+        src_b = 'class B:\n    HOST = "b.example.com"\n'
+        p1 = store.save_client_copy("same_client.py", src_a,
+                                    base=self.tmp)
+        p2 = store.save_client_copy("same_client.py", src_b,
+                                    base=self.tmp)
+        self.assertNotEqual(p1, p2)
+        self.assertTrue(p2.endswith("same_2_client.py"))
+        names = sorted(c[0] for c in store.list_clients(base=self.tmp))
+        self.assertEqual(names, ["same_2_client.py", "same_client.py"])
+        src_a2 = 'class A:\n    HOST = "a.example.com"\n# v2\n'
+        p3 = store.save_client_copy("same_client.py", src_a2,
+                                    base=self.tmp)
+        self.assertEqual(p3, p1)
+        with open(p1) as fh:
+            self.assertEqual(fh.read(), src_a2)
+
     def test_data_dir_env_override(self):
         os.environ["MIMIK_DATA_DIR"] = self.tmp
         try:

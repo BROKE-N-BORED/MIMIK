@@ -1,11 +1,14 @@
 [project]
 name = "mimik"
-version = "0.7.0"
+version = "0.8.0"
 description = "Intercept any app, then call it from Python like a library — Linux port of littledivy/mimic."
 requires-python = ">=3.10"
 license = "MIT"
 authors = [{ name = "Broke n' Bored Studio" }]
-dependencies = ["requests>=2.28", "PySide6>=6.6", "mitmproxy>=10"]
+# v0.8 G5: every dependency carries an upper bound — an unbounded
+# >= let a future major release break fresh installs silently.
+# cryptography + argon2-cffi are the capture-encryption pair (G1).
+dependencies = ["requests>=2.28,<3", "PySide6>=6.6,<7", "mitmproxy>=10,<13", "cryptography>=42,<51", "argon2-cffi>=23,<26"]
 
 [project.scripts]
 mimik = "mimik.cli:main"

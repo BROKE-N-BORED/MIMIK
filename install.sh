@@ -30,7 +30,7 @@ mkdir -p "$PREFIX" "$BIN"
 # can't set file modes), so fix the scripts' bits here. The Release zip
 # already carries 0o100755 for these; this only matters for clones.
 # Never fatal: the tree may be read-only.
-chmod +x "$DIR/install.sh" "$DIR/uninstall.sh" "$DIR/Install MIMIK.desktop" 2>/dev/null || true
+chmod +x "$DIR/install.sh" "$DIR/uninstall.sh" "$DIR/Install MIMIK.desktop" "$DIR/Uninstall MIMIK.desktop" 2>/dev/null || true
 
 if [ ! -x "$VENV/bin/python" ]; then
   echo "Creating virtualenv at $VENV …"
@@ -122,6 +122,23 @@ Categories=Development;
 StartupNotify=true
 EOF
 chmod 644 "$HOME/.local/share/applications/mimik.desktop"
+
+# Menu uninstaller (v0.8 G4): a copy of uninstall.sh inside the
+# install prefix plus its own menu entry, so removing MIMIK never
+# needs the downloaded folder or a terminal either.
+cp "$DIR/uninstall.sh" "$PREFIX/uninstall.sh"
+chmod +x "$PREFIX/uninstall.sh"
+cat > "$HOME/.local/share/applications/mimik-uninstall.desktop" <<EOF
+[Desktop Entry]
+Type=Application
+Name=Uninstall MIMIK
+Comment=Remove MIMIK from this PC
+Exec=bash $PREFIX/uninstall.sh
+Icon=mimik
+Terminal=true
+Categories=Development;
+EOF
+chmod 644 "$HOME/.local/share/applications/mimik-uninstall.desktop"
 
 if command -v update-desktop-database >/dev/null 2>&1; then
   update-desktop-database "$HOME/.local/share/applications" 2>/dev/null || true

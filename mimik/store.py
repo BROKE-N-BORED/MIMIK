@@ -22,6 +22,8 @@ import tempfile
 import time
 from datetime import datetime
 
+from . import crypto
+
 DEFAULT_DATA_DIR = os.path.join(
     os.path.expanduser("~"), ".local", "share", "mimik"
 )
@@ -163,13 +165,231 @@ def _host_files(host, base):
                   if n.startswith(safe + "_") and n.endswith(".json"))
 
 
-def _read_capture(path):
-    """One capture file's JSON, or None if it can't be read/parsed."""
+# v0.8 B7: capture files that exist but cannot be parsed. Recorded
+# once per path per process (and logged once), so a corrupt capture
+# is never silently invisible: the CLI warns on stderr and the GUI
+# status bar names the count. The file itself is left on disk.
+_unreadable = {}
+
+
+def _note_unreadable(path, exc):
+    if path in _unreadable:
+        return
+    _unreadable[path] = str(exc)
     try:
-        with open(path) as fh:
+        from . import log
+        log.log_error(f"store: unreadable capture file {path}", exc)
+    except Exception:
+        pass  # logging must never break a read
+
+
+def unreadable_captures(base=None):
+    """[(filename, error)] for capture files under `base` that were
+    found unreadable during this process's reads (v0.8 B7)."""
+    base = base or data_dir()
+    cdir = captures_dir(base)
+    out = []
+    for path, err in sorted(_unreadable.items()):
+        if os.path.dirname(path) == cdir:
+            out.append((os.path.basename(path), err))
+    return out
+
+
+def _read_capture(path):
+    """One capture file's JSON, or None if it can't be read/parsed.
+
+    A file that exists but does not parse is noted (v0.8 B7) — it
+    used to vanish silently, indistinguishable from "never saved".
+    An encrypted capture (v0.8 G1) opens only while the store is
+    unlocked; locked, it reads as None and is noted as locked, NOT
+    as corrupt — the file is fine, the key is just not in memory.
+    """
+    try:
+        with open(path, encoding="utf-8") as fh:
+            text = fh.read()
+    except OSError:
+        return None
+    try:
+        obj = json.loads(text)
+    except ValueError as e:
+        _note_unreadable(path, e)
+        return None
+    if crypto.is_envelope(obj):
+        key = _keys.get(_base_of_capture(path))
+        if key is None:
+            _locked_files.add(path)
+            return None
+        try:
+            return crypto.decrypt_json(key, obj)
+        except crypto.CryptoError as e:
+            _note_unreadable(path, e)
+            return None
+    return obj
+
+
+# ---- capture encryption (v0.8 G1) -------------------------------------
+#
+# Decided 2026-11-13, built in v0.8: capture files are sealed with
+# AES-256-GCM under an Argon2id key derived from a passphrase. The
+# key lives in _keys, in memory only, keyed by data dir. The marker
+# file (encryption.json in the data dir) holds only the salt and a
+# sealed verifier — never the key, never the passphrase.
+
+class StoreLockedError(Exception):
+    """Captures are encrypted and this process has not unlocked
+    them. Raised on WRITE (a save must never silently land as
+    plaintext or get dropped); reads of locked captures return
+    empty and are reported through locked_captures()."""
+
+
+_keys = {}
+_locked_files = set()
+
+
+def _base_of_capture(path):
+    """The data dir a capture file lives under (…/captures/x.json)."""
+    return os.path.dirname(os.path.dirname(os.path.abspath(path)))
+
+
+def encryption_marker_path(base=None):
+    return os.path.join(base or data_dir(), "encryption.json")
+
+
+def encryption_enabled(base=None):
+    """True when this store has capture encryption turned on."""
+    return os.path.isfile(encryption_marker_path(base))
+
+
+def _load_marker(base):
+    try:
+        with open(encryption_marker_path(base), encoding="utf-8") as fh:
+            marker = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    return marker if isinstance(marker, dict) else None
+
+
+def unlocked(base=None):
+    """True when the passphrase for this store was given this run."""
+    return os.path.abspath(base or data_dir()) in _keys
+
+
+def unlock(passphrase, base=None):
+    """Try a passphrase against the store's marker. True (and the
+    key is kept in memory) when it opens the verifier; False when
+    it does not. Raises crypto.CryptoError when the crypto packages
+    are missing — a plain-words refusal, not a silent no."""
+    base = base or data_dir()
+    marker = _load_marker(base)
+    if marker is None:
+        return False
+    key = crypto.check_marker(marker, passphrase)
+    if key is None:
+        return False
+    _keys[os.path.abspath(base)] = key
+    return True
+
+
+def lock(base=None):
+    """Forget the key for this store (captures stay encrypted)."""
+    _keys.pop(os.path.abspath(base or data_dir()), None)
+
+
+def locked_captures(base=None):
+    """Basenames of encrypted capture files this process tried to
+    read while locked (v0.8 G1) — so callers can say "locked"
+    instead of pretending the captures do not exist."""
+    base = base or data_dir()
+    cdir = captures_dir(base)
+    return sorted(os.path.basename(p) for p in _locked_files
+                  if os.path.dirname(p) == cdir)
+
+
+def _seal_payload(base, payload):
+    """The text to write for a capture payload: plain JSON, or a
+    sealed envelope while encryption is on. Writing while locked
+    is a hard error (StoreLockedError), never a plaintext save."""
+    if encryption_enabled(base):
+        key = _keys.get(os.path.abspath(base))
+        if key is None:
+            raise StoreLockedError(
+                "captures are encrypted and locked: unlock before "
+                "saving (the passphrase is asked at startup)")
+        return json.dumps(crypto.encrypt_json(key, payload))
+    return json.dumps(payload)
+
+
+def _read_capture_plain(path):
+    """Parse a capture file's raw JSON with NO decryption (the
+    migration path in enable_encryption reads files it is about to
+    seal)."""
+    try:
+        with open(path, encoding="utf-8") as fh:
             return json.load(fh)
     except (OSError, ValueError):
         return None
+
+
+def enable_encryption(passphrase, base=None):
+    """Turn capture encryption ON for this store and seal every
+    existing plaintext capture in place (same filenames). Returns
+    how many capture files were sealed. The marker is written
+    first, so an interrupted migration still leaves a store that
+    unlocks and reads its (mixed) files correctly."""
+    base = base or data_dir()
+    if encryption_enabled(base):
+        raise crypto.CryptoError(
+            "capture encryption is already on for this store")
+    marker, key = crypto.make_marker(passphrase)
+    ensure_private_dir(base)
+    ensure_private_dir(captures_dir(base))
+    atomic_write(encryption_marker_path(base),
+                 json.dumps(marker, indent=2))
+    _keys[os.path.abspath(base)] = key
+    sealed = 0
+    cdir = captures_dir(base)
+    for name in sorted(os.listdir(cdir)):
+        if not name.endswith(".json"):
+            continue
+        path = os.path.join(cdir, name)
+        data = _read_capture_plain(path)
+        if data is None or crypto.is_envelope(data):
+            continue
+        atomic_write(path, json.dumps(crypto.encrypt_json(key, data)))
+        sealed += 1
+    return sealed
+
+
+def disable_encryption(base=None):
+    """Turn capture encryption OFF: unseal every capture back to
+    plain JSON and remove the marker. Needs the store unlocked.
+    Returns how many capture files were unsealed."""
+    base = base or data_dir()
+    if not encryption_enabled(base):
+        return 0
+    if not unlocked(base):
+        raise StoreLockedError(
+            "unlock the captures before turning encryption off")
+    unsealed = 0
+    cdir = captures_dir(base)
+    for name in sorted(os.listdir(cdir)):
+        if not name.endswith(".json"):
+            continue
+        path = os.path.join(cdir, name)
+        raw = _read_capture_plain(path)
+        if raw is None or not crypto.is_envelope(raw):
+            continue
+        data = _read_capture(path)
+        if data is None:
+            continue
+        atomic_write(path, json.dumps(data))
+        unsealed += 1
+    try:
+        os.remove(encryption_marker_path(base))
+    except OSError:
+        pass
+    lock(base)
+    return unsealed
 
 
 def _saved_ids(host, base):
@@ -335,9 +555,9 @@ def save_flows(flows, mitm=None, base=None, meta=None):
                 f"{_safe_host(host)}_{stamp}_{n}.json",
             )
             n += 1
-        atomic_write(path, json.dumps(
-            {"host": host, "saved_at": stamp, "flows": embedded,
-             "meta": meta or {}}))
+        atomic_write(path, _seal_payload(
+            base, {"host": host, "saved_at": stamp, "flows": embedded,
+                   "meta": meta or {}}))
         paths.append(path)
     return paths
 
@@ -536,12 +756,47 @@ def delete_host(host, base=None):
             "bytes_freed": bytes_freed}
 
 
+def _client_host_of(source):
+    """The HOST a generated client was built for, or None."""
+    m = re.search(r'^\s*HOST\s*=\s*"([^"]+)"', source or "", re.M)
+    return m.group(1) if m else None
+
+
 def save_client_copy(name, source, base=None):
-    """Keep a copy of a generated client under clients/. Returns the path."""
+    """Keep a copy of a generated client under clients/. Returns the path.
+
+    v0.8 B2: the store copy always carries the _client.py suffix
+    (list_clients / delete_client only speak that convention, so a
+    copy saved under a custom --out basename like "cli-out" used to
+    be invisible and undeletable). Regenerating the SAME host's
+    client refreshes its copy, as before; a copy whose name is
+    taken by a DIFFERENT host's client gets a _2/_3 sibling that
+    still ends in _client.py.
+    """
     base = base or data_dir()
     ensure_private_dir(base)
     ensure_private_dir(clients_dir(base))
+    if not name.endswith("_client.py"):
+        stem = name[:-3] if name.endswith(".py") else name
+        name = f"{stem}_client.py"
     path = os.path.join(clients_dir(base), name)
+    if os.path.exists(path):
+        try:
+            with open(path, encoding="utf-8") as fh:
+                old = fh.read()
+        except OSError:
+            old = None
+        if old is not None and old != source:
+            old_host = _client_host_of(old)
+            new_host = _client_host_of(source)
+            if old_host and new_host and old_host != new_host:
+                stem = name[: -len("_client.py")]
+                n = 2
+                while os.path.exists(os.path.join(
+                        clients_dir(base), f"{stem}_{n}_client.py")):
+                    n += 1
+                path = os.path.join(
+                    clients_dir(base), f"{stem}_{n}_client.py")
     atomic_write(path, source, private=False)
     return path
 

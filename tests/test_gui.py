@@ -293,6 +293,144 @@ class GuiTests(unittest.TestCase):
             finally:
                 win.close()
 
+    def test_empty_state_action_buttons_disabled(self):
+        # v0.8 B3: every action that needs a selection or a host is
+        # disabled in the empty state (the audit found them all
+        # clickable, erroring or doing nothing). Actions that need
+        # nothing (Refresh, Import, Scan, Analyze) stay enabled.
+        from mimik.gui import MainWindow
+
+        empty = tempfile.mkdtemp()
+        with mock.patch.dict(os.environ, {"MIMIK_DATA_DIR": empty}):
+            win = MainWindow()
+            win.show()
+            self.app.processEvents()
+            try:
+                for b in (win.host_delete_btn, win.host_gen_btn,
+                          win.host_link_btn, win.gen_btn,
+                          win.asset_delete_group_btn,
+                          win.asset_preview_btn, win.asset_reveal_btn,
+                          win.build_pack_btn, win.asset_delete_pack_btn,
+                          win.asset_export_pack_btn, win.smoke_btn,
+                          win.client_delete_btn, win.client_open_btn,
+                          win.client_reveal_btn, win.learn_btn,
+                          win.preset_delete_btn, win.preset_export_btn):
+                    self.assertFalse(b.isEnabled(), b.text())
+                # v0.8 B4: the Binary list wraps instead of clipping.
+                self.assertTrue(win.binaries_list.wordWrap())
+            finally:
+                win.close()
+
+    def test_sample_state_enables_actions_and_autoselects(self):
+        # v0.8 B3/G9: with the sample loaded, the lone host selects
+        # itself on Hosts (endpoints load, actions enable), the lone
+        # preset selects itself on Presets, the Assets combo shows a
+        # short label, and picking the asset row enables Preview.
+        from PySide6.QtCore import Qt
+
+        from mimik import sample
+        from mimik.gui import MainWindow
+
+        empty = tempfile.mkdtemp()
+        with mock.patch.dict(os.environ, {"MIMIK_DATA_DIR": empty}):
+            sample.load_sample()
+            win = MainWindow()
+            win.show()
+            try:
+                self.assertTrue(win._refresh_hosts(refresh=False))
+                _wait_for(self.app, lambda: win._task is None)
+                # Auto-select fires the endpoints load as a 2nd task.
+                _wait_for(self.app, lambda: win._task is None
+                          and win.ep_table.rowCount() > 0)
+                item = win.hosts_list.currentItem()
+                self.assertIsNotNone(item)
+                self.assertEqual(item.data(Qt.UserRole),
+                                 sample.SAMPLE_HOST)
+                self.assertTrue(win.host_delete_btn.isEnabled())
+                self.assertTrue(win.host_gen_btn.isEnabled())
+                win._refresh_presets()
+                self.app.processEvents()
+                self.assertTrue(win.learn_btn.isEnabled())
+                self.assertTrue(win.preset_delete_btn.isEnabled())
+                self.assertTrue(win.preset_export_btn.isEnabled())
+                win._refresh_asset_groups()
+                self.app.processEvents()
+                self.assertEqual(win.asset_group.currentText(),
+                                 f"{sample.SAMPLE_HOST} (1 asset)")
+                self.assertTrue(win.asset_delete_group_btn.isEnabled())
+                self.assertTrue(win.build_pack_btn.isEnabled())
+                self.assertFalse(win.asset_preview_btn.isEnabled())
+                win.asset_table.setCurrentCell(0, 0)
+                self.app.processEvents()
+                self.assertTrue(win.asset_preview_btn.isEnabled())
+                self.assertTrue(win.asset_reveal_btn.isEnabled())
+            finally:
+                win.close()
+
+    def test_encryption_actions_follow_store(self):
+        # v0.8 G1: File-menu encryption actions + the status bar
+        # follow the store — locked reads as "locked", never as an
+        # empty store.
+        from mimik import crypto, sample, store
+        if not crypto.available():
+            self.skipTest("crypto packages missing")
+        from mimik.gui import MainWindow
+
+        empty = tempfile.mkdtemp()
+        with mock.patch.dict(os.environ, {"MIMIK_DATA_DIR": empty}):
+            win = MainWindow()
+            win.show()
+            self.app.processEvents()
+            try:
+                self.assertFalse(win._unlock_action.isVisible())
+                self.assertEqual(win._encrypt_action.text(),
+                                 "Encrypt captures…")
+            finally:
+                win.close()
+            sample.load_sample()
+            store.enable_encryption("pw123")
+            store.lock()
+            win = MainWindow()
+            win.show()
+            self.app.processEvents()
+            try:
+                self.assertTrue(win._unlock_action.isVisible())
+                self.assertEqual(win._encrypt_action.text(),
+                                 "Turn off capture encryption…")
+                self.assertIn("locked", win.status_flows.text())
+                with mock.patch.object(win, "_ask_passphrase",
+                                       return_value="pw123"):
+                    win._unlock_captures()
+                self.assertTrue(store.unlocked())
+                self.assertFalse(win._unlock_action.isVisible())
+                self.assertNotIn("locked", win.status_flows.text())
+            finally:
+                win.close()
+                store.lock()
+
+    def test_accessible_names_cover_controls(self):
+        # v0.8 G8: buttons, checkboxes and tab pages carry
+        # accessible names for screen readers.
+        from PySide6.QtWidgets import QPushButton
+        from mimik.gui import MainWindow
+
+        empty = tempfile.mkdtemp()
+        with mock.patch.dict(os.environ, {"MIMIK_DATA_DIR": empty}):
+            win = MainWindow()
+            win.show()
+            self.app.processEvents()
+            try:
+                named = [b for b in win.findChildren(QPushButton)
+                         if b.accessibleName()]
+                self.assertGreater(len(named), 10)
+                self.assertEqual(win.tabs.accessibleName(),
+                                 "Main sections")
+                for i in range(win.tabs.count()):
+                    self.assertTrue(
+                        win.tabs.widget(i).accessibleName())
+            finally:
+                win.close()
+
     def test_doctor_pending_shows_check_names(self):
         # v0.6 T4: the Doctor tab shows the check names with a
         # pending state while probing, never a blank box.
@@ -2549,6 +2687,28 @@ class GuiTests(unittest.TestCase):
         finally:
             win.close()
 
+    def test_pads_say_what_a_tap_does(self):
+        # v0.8 B5: the pads are the Start button (T16) but read as
+        # selectors — the hint line and every pad subtitle must say
+        # what tapping does, and the Web pad must own up that it
+        # starts no proxy.
+        from mimik.gui import PAD_TARGETS, MainWindow
+
+        win = MainWindow()
+        win.show()
+        try:
+            self.assertIn("Tap a card to start recording",
+                          win.pads_hint.text())
+            subs = {key: sub for key, _t, sub in PAD_TARGETS}
+            self.assertIn("Tap to start", subs["android"])
+            self.assertIn("Tap to start", subs["linux-app"])
+            self.assertIn("Tap to start", subs["windows"])
+            self.assertIn("Tap to choose", subs["file"])
+            self.assertIn("no proxy", subs["web"])
+            self.assertGreaterEqual(win.steps.minimumHeight(), 140)
+        finally:
+            win.close()
+
     def test_tap_file_pad_without_file_opens_picker(self):
         # v0.6 T16: the file pad with no file opens the picker
         # instead of starting — no dead end, no silent no-op.
@@ -3567,7 +3727,7 @@ class GuiTests(unittest.TestCase):
     def test_generate_overwrite_numbered(self):
         win, tmp, original = self._generate_with_existing("numbered")
         try:
-            second = os.path.join(tmp, "game_example_com_client_2.py")
+            second = os.path.join(tmp, "game_example_com_2_client.py")
             self.assertTrue(os.path.exists(second))
             self.assertEqual(win.gen_out, second)
             with open(os.path.join(tmp, "game_example_com_client.py")) as f:
@@ -3581,7 +3741,7 @@ class GuiTests(unittest.TestCase):
             with open(os.path.join(tmp, "game_example_com_client.py")) as f:
                 self.assertNotEqual(f.read(), original)
             self.assertFalse(os.path.exists(
-                os.path.join(tmp, "game_example_com_client_2.py")))
+                os.path.join(tmp, "game_example_com_2_client.py")))
         finally:
             win.close()
 
@@ -3589,7 +3749,7 @@ class GuiTests(unittest.TestCase):
         win, tmp, original = self._generate_with_existing(None)
         try:
             self.assertFalse(os.path.exists(
-                os.path.join(tmp, "game_example_com_client_2.py")))
+                os.path.join(tmp, "game_example_com_2_client.py")))
             with open(os.path.join(tmp, "game_example_com_client.py")) as f:
                 self.assertEqual(f.read(), original)
             self.assertFalse(win.open_btn.isEnabled())

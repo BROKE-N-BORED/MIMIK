@@ -44,6 +44,15 @@ from .doctor import lan_ip
 SCRIPTS_REPO = ("https://github.com/httptoolkit/"
                 "frida-interception-and-unpinning")
 
+# v0.8 G3: the scripts are pinned to the exact upstream commit
+# MIMIK was verified against (HEAD as of 2026-11-19). These files
+# get injected into apps by Frida, so a floating clone/pull of
+# whatever HEAD happens to be that day was a supply-chain hole:
+# fetch_scripts now refuses scripts at any other commit instead
+# of silently trusting them. Bumping the pin is a deliberate,
+# reviewed change, like a dependency upgrade.
+SCRIPTS_COMMIT = "f0f40c77d6be2d0fc5e099aa2b4c5537200feb47"
+
 DEFAULT_CA = os.path.expanduser("~/.mitmproxy/mitmproxy-ca-cert.pem")
 PROXY_PORT = 8080  # mitmweb's proxy listener: the port `mimik record` uses
 
@@ -74,21 +83,50 @@ def target_kind(target, platform=None):
         "--android or --linux to say which.")
 
 
-def fetch_scripts(dst):
-    """Fetch (or refresh) the upstream Frida scripts into `dst`.
+def _git_head(dst):
+    """The checked-out commit of the scripts clone, or None."""
+    r = subprocess.run(["git", "-C", dst, "rev-parse", "HEAD"],
+                       check=False, capture_output=True, text=True)
+    return r.stdout.strip() if r.returncode == 0 else None
 
-    False when git is missing or the clone fails; a failed refresh
-    pull is not fatal (the scripts already there still work).
+
+def _checkout_pinned(dst):
+    """Move the clone at `dst` onto SCRIPTS_COMMIT. True only when
+    HEAD is the pinned commit afterwards."""
+    if _git_head(dst) == SCRIPTS_COMMIT:
+        return True
+    # Fetch the pinned commit itself (GitHub serves reachable SHAs
+    # directly), then check it out detached.
+    r = subprocess.run(
+        ["git", "-C", dst, "fetch", "--depth", "1", "--quiet",
+         "origin", SCRIPTS_COMMIT], check=False)
+    if r.returncode != 0:
+        return False
+    r = subprocess.run(
+        ["git", "-C", dst, "checkout", "--quiet", "FETCH_HEAD"],
+        check=False)
+    return r.returncode == 0 and _git_head(dst) == SCRIPTS_COMMIT
+
+
+def fetch_scripts(dst):
+    """Fetch the upstream Frida scripts into `dst`, pinned to
+    SCRIPTS_COMMIT (v0.8 G3).
+
+    True only when the scripts on disk afterwards are exactly the
+    pinned commit. False when git is missing, the fetch fails, or
+    the pinned commit cannot be checked out — unverified scripts
+    are never used, and an older unpinned clone left at another
+    commit is not silently trusted either.
     """
     if not shutil.which("git"):
         return False
     if os.path.isdir(os.path.join(dst, ".git")):
-        subprocess.run(["git", "-C", dst, "pull", "--quiet", "--ff-only"],
-                       check=False)
-        return True
+        return _checkout_pinned(dst)
     r = subprocess.run(["git", "clone", "--depth", "1", "--quiet",
                         SCRIPTS_REPO, dst], check=False)
-    return r.returncode == 0
+    if r.returncode != 0:
+        return False
+    return _checkout_pinned(dst)
 
 
 def _js_in(directory):
@@ -274,13 +312,22 @@ def prepare(target, ca_path=None, proxy_host=None, workdir=None,
     have_git = os.path.isdir(os.path.join(scripts_dir, ".git"))
     have_scripts = os.path.isfile(os.path.join(scripts_dir, "config.js"))
     if have_git:
-        fetch_scripts(scripts_dir)  # refresh; a failed pull is not fatal
+        # v0.8 G3: an existing clone must sit at the pinned commit;
+        # anything else is unverified and is never used.
+        if not fetch_scripts(scripts_dir):
+            raise UnpinError(
+                "the Frida scripts on disk are not at the commit "
+                "MIMIK pins and could not be moved to it, so they "
+                "were not used. Delete the folder and re-run "
+                f"`mimik unpin` to fetch the pinned scripts:\n"
+                f"    {scripts_dir}")
     elif not have_scripts:
         if not fetch_scripts(scripts_dir):
             raise UnpinError(
                 "couldn't fetch the Frida scripts (need git + network). "
-                "Clone them yourself:\n"
+                "Clone them yourself, at the commit MIMIK pins:\n"
                 f"    git clone {SCRIPTS_REPO} {scripts_dir}\n"
+                f"    git -C {scripts_dir} checkout {SCRIPTS_COMMIT}\n"
                 "then re-run `mimik unpin`.")
 
     host = proxy_host or lan_ip()

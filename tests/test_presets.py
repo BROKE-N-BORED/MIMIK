@@ -185,20 +185,45 @@ class LearnTests(unittest.TestCase):
         with open(path, "w") as fh:
             json.dump(data, fh, indent=2)
         # Second batch: the users endpoint again (SAME flow id, so the
-        # saved-capture dedupe keeps the count honest either side of a
-        # second boundary) plus a brand-new endpoint.
+        # saved-capture dedupe means it must NOT be counted twice),
+        # one genuinely new users flow, plus a brand-new endpoint.
         store.save_flows([
             auth_flow("f1", HOST, "/api/users/999"),
             auth_flow("f3", HOST, "/api/friends"),
+            auth_flow("f4", HOST, "/api/users/555"),
         ], base=self.tmp)
         preset, _path, created = presets.learn(HOST)
         self.assertFalse(created)
         by_key = {(e["method"], e["path"]): e for e in preset["endpoints"]}
+        # f1 + f4 = 2 distinct users flows; the re-saved f1 adds none.
         self.assertEqual(by_key[("GET", "/api/users/{id}")]["seen"], 2)
         self.assertEqual(by_key[("GET", "/api/users/{id}")]["first_seen"],
                          "2026-01-01T00:00:00")
         self.assertIn(("GET", "/api/shop"), by_key)
+        # The shop endpoint was captured once and never again: its
+        # count must stay 1 after the re-learn (v0.8 B1 — it used to
+        # double on every re-learn).
+        self.assertEqual(by_key[("GET", "/api/shop")]["seen"], 1)
         self.assertIn(("GET", "/api/friends"), by_key)
+
+    def test_relearn_without_new_flows_changes_no_counts(self):
+        # v0.8 B1 regression: learning three times over the same store
+        # must leave every seen count exactly where the first learn
+        # put it (they used to grow 2 -> 4 -> 6).
+        store.save_flows([
+            auth_flow("f1", HOST, "/api/users/123"),
+            auth_flow("f2", HOST, "/api/users/456"),
+        ], base=self.tmp)
+        first, _p, _c = presets.learn(HOST)
+        first_counts = {(e["method"], e["path"]): e["seen"]
+                        for e in first["endpoints"]}
+        self.assertEqual(first_counts[("GET", "/api/users/{id}")], 2)
+        for _ in range(2):
+            again, _p, created = presets.learn(HOST)
+            self.assertFalse(created)
+            counts = {(e["method"], e["path"]): e["seen"]
+                      for e in again["endpoints"]}
+            self.assertEqual(counts, first_counts)
 
     def test_learn_nothing_returns_none(self):
         self.assertIsNone(presets.learn("nobody.example.com"))

@@ -1,5 +1,66 @@
 # MIMIK Changelog
 
+## v0.8 — 2026-11-19
+
+The audit build: a full user-mode audit of v0.7 (every tab driven,
+every flow run) produced a fix list, and this release works through
+all of it — one real counting bug, a batch of greyed-out-button and
+clipped-text defects, honest CLI output, and the capture encryption
+that was decided on 2026-11-13.
+
+- Capture encryption (G1): `mimik encrypt on` seals every saved
+  capture with a passphrase (Argon2id key derivation, AES-256-GCM).
+  The passphrase is never stored; MIMIK asks for it each time it
+  starts (GUI dialog, CLI prompt) and keeps the key in memory only.
+  A locked store reads as locked, never as empty. Forgetting the
+  passphrase means the captures cannot be recovered, by design.
+  File menu: "Encrypt captures…" / "Unlock captures…". Only
+  captures are encrypted; presets and clients hold no secrets.
+- Preset counts fixed (B1): re-learning a host no longer inflates
+  the preset's "seen" counts. Learning recomputes totals from the
+  deduped capture store, so learning the same traffic three times
+  leaves the counts exactly where one learn put them.
+- Buttons tell the truth (B3): actions that need a selection or a
+  host (delete, generate, preview, export, and friends) start
+  disabled and wake up when there is something to act on, on the
+  Hosts, Generate, Assets, Clients and Presets tabs. A lone host
+  or lone preset selects itself (G9).
+- Clipped text fixed (B4): the Binary tab's empty-state text wraps
+  instead of cutting off mid-word; the Assets capture picker shows
+  short labels with the full details in a tooltip; the Assets
+  Source column stretches and shows the full text.
+- Record tab (B5): the capture cards now say what a tap does
+  ("Your phone, over Wi-Fi. Tap to start"), with a hint line under
+  the heading: tap a card to start, tap it again or Stop to end.
+- Honest `mimik gen` output (B2, B6): the printed import snippet is
+  valid for the file actually written (or plainly says to rename
+  the file first); clients saved to the store always end in
+  _client.py, and a different host's client gets its own file
+  instead of overwriting; the "generating" line counts endpoints
+  the same way the generated file does.
+- Corrupt captures speak up (B7): a capture file that cannot be
+  read is named on the command line and noted in the GUI status
+  bar, and written to the log, instead of vanishing silently. The
+  file itself is left on disk.
+- `python3 -m mimik` works (B8): the package has a __main__ entry.
+- Uninstall without a terminal (G4): the zip ships an "Uninstall
+  MIMIK" double-click launcher, and installing adds an "Uninstall
+  MIMIK" menu entry too. It asks whether to keep or delete your
+  captures (kept by default) and waits before its window closes.
+- Unpin scripts pinned (G3): the Frida unpinning scripts are
+  fetched at one exact upstream commit and verified against it;
+  scripts at any other commit are refused, never silently trusted.
+- Dependencies bounded (G5): pyproject now carries upper bounds
+  (requests <3, PySide6 <7, mitmproxy <13, cryptography <51,
+  argon2-cffi <26) so a future major release cannot break an
+  install overnight.
+- Docs complete (G7): the README command table and `mimik --help`
+  now list every command, including diff, import, prune, delete,
+  sample, update-check, exclude, encrypt, preset export/import
+  and pack.
+- Screen readers (G8): buttons, checkboxes, line edits and tab
+  pages carry accessible names taken from their visible labels.
+
 ## v0.7 — 2026-11-17
 
 The auto-update build (standing order, all projects): MIMIK checks for

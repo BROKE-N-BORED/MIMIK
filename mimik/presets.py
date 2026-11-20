@@ -414,6 +414,13 @@ def _merge_auth(old, new):
 
 
 def _merge_endpoints(old, new):
+    # v0.8 B1: the "new" counts are TOTALS recomputed from the whole
+    # capture store (which dedupes flows by id), not a delta since the
+    # last learn. Adding them onto the old counts double-counted every
+    # flow on every re-learn (seen 2 -> 4 -> 6 with nothing new
+    # captured). Taking the max keeps re-learning idempotent, still
+    # grows when genuinely new flows arrive, and never shrinks a
+    # historical count when old captures are pruned.
     by_key = {}
     for e in old:
         by_key[(e["method"], e["path"])] = dict(e)
@@ -421,7 +428,7 @@ def _merge_endpoints(old, new):
         key = (e["method"], e["path"])
         if key in by_key:
             cur = by_key[key]
-            cur["seen"] = cur.get("seen", 0) + e.get("seen", 0)
+            cur["seen"] = max(cur.get("seen", 0), e.get("seen", 0))
             cur["first_seen"] = min(cur.get("first_seen", e["first_seen"]),
                                     e["first_seen"])
             cur["last_seen"] = max(cur.get("last_seen", e["last_seen"]),
@@ -440,7 +447,10 @@ def _merge_mapping(old, new):
     for m in new:
         key = (m["pattern"], m["kind"])
         if key in by_key:
-            by_key[key]["seen"] = by_key[key].get("seen", 0) + m.get("seen", 0)
+            # v0.8 B1: totals, not deltas — max, never sum (see
+            # _merge_endpoints).
+            by_key[key]["seen"] = max(by_key[key].get("seen", 0),
+                                      m.get("seen", 0))
         else:
             by_key[key] = dict(m)
     out = list(by_key.values())

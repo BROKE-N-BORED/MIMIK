@@ -44,12 +44,14 @@ def default_out_path():
     """The default zip path when no output is given: ./dist/."""
     return os.path.join(os.getcwd(), "dist", f"mimik-v{VERSION}.zip")
 
-EXECUTABLES = {"install.sh", "uninstall.sh", "Install MIMIK.desktop"}
+EXECUTABLES = {"install.sh", "uninstall.sh", "Install MIMIK.desktop",
+               "Uninstall MIMIK.desktop"}
 
 INCLUDE_DIRS = ["mimik", "tests", "icons", "tools", ".github"]
 INCLUDE_FILES = ["pyproject.toml", "README.md", "CHANGELOG.md",
                  "LICENSE", "LICENSE-NOTICE",
-                 "install.sh", "uninstall.sh", "Install MIMIK.desktop"]
+                 "install.sh", "uninstall.sh", "Install MIMIK.desktop",
+                 "Uninstall MIMIK.desktop"]
 
 
 def collect():
@@ -99,7 +101,8 @@ def verify(out_path):
     # stdin closed it fails fast instead of hanging the build.
     subprocess.run(["unzip", "-q", out_path, "-d", tmp], check=True,
                    stdin=subprocess.DEVNULL)
-    for name in ("install.sh", "uninstall.sh", "Install MIMIK.desktop"):
+    for name in ("install.sh", "uninstall.sh", "Install MIMIK.desktop",
+                 "Uninstall MIMIK.desktop"):
         p = os.path.join(tmp, PREFIX, name)
         assert os.access(p, os.X_OK), f"{name} lost its exec bit on extract"
     return tmp

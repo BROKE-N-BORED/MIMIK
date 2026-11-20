@@ -205,9 +205,17 @@ def doctor():
 
     saved = store.list_captures()
     usage = store.disk_usage()
+    # v0.8 G1: while the store is locked, captures read as zero —
+    # the line must say "locked", not report a fake empty store.
+    if store.encryption_enabled() and not store.unlocked():
+        saved_line = ("saved captures: encrypted and locked "
+                      "(unlock to count them) under "
+                      f"{store.captures_dir()}")
+    else:
+        saved_line = (f"saved captures: {len(saved)} host(s) under "
+                      f"{store.captures_dir()}")
     info = [
-        f"saved captures: {len(saved)} host(s) under "
-        f"{store.captures_dir()}",
+        saved_line,
         f"disk usage: {store.format_size(usage['total'])} total, "
         f"captures {store.format_size(usage['captures'])}, clients "
         f"{store.format_size(usage['clients'])}, assets "

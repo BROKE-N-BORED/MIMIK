@@ -187,13 +187,31 @@ class FetchTests(unittest.TestCase):
                         return_value=None):
             self.assertFalse(unpin.fetch_scripts("/tmp/x"))
 
+    def _git_mock(self, heads):
+        """A subprocess.run stand-in: rev-parse answers from the
+        `heads` list (one per call, last repeats), everything else
+        succeeds."""
+        state = {"rev": 0}
+
+        def run(cmd, **_kw):
+            if "rev-parse" in cmd:
+                i = min(state["rev"], len(heads) - 1)
+                state["rev"] += 1
+                return mock.Mock(returncode=0, stdout=heads[i] + "\n")
+            return mock.Mock(returncode=0, stdout="")
+
+        return run
+
     def test_clone_success(self):
+        # v0.8 G3: a clone is only a success once HEAD is verified
+        # to be the pinned commit.
         with mock.patch("mimik.unpin.shutil.which",
                         return_value="/usr/bin/git"), \
              mock.patch("mimik.unpin.subprocess.run",
-                        return_value=mock.Mock(returncode=0)) as run:
+                        side_effect=self._git_mock(
+                            [unpin.SCRIPTS_COMMIT])) as run:
             self.assertTrue(unpin.fetch_scripts("/tmp/x"))
-            self.assertIn("clone", run.call_args.args[0])
+            self.assertIn("clone", run.call_args_list[0].args[0])
 
     def test_clone_failure_is_false(self):
         with mock.patch("mimik.unpin.shutil.which",
@@ -202,15 +220,38 @@ class FetchTests(unittest.TestCase):
                         return_value=mock.Mock(returncode=128)):
             self.assertFalse(unpin.fetch_scripts("/tmp/x"))
 
-    def test_existing_checkout_pulls(self):
+    def test_clone_landing_off_pin_is_false(self):
+        # v0.8 G3: upstream moved (or was swapped) — scripts at any
+        # commit other than the pin are refused, never trusted.
+        with mock.patch("mimik.unpin.shutil.which",
+                        return_value="/usr/bin/git"), \
+             mock.patch("mimik.unpin.subprocess.run",
+                        side_effect=self._git_mock(["0" * 40])):
+            self.assertFalse(unpin.fetch_scripts("/tmp/x"))
+
+    def test_existing_checkout_at_pin_needs_no_fetch(self):
         tmp = tempfile.mkdtemp()
         os.makedirs(os.path.join(tmp, ".git"))
         with mock.patch("mimik.unpin.shutil.which",
                         return_value="/usr/bin/git"), \
              mock.patch("mimik.unpin.subprocess.run",
-                        return_value=mock.Mock(returncode=0)) as run:
+                        side_effect=self._git_mock(
+                            [unpin.SCRIPTS_COMMIT])) as run:
             self.assertTrue(unpin.fetch_scripts(tmp))
-            self.assertIn("pull", run.call_args.args[0])
+            verbs = [c.args[0][3] for c in run.call_args_list
+                     if len(c.args[0]) > 3]
+            self.assertNotIn("fetch", verbs)
+            self.assertNotIn("pull", verbs)
+
+    def test_existing_checkout_off_pin_moves_to_pin(self):
+        tmp = tempfile.mkdtemp()
+        os.makedirs(os.path.join(tmp, ".git"))
+        with mock.patch("mimik.unpin.shutil.which",
+                        return_value="/usr/bin/git"), \
+             mock.patch("mimik.unpin.subprocess.run",
+                        side_effect=self._git_mock(
+                            ["0" * 40, unpin.SCRIPTS_COMMIT])):
+            self.assertTrue(unpin.fetch_scripts(tmp))
 
 
 class PrepareTests(unittest.TestCase):

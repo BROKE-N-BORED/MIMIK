@@ -64,7 +64,8 @@ class ZipModeTests(unittest.TestCase):
                        check=True, stdin=subprocess.DEVNULL)
         prefix = build_zip.PREFIX
         for name in ("install.sh", "uninstall.sh",
-                     "Install MIMIK.desktop"):
+                     "Install MIMIK.desktop",
+                     "Uninstall MIMIK.desktop"):
             path = os.path.join(out, prefix, name)
             self.assertTrue(os.path.exists(path), f"{name} missing")
             mode = stat.S_IMODE(os.stat(path).st_mode)

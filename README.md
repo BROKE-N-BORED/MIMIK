@@ -374,6 +374,14 @@ What a preset changes (nothing changes where no preset exists):
 | `mimik learn <host> [--har FILE] [--curl FILE]` | Show endpoints for a host |
 | `mimik gen <host> [...]` | Generate a Python client |
 | `mimik clients` | List generated clients + saved captures |
+| `mimik diff <host> <file-a> <file-b>` | Compare two captures of a host (added / removed / changed calls) |
+| `mimik import <file.har>` | Import a HAR file into the capture store |
+| `mimik prune [--days N] [--keep N]` | Delete old captures (asks first; `--yes` skips) |
+| `mimik delete <host> [--yes]` | Delete a host's captures and its saved client |
+| `mimik sample` | Load the built-in demo capture (safe to delete) |
+| `mimik update-check` | Check GitHub for a newer MIMIK release |
+| `mimik exclude [list\|add\|remove\|reset]` | Manage the capture exclusion list (telemetry hosts are excluded by default) |
+| `mimik encrypt [on\|off\|status]` | Encrypt saved captures with a passphrase (v0.8; Argon2id + AES-256-GCM, asked at every start, never stored) |
 | `mimik assets [host] [--har FILE] [--scan DIR] [--refresh]` | List captured assets (images, models, audio, fonts) |
 | `mimik build-pack <host> [--reblend PATH] [--out DIR] [--scale N]` | Build a Reblend asset pack |
 | `mimik presets [--auto-learn on\|off]` | List app + pattern presets + the auto-learn setting |
@@ -381,6 +389,11 @@ What a preset changes (nothing changes where no preset exists):
 | `mimik presets show <name>` | Show a preset in plain language |
 | `mimik presets match <host\|group>` | Show which pattern presets would apply (dry run) |
 | `mimik presets delete <name> [--yes]` | Delete a preset |
+| `mimik presets export <name> [file]` | Export a preset to a zip file |
+| `mimik presets import <file>` | Import a preset from a zip file |
+| `mimik pack [list]` | List built Reblend packs |
+| `mimik pack export <host> [file]` | Export a pack to a zip file |
+| `mimik pack import <file>` | Import a pack from a zip file |
 | `mimik unpin <target> [--android\|--linux] [--ca PATH] [--proxy-host HOST] [--workdir DIR]` | Defeat cert pinning via Frida so a pinned app can be captured |
 | `mimik analyze <file> [--ghidra] [--json]` | Analyze a program file (stdlib pass; `--ghidra` adds the Ghidra pass) |
 | `mimik binaries [--json]` | List analyzed binaries |
@@ -411,6 +424,28 @@ tools it needs (git, frida, objection) as optional checks. The hooks
 cover OpenSSL/BoringSSL; Flutter apps and apps on another TLS stack
 still show no traffic (see Honest limits). Your own apps on your own
 devices only.
+
+Since v0.8 the scripts are pinned to one exact upstream commit
+(the one MIMIK was verified against) and are refused at any other
+commit — they get injected into apps, so MIMIK never runs whatever
+upstream HEAD happens to be that day.
+
+## Encrypting your captures — `mimik encrypt` (v0.8)
+
+Captures can contain your session tokens. They already sit in a
+folder only your user can read, but you can seal them properly:
+
+    mimik encrypt on     # asks for a passphrase, seals every capture
+    mimik encrypt        # status
+    mimik encrypt off    # back to plain JSON (asks for the passphrase)
+
+Or in the GUI: File → Encrypt captures… The encryption is
+Argon2id + AES-256-GCM. The passphrase is **never stored** — MIMIK
+asks for it each time it starts, keeps the key in memory only, and
+a locked store simply reads as empty until you unlock it. If you
+forget the passphrase the captures **cannot be recovered, by
+design** — there is no backdoor and no reset. Only captures are
+encrypted; presets and generated clients never hold secret values.
 
 ## Binary analysis — Ghidra (v0.5)
 

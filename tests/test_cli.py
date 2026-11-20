@@ -75,6 +75,94 @@ class CliTests(unittest.TestCase):
         self.assertNotIn("SECRETTOKEN123", src)
         self.assertIn("wrote", out)
 
+    def test_gen_out_subdir_snippet_names_bare_module(self):
+        # v0.8 B2: --out with a folder in it used to print
+        # "from /abs/path/sub/my_client import …" — invalid Python.
+        out_path = os.path.join(self.tmp, "sub", "my_client.py")
+        args = argparse.Namespace(host="api.example.com", har=FIXTURE,
+                                  curl=None, out=out_path, model=None,
+                                  polish="none", prompt_only=False)
+        out, code = run_cmd(cli.cmd_gen, args)
+        self.assertEqual(code, 0)
+        self.assertIn("from my_client import ExampleClient", out)
+        self.assertNotIn("from /", out)
+        self.assertNotIn("from sub", out)
+
+    def test_gen_out_dashed_name_snippet_is_honest(self):
+        # v0.8 B2: a basename that is not a Python identifier gets
+        # rename instructions, never a fake import line.
+        out_path = os.path.join(self.tmp, "cli-out")
+        args = argparse.Namespace(host="api.example.com", har=FIXTURE,
+                                  curl=None, out=out_path, model=None,
+                                  polish="none", prompt_only=False)
+        out, code = run_cmd(cli.cmd_gen, args)
+        self.assertEqual(code, 0)
+        self.assertIn("rename the file", out)
+        self.assertNotIn("from /", out)
+        self.assertNotIn("from cli-out", out)
+
+    def test_gen_message_counts_generalized_endpoints(self):
+        # v0.8 B6: /users/123 + /users/456 are ONE method in the
+        # generated file; the stderr message must say so.
+        from mimik import store
+
+        def flow(fid, path):
+            return {"id": fid, "request": {
+                "host": "api.example.com", "method": "GET",
+                "path": path, "scheme": "https", "port": 443,
+                "headers": []}, "response": {"status_code": 200,
+                                             "headers": []}}
+        store.save_flows([flow("g1", "/api/users/123"),
+                          flow("g2", "/api/users/456")])
+        args = argparse.Namespace(host="api.example.com", har=None,
+                                  curl=None, out=None, model=None,
+                                  polish="none", prompt_only=False)
+        err = io.StringIO()
+        with mock.patch("sys.stderr", err):
+            out, code = run_cmd(cli.cmd_gen, args)
+        self.assertEqual(code, 0)
+        self.assertIn("2 captured calls (1 endpoint after "
+                      "generalizing", err.getvalue())
+
+    def test_hosts_warns_about_unreadable_capture(self):
+        # v0.8 B7: a corrupt capture file is named on stderr, not
+        # silently skipped.
+        from mimik import store
+
+        def flow(fid, path):
+            return {"id": fid, "request": {
+                "host": "api.example.com", "method": "GET",
+                "path": path, "scheme": "https", "port": 443,
+                "headers": []}, "response": {"status_code": 200,
+                                             "headers": []}}
+        store.save_flows([flow("h1", "/api/ping")])
+        bad = os.path.join(self.tmp, "captures",
+                           "zzz.example.com_20260101-000000.json")
+        with open(bad, "w") as fh:
+            fh.write("CORRUPT{{{")
+        args = argparse.Namespace(har=None, curl=None)
+        err = io.StringIO()
+        with mock.patch("sys.stderr", err):
+            out, code = run_cmd(cli.cmd_hosts, args)
+        self.assertEqual(code, 0)
+        self.assertIn("api.example.com", out)
+        self.assertIn("unreadable capture", err.getvalue())
+        self.assertIn("zzz.example.com_20260101-000000.json",
+                      err.getvalue())
+        self.assertTrue(os.path.exists(bad))  # left on disk
+
+    def test_python_dash_m_mimik_runs(self):
+        # v0.8 B8: python3 -m mimik is the same entry as `mimik`.
+        import subprocess
+        root = os.path.abspath(
+            os.path.join(os.path.dirname(__file__), ".."))
+        env = dict(os.environ, PYTHONPATH=root)
+        r = subprocess.run([sys.executable, "-m", "mimik", "--version"],
+                           capture_output=True, text=True, env=env,
+                           timeout=60)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertTrue(r.stdout.startswith("mimik "), r.stdout)
+
     def test_gen_default_out_name(self):
         args = argparse.Namespace(host="api.example.com", har=FIXTURE,
                                   curl=None, out=None, model=None,
@@ -98,12 +186,14 @@ class CliTests(unittest.TestCase):
                          "api_example_com_client.py")
 
     def test_unique_out_numbers_on_collision(self):
+        # v0.8 B2: the number sits before _client.py, so numbered
+        # clients still end with the suffix the store speaks.
         open(os.path.join(self.tmp, "api_foo_com_client.py"), "w").write("x")
         self.assertEqual(cli._unique_out("api.foo.com", self.tmp),
-                         "api_foo_com_client_2.py")
-        open(os.path.join(self.tmp, "api_foo_com_client_2.py"), "w").write("x")
+                         "api_foo_com_2_client.py")
+        open(os.path.join(self.tmp, "api_foo_com_2_client.py"), "w").write("x")
         self.assertEqual(cli._unique_out("api.foo.com", self.tmp),
-                         "api_foo_com_client_3.py")
+                         "api_foo_com_3_client.py")
         self.assertEqual(cli._unique_out("api.bar.com", self.tmp),
                          "api_bar_com_client.py")
 
@@ -114,7 +204,7 @@ class CliTests(unittest.TestCase):
         out, code = run_cmd(cli.cmd_gen, args)
         self.assertEqual(code, 0)
         first = os.path.join(self.tmp, "api_example_com_client.py")
-        second = os.path.join(self.tmp, "api_example_com_client_2.py")
+        second = os.path.join(self.tmp, "api_example_com_2_client.py")
         with open(first) as f:
             original = f.read()
         out, code = run_cmd(cli.cmd_gen, args)
