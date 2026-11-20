@@ -1,5 +1,33 @@
 # MIMIK Changelog
 
+## v0.9 — 2026-11-19
+
+JavaScript clients: MIMIK now generates a second language, as a
+pure addition. The Python generator's output is unchanged.
+
+- `mimik gen <host> --lang js` (or the Generate tab's new
+  Language picker) writes a JavaScript client: a standalone
+  Node module (`<host>_client.mjs`) with the same method names,
+  the same generalized endpoints, and the same secret rules as
+  the Python client. It runs on Node 18 or newer with zero
+  dependencies (built-in fetch); there is nothing to install.
+- Auth by name, never by value: a learned preset's header and
+  cookie names are listed in the class, and their values are
+  filled at run time from environment variables
+  (`MIMIK_AUTHORIZATION`, `MIMIK_X_API_KEY`, `MIMIK_COOKIE`) or
+  from headers passed to the constructor. No token is ever
+  written into the file. Secret-keyed values and personal
+  strings are method parameters, exactly as in Python.
+- WebSocket endpoints become methods that replay the captured
+  client messages over the built-in WebSocket and return what
+  the server sends back.
+- The Clients tab lists, previews, and deletes `.mjs` clients
+  alongside `.py` ones; the smoke test runs a JavaScript client
+  with Node and shows its class and methods (and says plainly
+  when Node is not installed).
+- Polish stays Python-only: asking for polish with `--lang js`
+  says so and still writes the deterministic JavaScript client.
+
 ## v0.8 — 2026-11-19
 
 The audit build: a full user-mode audit of v0.7 (every tab driven,

@@ -1236,10 +1236,13 @@ class GuiTests(unittest.TestCase):
                         if w.objectName() == "explain"]
         # v0.6 T10: the polish picker gained its own plain-words
         # line, so the Generate tab has two explain labels now.
-        self.assertEqual(len(gen_explains), 2)
+        # v0.9: the language picker gained one too, so three.
+        self.assertEqual(len(gen_explains), 3)
         gen_text = " ".join(w.text() for w in gen_explains)
         self.assertIn("Usually the one with JSON", gen_text)
         self.assertIn("Polish rewrites the generated client", gen_text)
+        self.assertIn("JavaScript writes a standalone .mjs module",
+                      gen_text)
         win.close()
 
     def test_live_strip_hidden_when_idle(self):
@@ -1388,6 +1391,62 @@ class GuiTests(unittest.TestCase):
             self.assertTrue(win.status_proxy.text().startswith(
                 "✓ Client written: "))
             self.assertIn("game", win.status_proxy.text())
+            win.close()
+        finally:
+            os.chdir(old_cwd)
+
+    def test_generate_javascript_client(self):
+        # v0.9: the Language combo writes a JavaScript client;
+        # polish disables while JavaScript is picked (it works on
+        # Python source only) and the store keeps the .mjs copy.
+        from mimik import store
+        from mimik.gui import MainWindow
+
+        store.save_flows([{
+            "id": "js1",
+            "request": {"host": "game.example.com", "method": "GET",
+                        "path": "/api/users/123", "scheme": "https",
+                        "port": 443, "headers": []},
+            "response": {"status_code": 200, "headers": []},
+        }])
+        tmp = tempfile.mkdtemp()
+        old_cwd = os.getcwd()
+        os.chdir(tmp)
+        try:
+            win = MainWindow()
+            win.show()
+            win.tabs.setCurrentIndex(2)  # Generate tab
+            self.assertTrue(_wait_for(
+                self.app,
+                lambda: win.gen_host.findText("game.example.com") >= 0))
+            win.gen_host.setCurrentText("game.example.com")
+            js_index = win.lang_combo.findData("js")
+            win.lang_combo.setCurrentIndex(js_index)
+            self.assertFalse(win.polish_combo.isEnabled())
+            self.assertIn("Polish applies to Python clients",
+                          win.polish_explain.text())
+            self.assertIn("JavaScript client", win.gen_header.text())
+            win._generate()
+            self.assertTrue(_wait_for(
+                self.app,
+                lambda: "wrote" in win.gen_log.toPlainText()))
+            self.assertTrue(win.gen_out.endswith(
+                "game_example_com_client.mjs"))
+            with open(win.gen_out) as f:
+                src = f.read()
+            self.assertIn("export class GameClient", src)
+            names = [n for n, _p, _s in store.list_clients()]
+            self.assertIn("game_example_com_client.mjs", names)
+            win._copy_snippet()
+            from PySide6.QtWidgets import QApplication
+            self.assertIn(
+                'import { GameClient } from '
+                '"./game_example_com_client.mjs";',
+                QApplication.clipboard().text())
+            win.lang_combo.setCurrentIndex(
+                win.lang_combo.findData("python"))
+            self.assertTrue(win.polish_combo.isEnabled())
+            self.assertIn("Python client", win.gen_header.text())
             win.close()
         finally:
             os.chdir(old_cwd)
@@ -1828,6 +1887,43 @@ class GuiTests(unittest.TestCase):
             self.assertTrue(_wait_for(
                 self.app, lambda: win._task is None))
             self.assertIn("class: DemoClient", win.smoke_log.toPlainText())
+            self.assertIn("get_items", win.smoke_log.toPlainText())
+            win.close()
+
+    def test_smoke_test_runs_generated_js_client(self):
+        """v0.9: a generated JavaScript client smoke-tests by
+        running it with Node, no confirmation dialog (the marker
+        is the trust, same as Python)."""
+        import shutil as _shutil
+
+        if _shutil.which("node") is None:
+            self.skipTest("node is not installed")
+        from PySide6.QtWidgets import QMessageBox
+        from mimik import codegen, store
+        from mimik.gui import MainWindow
+
+        empty = tempfile.mkdtemp()
+        with mock.patch.dict(os.environ, {"MIMIK_DATA_DIR": empty}):
+            src = codegen.generate_js("demo.example.com", [
+                {"method": "GET", "path": "/api/items", "status": 200,
+                 "query": "", "request_body": "",
+                 "response_body": ""}])
+            store.save_client_copy("demo_client.mjs", src)
+            win = MainWindow()
+            win.show()
+            win.tabs.setCurrentIndex(4)  # Clients tab
+            self.assertTrue(_wait_for(
+                self.app, lambda: any(
+                    "demo_client.mjs" in win.clients_list.item(i).text()
+                    for i in range(win.clients_list.count()))))
+            self.assertTrue(_select_client(win, "demo_client.mjs"))
+            with mock.patch.object(QMessageBox, "question") as asked:
+                win._smoke_test()
+                asked.assert_not_called()
+            self.assertTrue(_wait_for(
+                self.app, lambda: win._task is None))
+            self.assertIn("class: DemoClient",
+                          win.smoke_log.toPlainText())
             self.assertIn("get_items", win.smoke_log.toPlainText())
             win.close()
 

@@ -7,6 +7,7 @@ Accent violet #b48fdd only where needed.
 import base64
 import html
 import os
+import shutil
 import subprocess
 import sys
 import threading
@@ -3492,9 +3493,10 @@ class MainWindow(QMainWindow):
     def _generate_tab(self):
         w = QWidget()
         lay = QVBoxLayout(w)
-        lay.addWidget(QLabel(
+        self.gen_header = QLabel(
             "Generate a Python client from captured traffic: "
-            "deterministic and free, no LLM."))
+            "deterministic and free, no LLM.")
+        lay.addWidget(self.gen_header)
 
         row = QHBoxLayout()
         row.addWidget(QLabel("Host:"))
@@ -3534,6 +3536,21 @@ class MainWindow(QMainWindow):
         row.addWidget(curl_btn)
         row.addWidget(self.import_label, 1)
         lay.addLayout(row)
+
+        row = QHBoxLayout()
+        row.addWidget(QLabel("Language:"))
+        self.lang_combo = QComboBox()
+        self.lang_combo.addItem("Python", "python")
+        self.lang_combo.addItem("JavaScript (Node)", "js")
+        self.lang_combo.currentIndexChanged.connect(
+            self._lang_changed)
+        row.addWidget(self.lang_combo, 1)
+        lay.addLayout(row)
+        self.lang_explain = _explain_label(
+            "Python writes a .py client. JavaScript writes a "
+            "standalone .mjs module for Node 18 or newer, with zero "
+            "dependencies.")
+        lay.addWidget(self.lang_explain)
 
         row = QHBoxLayout()
         row.addWidget(QLabel("Polish:"))
@@ -3777,6 +3794,27 @@ class MainWindow(QMainWindow):
             self.gen_host.clear()
             self.gen_host.addItems(hosts)
 
+    def _lang_changed(self):
+        """v0.9: polish works on Python source only, so the
+        JavaScript choice disables the polish combo and says why;
+        Python re-enables it."""
+        js = self.lang_combo.currentData() == "js"
+        self.polish_combo.setEnabled(not js)
+        if js:
+            self.polish_explain.setText(
+                "Polish applies to Python clients. The JavaScript "
+                "client is deterministic.")
+            self.gen_header.setText(
+                "Generate a JavaScript client from captured "
+                "traffic: deterministic and free, no LLM.")
+        else:
+            self.polish_explain.setText(
+                "Polish rewrites the generated client so it reads "
+                "better. None is free and always works.")
+            self.gen_header.setText(
+                "Generate a Python client from captured traffic: "
+                "deterministic and free, no LLM.")
+
     def _generate(self):
         host = self.gen_host.currentText().strip()
         if not host:
@@ -3784,6 +3822,7 @@ class MainWindow(QMainWindow):
             return
         har_path, curl_path = self.har_path, self.curl_path
         polish = self.polish_combo.currentData()
+        lang = self.lang_combo.currentData()
 
         def work(worker):
             if har_path:
@@ -3807,7 +3846,8 @@ class MainWindow(QMainWindow):
             preset, applied, _pids, auth_label = presets.resolve_for_gen(
                 host)
             src = codegen.generate(host, eps, polish=polish, preset=preset,
-                                   preset_label=auth_label, applied=applied)
+                                   preset_label=auth_label, applied=applied,
+                                   lang=lang)
             return src, applied
 
         def done(ok, result):
@@ -3818,9 +3858,9 @@ class MainWindow(QMainWindow):
             src, applied = result
             from .cli import _default_out, _unique_out
 
-            out = os.path.join(os.getcwd(), _default_out(host))
+            out = os.path.join(os.getcwd(), _default_out(host, lang))
             if os.path.exists(out):
-                numbered = _unique_out(host, os.getcwd())
+                numbered = _unique_out(host, os.getcwd(), lang)
                 choice = self._ask_overwrite(os.path.basename(out),
                                              numbered)
                 if choice is None:
@@ -3890,9 +3930,15 @@ class MainWindow(QMainWindow):
 
         with open(self.gen_out) as f:
             cls = _class_name(f.read()) or "Client"
-        mod = os.path.splitext(os.path.basename(self.gen_out))[0]
-        QApplication.clipboard().setText(
-            f"from {mod} import {cls}\nacc = {cls}()\n")
+        base = os.path.basename(self.gen_out)
+        if base.endswith(".mjs"):
+            QApplication.clipboard().setText(
+                f"import {{ {cls} }} from \"./{base}\";\n"
+                f"const acc = new {cls}();\n")
+        else:
+            mod = os.path.splitext(base)[0]
+            QApplication.clipboard().setText(
+                f"from {mod} import {cls}\nacc = {cls}()\n")
         self.gen_log.append("\n(import snippet copied to clipboard)")
 
     # ---- Assets tab -----------------------------------------------------------
@@ -5080,6 +5126,19 @@ class MainWindow(QMainWindow):
                     f"smoke test refused: {os.path.basename(path)} was "
                     f"not generated by MIMIK")
                 return
+        # v0.9: a JavaScript client is smoke-tested by running it
+        # with Node (its main guard prints the class and methods,
+        # the same shape as the Python smoke output). No Node on
+        # this machine is a plain fact, not an error.
+        node = None
+        if path.endswith(".mjs"):
+            node = shutil.which("node")
+            if node is None:
+                self.smoke_log.setText(
+                    "Node.js was not found on this machine, so the "
+                    "JavaScript client could not be smoke-tested. "
+                    "Install Node 18 or newer to run it.")
+                return
         code = (
             "import importlib.util, sys\n"
             f"spec = importlib.util.spec_from_file_location('c', {path!r})\n"
@@ -5101,8 +5160,9 @@ class MainWindow(QMainWindow):
         def work(worker):
             # Popen + poll (not subprocess.run): Cancel kills the child
             # instead of waiting out the 30 s timeout.
+            cmd = [node, path] if node else [sys.executable, "-c", code]
             proc = subprocess.Popen(
-                [sys.executable, "-c", code],
+                cmd,
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                 text=True, cwd=os.path.dirname(path))
             deadline = time.time() + 30

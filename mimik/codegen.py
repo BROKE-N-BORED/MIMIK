@@ -58,6 +58,8 @@ def preview_client(path):
     (the file's own date, YYYY-MM-DD, None when it cannot be read).
     The generated client carries no date line, so the file's
     modification date is the honest generated date."""
+    if str(path).endswith(".mjs"):
+        return _preview_client_js(path)
     try:
         with open(path, "r", encoding="utf-8", errors="strict") as fh:
             source = fh.read()
@@ -536,6 +538,336 @@ if __name__ == "__main__":
 '''
 
 
+def _preview_client_js(path):
+    """The preview_client facts for a generated JavaScript client:
+    host from its static HOST line, method names from its async
+    methods (private helpers excluded), date from the file's
+    modification time. Regex only: the file is never run or
+    imported. Returns None when the file cannot be read."""
+    try:
+        with open(path, "r", encoding="utf-8", errors="strict") as fh:
+            source = fh.read()
+    except (OSError, ValueError):
+        return None
+    m = re.search(r'static\s+HOST\s*=\s*"([^"]+)"', source)
+    host = m.group(1) if m else None
+    methods = [name for name in
+               re.findall(r"^\s+async\s+(\w+)\s*\(", source, re.M)
+               if not name.startswith("_")]
+    try:
+        generated = date.fromtimestamp(os.path.getmtime(path)).isoformat()
+    except OSError:
+        generated = None
+    return {"host": host, "methods": methods, "date": generated}
+
+
+# ---- JavaScript client (v0.9, item 33: second language) --------------------
+# A standalone Node ESM module (.mjs): zero dependencies, built-in
+# fetch (Node 18+). It cannot subclass mimik.App (that is Python),
+# so it carries its own small _request runtime in the same file.
+# All the analysis is shared with the Python generator (method
+# names, parameters, the secret and literal rules); only the
+# rendering is new, so the two clients agree method for method.
+
+def _js_literal(value):
+    """A Python sample value as a JavaScript literal."""
+    if value is None:
+        return "null"
+    if value is True:
+        return "true"
+    if value is False:
+        return "false"
+    if isinstance(value, (int, float)):
+        return repr(value)
+    return json.dumps(str(value))
+
+
+def _preset_auth_block_js(host, preset, label=None):
+    """The preset auth section for a JavaScript client, or "" when
+    the preset learned nothing about auth. Names only, never
+    values: the class fills the learned header names from
+    environment variables at run time (MIMIK_<NAME>), cookies
+    from MIMIK_COOKIE, and constructor headers override both."""
+    auth = (preset or {}).get("auth") or {}
+    headers = auth.get("headers") or []
+    schemes = auth.get("schemes") or []
+    cookies = auth.get("cookies") or []
+    token_eps = auth.get("token_endpoints") or []
+    if not (headers or cookies or token_eps):
+        return ""
+    lines = ["  // Auth, learned from your captures "
+             f"({label or f'preset for {host}'}):"]
+    for h in headers:
+        extra = ""
+        if h.lower() == "authorization" and schemes:
+            extra = f" ({', '.join(schemes)})"
+        lines.append(f"  //   header: {h}{extra}")
+    for c in cookies:
+        lines.append(f"  //   cookie: {c}")
+    for t in token_eps:
+        lines.append(f"  //   sign-in: {t}")
+    return "\n" + "\n".join(lines)
+
+
+def _render_method_js(ep, used_names):
+    """Render one endpoint as a JavaScript method. Returns (name, source)."""
+    method, path = ep["method"].upper(), ep["path"]
+    base = method_name_for(method, path)
+    if ep.get("websocket") and not base.endswith("_ws"):
+        base += "_ws"
+    name = base
+    n = 2
+    while name in used_names:
+        name = f"{base}_{n}"
+        n += 1
+    used_names.add(name)
+    if ep.get("websocket"):
+        return name, _render_ws_method_js(ep, name)
+
+    _parts, path_params = _path_parts(path)
+    params, literals, query_params = _params_for_endpoint(ep)
+
+    # Path params stay positional (the Python client's split);
+    # body and query params become one options object, with the
+    # same sample defaults the Python signature carries.
+    opt_entries = []
+    seen_opts = set(path_params)
+    for py, _key, default, _req in params:
+        if py in seen_opts:
+            continue
+        seen_opts.add(py)
+        opt_entries.append(f"{py} = {default}" if default is not None
+                           else py)
+    for py, _key in query_params:
+        if py in seen_opts:
+            continue
+        seen_opts.add(py)
+        opt_entries.append(py)
+    sig_parts = list(path_params)
+    if opt_entries:
+        sig_parts.append("{ " + ", ".join(opt_entries) + " } = {}")
+    sig = ", ".join(sig_parts)
+
+    url = _url_with_params(path)
+    js_url = re.sub(r"\{(\w+)\}", r"${\1}", url)
+    url_expr = f"`{js_url}`" if path_params else json.dumps(url)
+    lines = [f"  async {name}({sig}) {{"]
+    lines.append(f"    // {method} {url} -> {ep.get('status')}")
+    if ep.get("samples") == 1:
+        lines.append("    // Single sample: one captured call built "
+                     "this method.")
+
+    use_json = method in ("POST", "PUT", "PATCH")
+    body_lines = []
+    if literals or params:
+        target = "body" if use_json else "query"
+        lit = ", ".join(f"{json.dumps(k)}: {_js_literal(v)}"
+                        for k, v in literals.items())
+        body_lines.append(f"    const {target} = "
+                          f"{{ {lit} }};" if lit
+                          else f"    const {target} = {{}};")
+        for py, key, _d, _r in params:
+            body_lines.append(f"    if ({py} !== undefined) "
+                              f"{target}[{json.dumps(key)}] = {py};")
+    query_declared = (not use_json) and bool(literals or params)
+    if query_params and not query_declared:
+        body_lines.append("    const query = {};")
+    for py, key in query_params:
+        body_lines.append(f"    if ({py} !== undefined) "
+                          f"query[{json.dumps(key)}] = {py};")
+
+    opts = []
+    if use_json and (literals or params):
+        opts.append("json: body")
+    if query_params or query_declared:
+        opts.append("query")
+    call = f"return this._request({json.dumps(method)}, {url_expr}"
+    if opts:
+        call += ", { " + ", ".join(opts) + " }"
+    call += ");"
+    lines.extend(body_lines)
+    lines.append(f"    {call}")
+    lines.append("  }")
+    return name, "\n".join(lines)
+
+
+def _render_ws_method_js(ep, name):
+    """A WebSocket endpoint as a _wsReplay call (v0.9): the
+    captured client messages are the default session, pass
+    messages = [...] to send something else. Text embeds as a
+    string, binary as a Buffer built from hex."""
+    method, path = ep["method"].upper(), ep["path"]
+    _parts, path_params = _path_parts(path)
+    url = _url_with_params(path)
+    js_url = re.sub(r"\{(\w+)\}", r"${\1}", url)
+    url_expr = f"`{js_url}`" if path_params else json.dumps(url)
+    sig = ", ".join(list(path_params) + ["messages = null"])
+    lines = [f"  async {name}({sig}) {{"]
+    lines.append(f"    // {method} {url} -> {ep.get('status')} "
+                 "(WebSocket)")
+    if ep.get("samples") == 1:
+        lines.append("    // Single sample: one captured call built "
+                     "this method.")
+    literals = []
+    for message in ep.get("ws_messages") or []:
+        if not message.get("from_client"):
+            continue
+        if message.get("b64") is not None:
+            try:
+                raw = base64.b64decode(message["b64"])
+            except (ValueError, TypeError):
+                continue
+            literals.append(
+                f"Buffer.from({json.dumps(raw.hex())}, \"hex\")")
+        else:
+            literals.append(json.dumps(message.get("text", "")))
+    if literals:
+        lines.append("    if (messages === null) "
+                     f"messages = [{', '.join(literals)}];")
+    else:
+        lines.append("    if (messages === null) messages = []; "
+                     "// no client messages captured")
+    lines.append(f"    return this._wsReplay({url_expr}, messages);")
+    lines.append("  }")
+    return "\n".join(lines)
+
+
+def generate_js(host, endpoints, preset=None, preset_label=None,
+                applied=None):
+    """The deterministic JavaScript generator: same endpoints,
+    same method names, same secret rules as the Python client,
+    rendered as a standalone Node ESM module. No LLM, no network.
+    preset / preset_label / applied mean what they mean for
+    generate_deterministic."""
+    cls = class_name_for_host(host)
+    used = set()
+    blocks = []
+    eps = _generalize_endpoints(endpoints)
+    for ep in eps:
+        _name, src = _render_method_js(ep, used)
+        blocks.append(src)
+    methods = "\n\n".join(blocks) if blocks else \
+        "  // no endpoints captured yet"
+    auth = (preset or {}).get("auth") or {}
+    headers = list(auth.get("headers") or []) if preset is not None else []
+    cookies = list(auth.get("cookies") or []) if preset is not None else []
+    auth_block = (_preset_auth_block_js(host, preset, label=preset_label)
+                  if preset is not None else "")
+    applied_note = ""
+    if applied:
+        applied_note = "\n// Presets applied: " + "; ".join(applied)
+    single = sum(1 for ep in eps if ep.get("samples") == 1)
+    sample_note = ""
+    if single:
+        sample_note = (
+            f"\n{single} of {len(eps)} "
+            f"endpoint{'s' if len(eps) != 1 else ''} "
+            f"come{'s' if single == 1 else ''} from a single captured "
+            "sample, those methods are marked below. Re-record with "
+            "more traffic to firm them up.\n")
+    return f'''/* {cls}, {GENERATED_MARKER} from your own captured traffic.
+
+Own accounts only: this client replays YOUR session for YOUR apps.
+No tokens are stored in this file: auth values come from your
+environment (see the auth notes in the class) or from the headers
+you pass to the constructor. Requests time out after 30 s by
+default, pass timeoutMs to the constructor to change it.
+Personal values from your captures (names, cities, and the like)
+are method parameters, never baked-in literals.{sample_note}
+Runs on Node 18 or newer with zero dependencies (built-in fetch).
+Edit freely.
+*/{applied_note}
+
+import {{ pathToFileURL }} from "node:url";
+
+export class {cls} {{
+  static HOST = "{host}";{auth_block}
+  static AUTH_HEADERS = {json.dumps(headers)};
+  static AUTH_COOKIES = {json.dumps(cookies)};
+
+  constructor({{ baseUrl, headers = {{}}, timeoutMs = 30000 }} = {{}}) {{
+    this._baseUrl = baseUrl ?? `https://${{{cls}.HOST}}`;
+    this._headers = headers;
+    this._timeoutMs = timeoutMs;
+  }}
+
+  _authHeaders() {{
+    const h = {{}};
+    for (const name of {cls}.AUTH_HEADERS) {{
+      const env = "MIMIK_" + name.replace(/[^A-Za-z0-9]+/g, "_").toUpperCase();
+      if (typeof process !== "undefined" && process.env[env]) {{
+        h[name] = process.env[env];
+      }}
+    }}
+    if ({cls}.AUTH_COOKIES.length
+        && typeof process !== "undefined" && process.env.MIMIK_COOKIE) {{
+      h["Cookie"] = process.env.MIMIK_COOKIE;
+    }}
+    return {{ ...h, ...this._headers }};
+  }}
+
+  async _request(method, path, {{ query, json }} = {{}}) {{
+    const url = new URL(this._baseUrl + path);
+    if (query) {{
+      for (const [k, v] of Object.entries(query)) {{
+        if (v !== undefined) url.searchParams.set(k, String(v));
+      }}
+    }}
+    const headers = {{ ...this._authHeaders() }};
+    const init = {{ method, headers,
+                    signal: AbortSignal.timeout(this._timeoutMs) }};
+    if (json !== undefined) {{
+      headers["Content-Type"] = "application/json";
+      init.body = JSON.stringify(json);
+    }}
+    const res = await fetch(url, init);
+    const text = await res.text();
+    if (!res.ok) {{
+      throw new Error(`${{method}} ${{path}} failed: ${{res.status}} ${{text}}`);
+    }}
+    try {{
+      return JSON.parse(text);
+    }} catch {{
+      return text;
+    }}
+  }}
+
+  async _wsReplay(path, messages) {{
+    const base = this._baseUrl.replace(/^http/, "ws");
+    const ws = new WebSocket(base + path);
+    const received = [];
+    ws.addEventListener("message", (ev) => received.push(ev.data));
+    await new Promise((resolve, reject) => {{
+      ws.addEventListener("open", resolve, {{ once: true }});
+      ws.addEventListener("error", reject, {{ once: true }});
+    }});
+    for (const m of messages) ws.send(m);
+    await new Promise((resolve) => {{
+      const timer = setTimeout(() => {{
+        try {{ ws.close(); }} catch {{}}
+        resolve();
+      }}, 5000);
+      ws.addEventListener("close", () => {{
+        clearTimeout(timer);
+        resolve();
+      }}, {{ once: true }});
+    }});
+    return received;
+  }}
+
+{methods}
+}}
+
+if (process.argv[1]
+    && import.meta.url === pathToFileURL(process.argv[1]).href) {{
+  const methods = Object.getOwnPropertyNames({cls}.prototype)
+    .filter((m) => !m.startsWith("_") && m !== "constructor");
+  console.log("class:", "{cls}", "| HOST:", {cls}.HOST);
+  console.log("methods:", methods.join(", "));
+}}
+'''
+
+
 # ---- prompt (for --prompt-only and the optional polishers) ------------------
 
 PROMPT = """\
@@ -698,14 +1030,20 @@ def polish_cli(source, host, generator):
 
 
 def generate(host, endpoints, polish="none", model=None, preset=None,
-             preset_label=None, applied=None):
+             preset_label=None, applied=None, lang="python"):
     """Generate a client. Deterministic by default; polish is optional.
 
     preset (a dict from mimik.presets, or None) is passed through to
     the deterministic generator; polish never sees it separately.
     preset_label / applied name the presets that were used, and are
     recorded as comments in the generated client.
+    lang "js" returns the standalone JavaScript client instead
+    (v0.9): deterministic only, the polishers work on Python
+    source, so polish is ignored for JavaScript.
     """
+    if lang == "js":
+        return generate_js(host, endpoints, preset=preset,
+                           preset_label=preset_label, applied=applied)
     source = generate_deterministic(host, endpoints, preset=preset,
                                     preset_label=preset_label,
                                     applied=applied)

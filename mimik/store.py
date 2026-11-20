@@ -756,9 +756,23 @@ def delete_host(host, base=None):
             "bytes_freed": bytes_freed}
 
 
+# Generated-client filename suffixes (v0.9: Python and JavaScript).
+_CLIENT_SUFFIXES = ("_client.py", "_client.mjs")
+
+
+def _client_suffix(name):
+    """The generated-client suffix a filename carries, or None."""
+    for suffix in _CLIENT_SUFFIXES:
+        if name.endswith(suffix):
+            return suffix
+    return None
+
+
 def _client_host_of(source):
-    """The HOST a generated client was built for, or None."""
-    m = re.search(r'^\s*HOST\s*=\s*"([^"]+)"', source or "", re.M)
+    """The HOST a generated client was built for, or None. Matches
+    the Python form (HOST = "...") and the JavaScript form
+    (static HOST = "...") alike."""
+    m = re.search(r'HOST\s*=\s*"([^"]+)"', source or "")
     return m.group(1) if m else None
 
 
@@ -772,13 +786,22 @@ def save_client_copy(name, source, base=None):
     client refreshes its copy, as before; a copy whose name is
     taken by a DIFFERENT host's client gets a _2/_3 sibling that
     still ends in _client.py.
+    v0.9: JavaScript clients follow the same convention with the
+    _client.mjs suffix, normalized from the file's own extension.
     """
     base = base or data_dir()
     ensure_private_dir(base)
     ensure_private_dir(clients_dir(base))
-    if not name.endswith("_client.py"):
-        stem = name[:-3] if name.endswith(".py") else name
-        name = f"{stem}_client.py"
+    suffix = _client_suffix(name)
+    if suffix is None:
+        # Normalize by the file's own language (v0.9): a .mjs name
+        # keeps .mjs, anything else follows the Python convention.
+        if name.endswith(".mjs"):
+            name, suffix = f"{name[:-4]}_client.mjs", "_client.mjs"
+        elif name.endswith(".py"):
+            name, suffix = f"{name[:-3]}_client.py", "_client.py"
+        else:
+            name, suffix = f"{name}_client.py", "_client.py"
     path = os.path.join(clients_dir(base), name)
     if os.path.exists(path):
         try:
@@ -790,13 +813,13 @@ def save_client_copy(name, source, base=None):
             old_host = _client_host_of(old)
             new_host = _client_host_of(source)
             if old_host and new_host and old_host != new_host:
-                stem = name[: -len("_client.py")]
+                stem = name[: -len(suffix)]
                 n = 2
                 while os.path.exists(os.path.join(
-                        clients_dir(base), f"{stem}_{n}_client.py")):
+                        clients_dir(base), f"{stem}_{n}{suffix}")):
                     n += 1
                 path = os.path.join(
-                    clients_dir(base), f"{stem}_{n}_client.py")
+                    clients_dir(base), f"{stem}_{n}{suffix}")
     atomic_write(path, source, private=False)
     return path
 
@@ -809,7 +832,7 @@ def list_clients(base=None):
         return []
     out = []
     for name in sorted(os.listdir(cdir)):
-        if name.endswith("_client.py"):
+        if _client_suffix(name):
             path = os.path.join(cdir, name)
             try:
                 out.append((name, path, os.path.getsize(path)))
@@ -821,12 +844,13 @@ def list_clients(base=None):
 def delete_client(name, base=None):
     """Delete one generated client by filename. Returns {"deleted":
     path or None, "bytes_freed": n}. The name must be a bare filename
-    ending _client.py — separators and ".." are refused, and the
+    ending in a generated-client suffix (_client.py or
+    _client.mjs): separators and ".." are refused, and the
     resolved path must stay inside clients/."""
     base = base or data_dir()
     cdir = clients_dir(base)
     if (not name or os.path.basename(name) != name
-            or not name.endswith("_client.py")):
+            or not _client_suffix(name)):
         return {"deleted": None, "bytes_freed": 0}
     path = os.path.join(cdir, name)
     if os.path.commonpath([os.path.abspath(path),

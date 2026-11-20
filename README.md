@@ -171,6 +171,7 @@ mimik gen <host> --curl request.txt
 ```
 mimik gen <host> [--har FILE] [--curl FILE] [--out FILE]
                  [--polish ollama|claude|opencode|none] [--prompt-only]
+                 [--lang python|js]
 ```
 
 Default `--polish none`: the deterministic generator. Method names come from
@@ -191,6 +192,29 @@ keep the proxy running while you use it against a live app.
 
 Generated clients are also copied to `~/.local/share/mimik/clients/`; the
 GUI Clients tab lists them with a smoke-test button.
+
+### JavaScript clients (v0.9)
+
+`mimik gen <host> --lang js` (or the Generate tab's Language picker)
+writes a **JavaScript** client instead: a standalone Node module
+(`<host>_client.mjs`) with the same method names and the same secret
+rules as the Python client. It runs on Node 18 or newer with **zero
+dependencies** (built-in `fetch`), so there is nothing to install:
+
+```js
+import { ExampleClient } from "./api_example_com_client.mjs";
+const acc = new ExampleClient();
+const users = await acc.get_users_by_id(123, { limit: 5 });
+```
+
+Because a JavaScript file cannot pull auth from MIMIK the way the
+Python client does, learned auth works by name: the class lists the
+header and cookie names your captures used, and fills their values
+from environment variables at run time (`MIMIK_AUTHORIZATION`,
+`MIMIK_X_API_KEY`, `MIMIK_COOKIE`), or from the `headers` you pass to
+the constructor. No token value is ever written into the file. Polish
+applies to Python clients only; JavaScript output is always the
+deterministic generator.
 
 If a **preset** was learned for the host (see below), the generated client
 uses it: the learned auth section (header/cookie names, sign-in endpoint)
@@ -372,7 +396,7 @@ What a preset changes (nothing changes where no preset exists):
 | `mimik doctor` | Check python, requests, mitmproxy, Qt, Ollama, CA cert, wine/WinLinx |
 | `mimik hosts [--har FILE] [--curl FILE]` | List captured hosts |
 | `mimik learn <host> [--har FILE] [--curl FILE]` | Show endpoints for a host |
-| `mimik gen <host> [...]` | Generate a Python client |
+| `mimik gen <host> [...]` | Generate a client (Python, or JavaScript with `--lang js`) |
 | `mimik clients` | List generated clients + saved captures |
 | `mimik diff <host> <file-a> <file-b>` | Compare two captures of a host (added / removed / changed calls) |
 | `mimik import <file.har>` | Import a HAR file into the capture store |

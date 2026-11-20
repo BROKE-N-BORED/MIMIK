@@ -7,7 +7,8 @@
     mimik record --target web         web app: HAR import / cURL paste
     mimik hosts                       list captured hosts
     mimik learn <host>                show the endpoints MIMIK saw for a host
-    mimik gen <host>                  generate a Python client for a host
+    mimik gen <host>                  generate a client for a host
+                                      (--lang js for JavaScript)
     mimik clients                     list generated clients + saved captures
     mimik diff <host> <a> <b>         compare two captures of a host
     mimik import <file.har>           import a HAR file into the store
@@ -826,36 +827,43 @@ def cmd_learn(args):
         print(f"  {e['method']:5s} {e['path']}   -> {e['status']}")
 
 
-def _default_out(host):
+def _default_out(host, lang="python"):
     """Full host, sanitized, as the client filename: api.foo.com →
     api_foo_com_client.py, 192.168.1.5 → 192_168_1_5_client.py. (The
     old first-label-only name collided: api.foo.com and api.bar.com
     both wrote api_client.py.) The stem is capped so the filename
-    stays under the 255-byte limit for very long hostnames."""
+    stays under the 255-byte limit for very long hostnames.
+    lang "js" (v0.9) names the JavaScript client instead:
+    api_foo_com_client.mjs."""
     stem = re.sub(r"[^a-z0-9]+", "_", host.lower()).strip("_")
-    return f"{(stem or 'app')[:200]}_client.py"
+    suffix = "_client.mjs" if lang == "js" else "_client.py"
+    return f"{(stem or 'app')[:200]}{suffix}"
 
 
-def _unique_out(host, directory):
+def _unique_out(host, directory, lang="python"):
     """A collision-free output filename in `directory`: the default
     name, or _2/_3/... when it already exists.
 
     v0.8 B2: the number goes BEFORE _client.py (api_foo_2_client.py),
     never after — store.list_clients / delete_client only speak the
     _client.py suffix, so the old api_foo_client_2.py form produced
-    clients the app itself could not list or delete."""
-    name = _default_out(host)
+    clients the app itself could not list or delete. v0.9: the same
+    rule per language suffix (_client.mjs for JavaScript)."""
+    suffix = "_client.mjs" if lang == "js" else "_client.py"
+    name = _default_out(host, lang)
     if not os.path.exists(os.path.join(directory, name)):
         return name
-    stem = name[: -len("_client.py")]
+    stem = name[: -len(suffix)]
     n = 2
-    while os.path.exists(os.path.join(directory, f"{stem}_{n}_client.py")):
+    while os.path.exists(os.path.join(directory, f"{stem}_{n}{suffix}")):
         n += 1
-    return f"{stem}_{n}_client.py"
+    return f"{stem}_{n}{suffix}"
 
 
 def _class_name(source):
-    m = re.search(r"class\s+(\w+)\s*\(", source)
+    # Python: "class ExampleClient(App):"; JavaScript (v0.9):
+    # "export class ExampleClient {" — the name follows "class".
+    m = re.search(r"class\s+(\w+)", source)
     return m.group(1) if m else None
 
 
@@ -869,7 +877,8 @@ def cmd_gen(args):
         print(codegen.build_prompt(args.host, eps))
         return
 
-    out = args.out or _unique_out(args.host, os.getcwd())
+    lang = getattr(args, "lang", "python")
+    out = args.out or _unique_out(args.host, os.getcwd(), lang)
     preset, applied, _pattern_ids, auth_label = presets.resolve_for_gen(
         args.host, flows=flows)
     # v0.8 B6: count the way the generated file counts — concrete
@@ -877,6 +886,9 @@ def cmd_gen(args):
     # /users/456 are one method), so the message names both numbers
     # instead of disagreeing with the file's own header.
     shapes = codegen._generalize_endpoints(eps)
+    if lang == "js" and args.polish != "none":
+        print("note: polish applies to Python clients; the "
+              "JavaScript client is deterministic.", file=sys.stderr)
     if len(shapes) != len(eps):
         print(f"generating a client from {len(eps)} captured calls "
               f"({len(shapes)} endpoint"
@@ -889,7 +901,8 @@ def cmd_gen(args):
         print("presets applied: " + "; ".join(applied), file=sys.stderr)
     src = codegen.generate(args.host, eps, polish=args.polish,
                            model=args.model, preset=preset,
-                           preset_label=auth_label, applied=applied)
+                           preset_label=auth_label, applied=applied,
+                           lang=lang)
 
     parent = os.path.dirname(os.path.abspath(out))
     if parent:
@@ -899,6 +912,20 @@ def cmd_gen(args):
     store.save_client_copy(os.path.basename(out), src)
     cls = _class_name(src) or "Client"
     print(f"\nwrote {out}")
+    if lang == "js":
+        # v0.9: the JavaScript import is a path import — it is
+        # valid for any filename, so the snippet always names the
+        # real file; only the folder decides the wording.
+        base = os.path.basename(out)
+        if os.path.dirname(os.path.abspath(out)) == os.getcwd():
+            print(f"\n    import {{ {cls} }} from \"./{base}\";")
+            print(f"    const acc = new {cls}();")
+            print("    // then call the generated methods\n")
+        else:
+            print(f"\n    copy {base} into your project folder, then:")
+            print(f"    import {{ {cls} }} from \"./{base}\";")
+            print(f"    const acc = new {cls}();\n")
+        return
     # v0.8 B2: the old snippet interpolated the whole --out PATH as
     # a module name ("from /home/you/subdir/cli-out import …" —
     # not valid Python for any path with a folder or a dash in it).
@@ -1414,6 +1441,10 @@ def main(argv=None):
                     help="optional polish pass (default: none, deterministic)")
     gp.add_argument("--prompt-only", action="store_true",
                     help="print the prompt instead of generating")
+    gp.add_argument("--lang", default="python",
+                    choices=["python", "js"],
+                    help="client language: python (default) or js "
+                    "(JavaScript, a standalone Node module)")
     gp.add_argument("--har", metavar="FILE", help="read from a HAR file")
     gp.add_argument("--curl", metavar="FILE",
                     help="read from a cURL paste (file or text)")
